@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: STAND Backend PROD - Fully Managed Infrastructure
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    Timeout: 30
+    MemorySize: 128
+    Tracing: PassThrough
+    Environment:
+      Variables:
+        STAGE: prod
+
+Resources:
+
+# =========================
+# HTTP APIs
+# =========================
+
+  WebhooksHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+
+  GameHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET","POST","PUT","DELETE","OPTIONS"]
+        AllowHeaders: ["authorization","content-type"]
+
+# =========================
+# WEBHOOK LAMBDAS
+# =========================
+
+  StandProdWebhookFnInstagramSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-webhook-fn-instagram-sam
+      Description: Receives and dispatches Instagram webhook events to the appropriate internal game and messaging services.
+      CodeUri: src/stand_prod_webhook_fn_instagram/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        InstagramGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhooksHttpApi
+            Path: /webhook/instagram
+            Method: GET
+        InstagramPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhooksHttpApi
+            Path: /webhook/instagram
+            Method: POST
+
+  StandProdWebhookFnStripeSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-webhook-fn-stripe-sam
+      Description: Processes Stripe webhook events to handle payments, subscriptions, and billing state changes.
+      CodeUri: src/stand_prod_webhook_fn_stripe/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        StripePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhooksHttpApi
+            Path: /webhook/stripe
+            Method: POST
+
+# =========================
+# GAME CORE
+# =========================
+
+  StandProdGameFnGameSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-fn-game-sam
+      Description: Handles game lifecycle (create, list, update and delete games).
+      CodeUri: src/stand_prod_game_fn_game/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        GameCrud:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game
+            Method: ANY
+
+  StandProdGameFnAssignSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-fn-assign-sam
+      Description: Assigns players to games, enforces plan limits, prevents duplicates, and initializes per-game player state.
+      CodeUri: src/stand_prod_game_fn_assign/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        AssignPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/assign
+            Method: POST
+
+  StandProdGameValidateSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-validate-sam
+      Description: Validates player participation and game actions based on game rules, feature flags, and completion status.
+      CodeUri: src/stand_prod_game_validate/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        ValidatePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/validate
+            Method: POST
+
+# =========================
+# GAME FEATURES
+# =========================
+
+  StandProdGameScoreSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-score-sam
+      Description: Stores player scores and provides rankings for games that support scoring.
+      CodeUri: src/stand_prod_game_score/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        ScoreGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/score
+            Method: GET
+        ScorePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/score
+            Method: POST
+
+  StandProdGameFnQuizSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-fn-quiz-sam
+      Description: Manages quiz configuration, quiz flow, and player quiz responses for games that include quizzes.
+      CodeUri: src/stand_prod_game_fn_quiz/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        QuizGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/quiz
+            Method: GET
+        QuizPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/quiz
+            Method: POST
+
+  StandProdGameFnRaffleSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-fn-raffle-sam
+      Description: Executes game raffles, selects eligible winners, persists raffle results, and notifies participants.
+      CodeUri: src/stand_prod_game_fn_raffle/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        RafflePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/game/raffle
+            Method: POST
+
+# =========================
+# BILLING
+# =========================
+
+  StandProdBillingFnCheckoutSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-billing-fn-checkout-sam
+      Description: Creates and manages Stripe checkout sessions for purchasing plans and subscriptions.
+      CodeUri: src/stand_prod_billing_fn_checkout/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        CheckoutPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/billing/checkout
+            Method: POST
+
+# =========================
+# USER & MESSAGING
+# =========================
+
+  StandProdUserFnUserSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-user-fn-user-sam
+      Description: Manages user accounts, authentication-related data, and user-level configuration and limits.
+      CodeUri: src/stand_prod_user_fn_user/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Events:
+        UserPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/user
+            Method: POST
+        MeGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameHttpApi
+            Path: /v1/me
+            Method: GET
+
+  StandProdMessagingInstagramSenderSam:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-messaging-fn-instagram-sender-sam
+      Description: Sends text messages, quick replies, and media to Instagram users via the Instagram Graph API.
+      CodeUri: src/stand_prod_messaging_fn_instagram_sender/
+      Handler: lambda_function.lambda_handler
+      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+
+# =========================
+# OUTPUTS
+# =========================
+
+Outputs:
+  WebhooksApiUrl:
+    Value: !Sub "https://${WebhooksHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  GameApiUrl:
+    Value: !Sub "https://${GameHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
