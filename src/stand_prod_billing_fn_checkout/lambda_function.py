@@ -14,14 +14,25 @@ dynamodb = boto3.resource("dynamodb")
 # ========= ENV =========
 USERS_TABLE = (os.environ.get("USERS_TABLE", "") or "").strip()
 
-STRIPE_SECRET_KEY = (os.environ.get("STRIPE_SECRET_KEY", "") or "").strip()
-STRIPE_PRICE_ID = (os.environ.get("STRIPE_PRICE_ID", "") or "").strip()
-
-# URLs a las que vuelve Stripe tras pagar/cancelar
+# URLs a las que vuelve Stripe tras pagar/cancelar (solo env, no están en el secret)
 STRIPE_SUCCESS_URL = (os.environ.get("STRIPE_SUCCESS_URL", "") or "").strip()
 STRIPE_CANCEL_URL = (os.environ.get("STRIPE_CANCEL_URL", "") or "").strip()
 
-# Opcional: si quieres forzar moneda/impuestos/etc lo harás en Stripe dashboard
+# Stripe keys solo desde Secrets Manager (STRIPE_SECRET_NAME obligatorio)
+STRIPE_SECRET_KEY = ""
+STRIPE_PRICE_ID = ""
+_stripe_secret_name = os.environ.get("STRIPE_SECRET_NAME", "").strip()
+if _stripe_secret_name:
+    try:
+        sm = boto3.client("secretsmanager")
+        raw = sm.get_secret_value(SecretId=_stripe_secret_name)
+        data = json.loads(raw.get("SecretString", "{}"))
+        if data:
+            STRIPE_SECRET_KEY = (data.get("STRIPE_SECRET_KEY") or data.get("SECRET_KEY") or "").strip()
+            STRIPE_PRICE_ID = (data.get("STRIPE_PRICE_ID") or data.get("PRICE_ID") or "").strip()
+    except Exception as e:
+        print(json.dumps({"msg": "stripe_secret_load_failed", "error": repr(e)}))
+
 stripe.api_key = STRIPE_SECRET_KEY
 
 

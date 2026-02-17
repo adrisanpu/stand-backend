@@ -2,6 +2,12 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: STAND Backend PROD - Fully Managed Infrastructure
 
+Parameters:
+  StripeLayerArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:781283585341:layer:stripe-layer:5
+    Description: ARN of the Stripe Lambda layer (created manually in AWS)
+
 Globals:
   Function:
     Runtime: python3.13
@@ -13,66 +19,296 @@ Globals:
     Environment:
       Variables:
         STAGE: prod
+        GAMES_TABLE: !Ref StandProdGameTable
+        USERS_TABLE: !Ref StandProdUserTable
+        GAMEPLAYER_TABLE: !Ref StandProdGameplayerTable
+        CATALOG_TABLE: !Ref StandProdCatalogTable
+        INSTAGRAM_SECRET_NAME: stand/prod/instagram
+        STRIPE_SECRET_NAME: stand/dev/stripe
 
 Resources:
+
+# =========================
+# IAM ROLE (Lambda execution)
+# =========================
+
+  StandProdGameRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stand-prod-game-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StandProdGameRolePolicy
+
+  StandProdGameRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: stand-prod-game-role-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+          - Sid: DynamoDB
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:BatchGetItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:ConditionCheckItem
+            Resource:
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                - TableName: !Ref StandProdGameTable
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-ownerUserId"
+                - TableName: !Ref StandProdGameTable
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-gameName"
+                - TableName: !Ref StandProdGameTable
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                - TableName: !Ref StandProdUserTable
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                - TableName: !Ref StandProdGameplayerTable
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-instagramPSID"
+                - TableName: !Ref StandProdGameplayerTable
+              - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                - TableName: !Ref StandProdCatalogTable
+          - Sid: LambdaInvoke
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-*"
+          - Sid: S3Presign
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub
+              - "arn:aws:s3:::${BucketName}/*"
+              - BucketName: !Ref StandProdEmpareja2CharBucket
+          - Sid: SSMParameters
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/prod/config/*"
+          - Sid: SecretsManager
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/*"
+
+# =========================
+# DYNAMODB TABLES
+# =========================
+
+  StandProdUserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stand-prod-user-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  StandProdGameTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stand-prod-game-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: gameId
+          AttributeType: S
+        - AttributeName: ownerUserId
+          AttributeType: S
+        - AttributeName: gameName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gameId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-ownerUserId
+          KeySchema:
+            - AttributeName: ownerUserId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: gsi-gameName
+          KeySchema:
+            - AttributeName: gameName
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  StandProdGameplayerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stand-prod-gameplayer-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: gameId
+          AttributeType: S
+        - AttributeName: playerId
+          AttributeType: N
+        - AttributeName: instagramPSID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: gameId
+          KeyType: HASH
+        - AttributeName: playerId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-instagramPSID
+          KeySchema:
+            - AttributeName: instagramPSID
+              KeyType: HASH
+            - AttributeName: gameId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  StandProdCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stand-prod-catalog-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: catalogId
+          AttributeType: S
+        - AttributeName: pairId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: catalogId
+          KeyType: HASH
+        - AttributeName: pairId
+          KeyType: RANGE
+
+# =========================
+# S3
+# =========================
+
+  StandProdEmpareja2CharBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stand-prod-empareja2-characters-${AWS::AccountId}"
 
 # =========================
 # HTTP APIs
 # =========================
 
-  WebhooksHttpApi:
+  WebhooksApi:
     Type: AWS::Serverless::HttpApi
     Properties:
+      Name: stand-prod-webhook-api
       StageName: prod
 
-  GameHttpApi:
+  GameApi:
     Type: AWS::Serverless::HttpApi
     Properties:
+      Name: stand-prod-game-api
       StageName: prod
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_54eXBuNq1
+              audience:
+                - 52ekpup21eo5ic4caokn2a33k3
+        DefaultAuthorizer: CognitoAuthorizer
       CorsConfiguration:
         AllowOrigins: ["*"]
         AllowMethods: ["GET","POST","PUT","DELETE","OPTIONS"]
         AllowHeaders: ["authorization","content-type"]
 
 # =========================
+# CORS (preflight without auth so browser OPTIONS succeeds)
+# =========================
+
+  StandProdCorsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-cors-fn
+      Description: Handles OPTIONS preflight for GameApi; no JWT so preflight passes.
+      CodeUri: src/stand_prod_cors_fn/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdGameRole.Arn
+      Events:
+        OptionsProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /{proxy+}
+            Method: OPTIONS
+            Auth:
+              Authorizer: NONE
+
+# =========================
 # WEBHOOK LAMBDAS
 # =========================
 
-  StandProdWebhookFnInstagramSam:
+  StandProdWebhookFnInstagram:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-webhook-fn-instagram-sam
+      FunctionName: stand-prod-webhook-fn-instagram
       Description: Receives and dispatches Instagram webhook events to the appropriate internal game and messaging services.
       CodeUri: src/stand_prod_webhook_fn_instagram/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Environment:
+        Variables:
+          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          QUIZ_LAMBDA: !Ref StandProdGameFnQuiz
       Events:
         InstagramGet:
           Type: HttpApi
           Properties:
-            ApiId: !Ref WebhooksHttpApi
+            ApiId: !Ref WebhooksApi
             Path: /webhook/instagram
             Method: GET
         InstagramPost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref WebhooksHttpApi
+            ApiId: !Ref WebhooksApi
             Path: /webhook/instagram
             Method: POST
 
-  StandProdWebhookFnStripeSam:
+  StandProdWebhookFnStripe:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-webhook-fn-stripe-sam
+      FunctionName: stand-prod-webhook-fn-stripe
       Description: Processes Stripe webhook events to handle payments, subscriptions, and billing state changes.
       CodeUri: src/stand_prod_webhook_fn_stripe/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StripeLayerArn
       Events:
         StripePost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref WebhooksHttpApi
+            ApiId: !Ref WebhooksApi
             Path: /webhook/stripe
             Method: POST
 
@@ -80,51 +316,79 @@ Resources:
 # GAME CORE
 # =========================
 
-  StandProdGameFnGameSam:
+  StandProdGameFnGame:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-game-sam
+      FunctionName: stand-prod-game-fn-game
       Description: Handles game lifecycle (create, list, update and delete games).
       CodeUri: src/stand_prod_game_fn_game/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
       Events:
-        GameCrud:
+        GameCrudGet:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game
-            Method: ANY
+            Method: GET
+        GameCrudPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game
+            Method: POST
+        GameCrudPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game
+            Method: PUT
+        GameCrudDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game
+            Method: DELETE
 
-  StandProdGameFnAssignSam:
+  StandProdGameFnAssign:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-assign-sam
+      FunctionName: stand-prod-game-fn-assign
       Description: Assigns players to games, enforces plan limits, prevents duplicates, and initializes per-game player state.
       CodeUri: src/stand_prod_game_fn_assign/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Environment:
+        Variables:
+          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          QUIZ_LAMBDA: !Ref StandProdGameFnQuiz
+          CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
       Events:
         AssignPost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/assign
             Method: POST
 
-  StandProdGameValidateSam:
+  StandProdGameValidate:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-validate-sam
+      FunctionName: stand-prod-game-validate
       Description: Validates player participation and game actions based on game rules, feature flags, and completion status.
       CodeUri: src/stand_prod_game_validate/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Environment:
+        Variables:
+          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          QUIZ_LAMBDA_NAME: !Ref StandProdGameFnQuiz
+          CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
       Events:
         ValidatePost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/validate
             Method: POST
 
@@ -132,63 +396,69 @@ Resources:
 # GAME FEATURES
 # =========================
 
-  StandProdGameScoreSam:
+  StandProdGameScore:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-score-sam
+      FunctionName: stand-prod-game-score
       Description: Stores player scores and provides rankings for games that support scoring.
       CodeUri: src/stand_prod_game_score/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
       Events:
         ScoreGet:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/score
             Method: GET
         ScorePost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/score
             Method: POST
 
-  StandProdGameFnQuizSam:
+  StandProdGameFnQuiz:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-quiz-sam
+      FunctionName: stand-prod-game-fn-quiz
       Description: Manages quiz configuration, quiz flow, and player quiz responses for games that include quizzes.
       CodeUri: src/stand_prod_game_fn_quiz/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Environment:
+        Variables:
+          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
       Events:
         QuizGet:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/quiz
             Method: GET
         QuizPost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/quiz
             Method: POST
 
-  StandProdGameFnRaffleSam:
+  StandProdGameFnRaffle:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-raffle-sam
+      FunctionName: stand-prod-game-fn-raffle
       Description: Executes game raffles, selects eligible winners, persists raffle results, and notifies participants.
       CodeUri: src/stand_prod_game_fn_raffle/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Environment:
+        Variables:
+          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
       Events:
         RafflePost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/game/raffle
             Method: POST
 
@@ -196,19 +466,25 @@ Resources:
 # BILLING
 # =========================
 
-  StandProdBillingFnCheckoutSam:
+  StandProdBillingFnCheckout:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-billing-fn-checkout-sam
+      FunctionName: stand-prod-billing-fn-checkout
       Description: Creates and manages Stripe checkout sessions for purchasing plans and subscriptions.
       CodeUri: src/stand_prod_billing_fn_checkout/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StripeLayerArn
+      Environment:
+        Variables:
+          STRIPE_SUCCESS_URL: https://www.playstand.app/home
+          STRIPE_CANCEL_URL: https://www.playstand.app/home
       Events:
         CheckoutPost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/billing/checkout
             Method: POST
 
@@ -216,45 +492,44 @@ Resources:
 # USER & MESSAGING
 # =========================
 
-  StandProdUserFnUserSam:
+  StandProdUserFnUser:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-user-fn-user-sam
+      FunctionName: stand-prod-user-fn-user
       Description: Manages user accounts, authentication-related data, and user-level configuration and limits.
       CodeUri: src/stand_prod_user_fn_user/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
+      Role: !GetAtt StandProdGameRole.Arn
       Events:
         UserPost:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
+            ApiId: !Ref GameApi
             Path: /v1/user
             Method: POST
         MeGet:
           Type: HttpApi
           Properties:
-            ApiId: !Ref GameHttpApi
-            Path: /v1/me
+            ApiId: !Ref GameApi
+            Path: /v1/user/me
             Method: GET
 
-  StandProdMessagingInstagramSenderSam:
+  StandProdMessagingInstagramSender:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-messaging-fn-instagram-sender-sam
+      FunctionName: stand-prod-messaging-fn-instagram-sender
       Description: Sends text messages, quick replies, and media to Instagram users via the Instagram Graph API.
       CodeUri: src/stand_prod_messaging_fn_instagram_sender/
       Handler: lambda_function.lambda_handler
-      Role: arn:aws:iam::781283585341:role/stand-prod-game-role-lambda
-
+      Role: !GetAtt StandProdGameRole.Arn
 # =========================
 # OUTPUTS
 # =========================
 
 Outputs:
   WebhooksApiUrl:
-    Value: !Sub "https://${WebhooksHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Value: !Sub "https://${WebhooksApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
 
   GameApiUrl:
-    Value: !Sub "https://${GameHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Value: !Sub "https://${GameApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
 

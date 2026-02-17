@@ -13,9 +13,22 @@ from botocore.exceptions import ClientError
 dynamodb = boto3.resource("dynamodb")
 
 # ========= ENV =========
-STRIPE_SECRET_KEY = (os.environ.get("STRIPE_SECRET_KEY", "") or "").strip()
-STRIPE_WEBHOOK_SECRET = (os.environ.get("STRIPE_WEBHOOK_SECRET", "") or "").strip()
 USERS_TABLE = (os.environ.get("USERS_TABLE", "") or "").strip()
+
+# Stripe keys solo desde Secrets Manager (STRIPE_SECRET_NAME obligatorio)
+STRIPE_SECRET_KEY = ""
+STRIPE_WEBHOOK_SECRET = ""
+_stripe_secret_name = os.environ.get("STRIPE_SECRET_NAME", "").strip()
+if _stripe_secret_name:
+    try:
+        sm = boto3.client("secretsmanager")
+        raw = sm.get_secret_value(SecretId=_stripe_secret_name)
+        data = json.loads(raw.get("SecretString", "{}"))
+        if data:
+            STRIPE_SECRET_KEY = (data.get("STRIPE_SECRET_KEY") or data.get("SECRET_KEY") or "").strip()
+            STRIPE_WEBHOOK_SECRET = (data.get("STRIPE_WEBHOOK_SECRET") or data.get("WEBHOOK_SECRET") or "").strip()
+    except Exception as e:
+        print(json.dumps({"msg": "stripe_secret_load_failed", "error": repr(e)}))
 
 stripe.api_key = STRIPE_SECRET_KEY
 
