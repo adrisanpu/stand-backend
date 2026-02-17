@@ -2,14 +2,31 @@ import os, json, base64, urllib.parse, urllib.request, re
 import boto3
 
 # ====== ENV VARS ======
-IG_SENDER_ID     = os.environ.get("OWN_PSID","")  # tu PSID de business
 IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
-IG_PAGE_TOKEN    = os.environ.get("IG_PAGE_TOKEN", "")
-VERIFY_TOKEN     = os.environ.get("VERIFY_TOKEN", "global-verify")
-
 ASSIGN_LAMBDA = os.environ.get("ASSIGN_LAMBDA", "stand-prod-game-fn-assign")
 QUIZ_LAMBDA   = os.environ.get("QUIZ_LAMBDA", "stand-prod-game-fn-quizz")
+
+# Instagram keys solo desde Secrets Manager (INSTAGRAM_SECRET_NAME obligatorio)
+# Secret: PAGE_TOKEN, VERIFY_TOKEN, SENDER_ID
+IG_PAGE_TOKEN = ""
+VERIFY_TOKEN  = ""
+IG_SENDER_ID  = ""
+_instagram_secret_name = os.environ.get("INSTAGRAM_SECRET_NAME", "")
+
+if _instagram_secret_name:
+    try:
+        sm = boto3.client("secretsmanager")
+        raw = sm.get_secret_value(SecretId=_instagram_secret_name)
+        data = json.loads(raw.get("SecretString", "{}"))
+        if data:
+            IG_PAGE_TOKEN = data.get("PAGE_TOKEN") or ""
+            VERIFY_TOKEN  = data.get("VERIFY_TOKEN") or ""
+            IG_SENDER_ID  = data.get("SENDER_ID") or ""
+    except Exception as e:
+        print(json.dumps({"msg": "instagram_secret_load_failed", "error": repr(e)}))
 # ======================
+
+print("instagram_secret_loaded", {"keys": list(data.keys()), "has_page_token": bool(IG_PAGE_TOKEN)})
 
 lambda_client = boto3.client("lambda")
 

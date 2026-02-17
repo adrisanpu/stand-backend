@@ -3,12 +3,27 @@ import json
 import urllib.request
 import urllib.parse
 import urllib.error
+import boto3
 
 # --- IG ENV ---
-IG_SENDER_ID     = os.environ.get("IG_SENDER_ID", "")
 IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
-IG_PAGE_TOKEN    = os.environ.get("IG_PAGE_TOKEN", "")
 IG_TIMEOUT       = int(os.environ.get("IG_TIMEOUT_SECONDS", "8"))
+
+# Instagram keys solo desde Secrets Manager (INSTAGRAM_SECRET_NAME obligatorio)
+# Secret: PAGE_TOKEN, VERIFY_TOKEN, SENDER_ID
+IG_PAGE_TOKEN = ""
+IG_SENDER_ID  = ""
+_instagram_secret_name = os.environ.get("INSTAGRAM_SECRET_NAME", "").strip()
+if _instagram_secret_name:
+    try:
+        sm = boto3.client("secretsmanager")
+        raw = sm.get_secret_value(SecretId=_instagram_secret_name)
+        data = json.loads(raw.get("SecretString", "{}"))
+        if data:
+            IG_PAGE_TOKEN = (data.get("PAGE_TOKEN") or data.get("IG_PAGE_TOKEN") or "").strip()
+            IG_SENDER_ID  = (data.get("SENDER_ID") or data.get("IG_SENDER_ID") or "").strip()
+    except Exception as e:
+        print(json.dumps({"msg": "instagram_secret_load_failed", "error": repr(e)}))
 
 
 def log(msg, obj=None):
