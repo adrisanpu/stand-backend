@@ -37,4 +37,7 @@ Config for deploy is in `samconfig.toml` (stack: `stand-backend-prod`, region: `
 
 ## Repo
 
-This folder is its own git repo; remote: [stand-backend](https://github.com/adrisanpu/stand-backend).
+- **Remote:** [stand-backend](https://github.com/adrisanpu/stand-backend)
+- **Default branch:** `main`
+
+To use `main` as the default on GitHub: **Settings → General → Default branch** → switch to `main` → Save. Then you can delete the `master` branch on the remote if desired.
