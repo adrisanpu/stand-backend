@@ -109,10 +109,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
     if not item:
         return {"ok": False, "error": "player_not_found", "message": "No existe ningún jugador con ese playerId."}
 
-    # 2) asegurar mapas type.<GAME>
-    _ensure_type_maps(game_id, player_id, gk, gp_table)
-
-    # 3) escribir score/timer
+    # 2) escribir score/timer (type map pre-initialized by assigner on join)
     now = _iso_now()
 
     gp_table.update_item(

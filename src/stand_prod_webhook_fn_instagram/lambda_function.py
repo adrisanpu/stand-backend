@@ -1,5 +1,6 @@
 import os, json, base64, urllib.parse, urllib.request, re
 import boto3
+from stand_common.utils import log
 
 # ====== ENV VARS ======
 IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
@@ -22,22 +23,14 @@ if _instagram_secret_name:
             IG_PAGE_TOKEN = data.get("PAGE_TOKEN") or ""
             VERIFY_TOKEN  = data.get("VERIFY_TOKEN") or ""
             IG_SENDER_ID  = data.get("SENDER_ID") or ""
+            log("instagram_secret_loaded", {"keys": list(data.keys()), "has_page_token": bool(IG_PAGE_TOKEN)})
     except Exception as e:
         print(json.dumps({"msg": "instagram_secret_load_failed", "error": repr(e)}))
 # ======================
 
-print("instagram_secret_loaded", {"keys": list(data.keys()), "has_page_token": bool(IG_PAGE_TOKEN)})
-
 lambda_client = boto3.client("lambda")
 
 JSON_HEADERS = {"Content-Type": "application/json"}
-
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
 
 
 def _ok(status=200, body=None, headers=None):

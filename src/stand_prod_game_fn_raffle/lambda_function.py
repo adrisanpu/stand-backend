@@ -10,11 +10,13 @@ from collections import defaultdict
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
+GSI_RAFFLE_ELIGIBLE = os.environ.get("GSI_RAFFLE_ELIGIBLE", "gsi-raffleEligible")
 # =================================
 
 dynamo_r = boto3.resource("dynamodb")
@@ -22,44 +24,6 @@ lambda_client = boto3.client("lambda")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
-
-
-# ----------------- util -----------------
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-
-def _json_sanitize(obj):
-    if isinstance(obj, Decimal):
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-
-def _resp(code, body):
-    if not isinstance(body, str):
-        body = json.dumps(_json_sanitize(body), ensure_ascii=False)
-    return {"statusCode": int(code), "headers": {"Content-Type": "application/json"}, "body": body}
-
-
-def _iso_now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _as_int(x):
-    try:
-        if isinstance(x, Decimal):
-            return int(x)
-        return int(x)
-    except Exception:
-        return None
 
 
 def _parse_event(event):
@@ -196,7 +160,7 @@ def _save_raffle_winners_to_game(game_id: str, winners: list[dict], only_validat
 
 def _query_all_players(game_id: str):
     """
-    Query por partición (gameId). Particiones pequeñas (maxPlayers <= 25/...)
+    Query por partición (gameId). Usado para broadcast a todos los jugadores.
     """
     items = []
     last = None
@@ -210,6 +174,49 @@ def _query_all_players(game_id: str):
         if not last:
             break
     return items
+
+
+def _query_eligible_players(game_id: str):
+    """
+    Query GSI gsi-raffleEligible (PK=eligibleForGameId) to get only
+    raffle-eligible players. The attribute is removed when a player wins,
+    so this index is sparse and contains only current candidates.
+    Falls back to _query_all_players + _is_raffle_eligible filter if the
+    GSI is unavailable (e.g. during a blue/green deployment).
+    """
+    try:
+        items = []
+        last = None
+        while True:
+            kwargs = {
+                "IndexName": GSI_RAFFLE_ELIGIBLE,
+                "KeyConditionExpression": Key("eligibleForGameId").eq(game_id),
+            }
+            if last:
+                kwargs["ExclusiveStartKey"] = last
+            resp = gp_table.query(**kwargs)
+            items.extend(resp.get("Items") or [])
+            last = resp.get("LastEvaluatedKey")
+            if not last:
+                break
+
+        # GSI projection is KEYS_ONLY; fetch full items in batch
+        if not items:
+            return []
+        keys = [{"gameId": it["gameId"], "playerId": it["playerId"]} for it in items]
+        result = []
+        # BatchGetItem supports up to 100 items per call
+        for i in range(0, len(keys), 100):
+            batch = keys[i:i + 100]
+            resp = dynamo_r.batch_get_item(
+                RequestItems={GAMEPLAYER_TABLE: {"Keys": batch}}
+            )
+            result.extend(resp.get("Responses", {}).get(GAMEPLAYER_TABLE, []))
+        return result
+
+    except Exception as e:
+        log("raffle_gsi_fallback", {"error": repr(e), "gameId": game_id})
+        return [it for it in _query_all_players(game_id) if _is_raffle_eligible(it, "")]
 
 
 def _is_raffle_eligible(it: dict, game_type_upper: str) -> bool:
@@ -274,13 +281,14 @@ def _mark_winner(game_id: str, player_id: int, game_type_upper: str, win_ts: str
         ExpressionAttributeValues={":ginit": {}},
     )
 
-    # 3) set flags (solo paths hijos)
+    # 3) set flags + remove sparse GSI key so player leaves the eligible index
     gp_table.update_item(
         Key=key,
         UpdateExpression=(
             "SET #type.#g.raffleEligible = :f, "
             "#type.#g.raffleWin = :t, "
-            "#type.#g.raffleWinAt = :ts"
+            "#type.#g.raffleWinAt = :ts "
+            "REMOVE eligibleForGameId"
         ),
         ExpressionAttributeNames={"#type": "type", "#g": gk},
         ExpressionAttributeValues={":f": False, ":t": True, ":ts": win_ts},
@@ -326,12 +334,12 @@ def lambda_handler(event, context):
         if not game_type:
             return _resp(500, {"ok": False, "error": "MissingGameType"})
 
-        # 1) jugadores del game
-        items = _query_all_players(game_id)
+        # 1) all players → for broadcast DMs
+        all_items = _query_all_players(game_id)
 
         # 2) everyone notifiable (para broadcast)
         notifiable = []
-        for it in items:
+        for it in all_items:
             pid = _as_int(it.get("playerId"))
             if pid is None or pid <= 0:
                 continue
@@ -344,19 +352,21 @@ def lambda_handler(event, context):
                 "item": it,
             })
 
-        # 3) candidates (elegibles)
+        # 3) candidates — query the sparse GSI so only eligible players are returned
+        eligible_items = _query_eligible_players(game_id)
         candidates = []
-        for p in notifiable:
-            it = p["item"]
-            if not _is_raffle_eligible(it, game_type):
+        for it in eligible_items:
+            pid = _as_int(it.get("playerId"))
+            if pid is None or pid <= 0:
+                continue
+            if not _has_psid(it):
                 continue
             if only_validated and not _is_validated(it):
                 continue
-
             candidates.append({
-                "playerId": p["playerId"],
-                "instagramPSID": p["instagramPSID"],
-                "instagramUsername": p.get("instagramUsername"),
+                "playerId": pid,
+                "instagramPSID": it.get("instagramPSID"),
+                "instagramUsername": it.get("instagramUsername"),
                 "validationCode": it.get("validationCode"),
             })
 

@@ -1,13 +1,13 @@
 import os
 import json
 import base64
-import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -20,46 +20,6 @@ lambda_client = boto3.client("lambda")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
-
-HEADERS = {"Content-Type": "application/json"}
-
-
-# ----------------- util -----------------
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-
-def _json_sanitize(obj):
-    if isinstance(obj, Decimal):
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-
-def _resp(code, body):
-    if not isinstance(body, str):
-        body = json.dumps(_json_sanitize(body), ensure_ascii=False)
-    return {"statusCode": int(code), "body": body, "headers": HEADERS}
-
-
-def _iso_now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _as_int(x):
-    try:
-        if isinstance(x, Decimal):
-            return int(x)
-        return int(x)
-    except Exception:
-        return None
 
 
 def _parse_http_event(event: dict):
@@ -118,6 +78,15 @@ def _send_dm(psid: str, text: str) -> bool:
 
 
 def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> bool:
+    msg = _build_quiz_question_message(psid, question_id, questions_cfg)
+    if not msg:
+        return False
+    _invoke_instagram_sender([msg])
+    return True
+
+
+def _build_quiz_question_message(psid: str, question_id: str, questions_cfg: dict) -> dict | None:
+    """Build a single message dict for a quiz question (for batching with intro)."""
     q = questions_cfg.get(question_id) or {}
     text = (q.get("text") or "").strip()
     options = q.get("options", []) or []
@@ -131,10 +100,8 @@ def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> boo
         quick_replies.append({"content_type": "text", "title": title, "payload": payload})
 
     if not quick_replies:
-        return _send_dm(psid, text)
-
-    _invoke_instagram_sender([{"psid": psid, "text": text, "quick_replies": quick_replies}])
-    return True
+        return {"psid": psid, "text": text} if text else None
+    return {"psid": psid, "text": text, "quick_replies": quick_replies}
 
 
 # ----------------- Quiz meta (game-table) -----------------
@@ -372,6 +339,19 @@ def _parse_quiz_payload(payload: str):
 # ----------------- MAIN handler -----------------
 
 def lambda_handler(event, context):
+    # ========== SQS MODE ==========
+    # Triggered by StandProdQuizQueue; each record carries a quiz_start payload.
+    if isinstance(event, dict) and "Records" in event:
+        results = []
+        for record in event["Records"]:
+            try:
+                inner = json.loads(record.get("body") or "{}")
+                results.append(lambda_handler(inner, context))
+            except Exception as e:
+                log("sqs_record_error", {"error": repr(e)})
+                results.append({"ok": False, "error": repr(e)})
+        return {"ok": True, "processed": len(event["Records"]), "results": results}
+
     # ========== HTTP MODE ==========
     if isinstance(event, dict) and ("httpMethod" in event or "requestContext" in event):
         method, body, qs = _parse_http_event(event)
@@ -533,14 +513,15 @@ def lambda_handler(event, context):
                 if pid is None:
                     results.append({"psid": psid, "started": False, "reason": "bad_playerId"})
                     continue
-                
-                _send_dm(psid, QUIZ_INTRO_TEXT)
 
-                time.sleep(1)
+                # Send intro then first question in one batch so order is guaranteed
+                first_q_msg = _build_quiz_question_message(psid, first_qid, quiz_questions)
+                messages = [{"psid": psid, "text": QUIZ_INTRO_TEXT}]
+                if first_q_msg:
+                    messages.append(first_q_msg)
+                _invoke_instagram_sender(messages)
 
                 _set_quiz_state(game_id, pid, game_type, first_qid, completed=False)
-
-                _send_quiz_question(psid, first_qid, quiz_questions)
 
                 results.append({"psid": psid, "started": True, "playerId": pid, "firstQuestion": first_qid})
 

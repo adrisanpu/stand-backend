@@ -4,6 +4,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import boto3
+from stand_common.utils import log
 
 # --- IG ENV ---
 IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
@@ -24,13 +25,6 @@ if _instagram_secret_name:
             IG_SENDER_ID  = (data.get("SENDER_ID") or data.get("IG_SENDER_ID") or "").strip()
     except Exception as e:
         print(json.dumps({"msg": "instagram_secret_load_failed", "error": repr(e)}))
-
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
 
 
 def _graph_post(path: str, payload: dict):

@@ -7,6 +7,7 @@ from typing import Optional
 import boto3
 import stripe
 from botocore.exceptions import ClientError
+from stand_common.utils import log, _resp, _iso_now, _parse_iso, _get_claims, _get_http_method
 
 # ========= AWS =========
 dynamodb = boto3.resource("dynamodb")
@@ -36,26 +37,6 @@ if _stripe_secret_name:
 stripe.api_key = STRIPE_SECRET_KEY
 
 
-def log(msg, data=None):
-    print(json.dumps({"msg": msg, "data": data}, ensure_ascii=False))
-
-
-def _resp(status: int, body: dict):
-    return {
-        "statusCode": int(status),
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body, ensure_ascii=False),
-    }
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
 def _is_expired(active_until: Optional[str]) -> bool:
     if not active_until:
         return False
@@ -63,20 +44,6 @@ def _is_expired(active_until: Optional[str]) -> bool:
         return datetime.now(timezone.utc) > _parse_iso(active_until)
     except Exception:
         return False
-
-
-def _get_http_method(event: dict) -> str:
-    method = event.get("requestContext", {}).get("http", {}).get("method")
-    if method:
-        return method.upper()
-    return (event.get("httpMethod") or "").upper()
-
-
-def _get_claims(event: dict) -> dict:
-    rc = (event or {}).get("requestContext") or {}
-    auth = rc.get("authorizer") or {}
-    jwt = auth.get("jwt") or {}
-    return jwt.get("claims") or auth.get("claims") or {}
 
 
 def _normalize_user(item: dict) -> dict:

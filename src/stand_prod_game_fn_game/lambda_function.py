@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _parse_iso, _get_claims, _read_json_body
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -26,71 +27,15 @@ gp_table = dynamodb.Table(GAMEPLAYER_TABLE)
 catalog_table = dynamodb.Table(CATALOG_TABLE)
 
 # ========= CONST =========
-SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO"}
+SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS"}
 
-# numeric 6 digits 
+# numeric 6 digits
 JOIN_CODE_ALPHABET = "0123456789"
 JOIN_CODE_LENGTH = 6
 JOIN_CODE_MAX_ATTEMPTS = 10
 
-HEADERS = {"Content-Type": "application/json"}
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-def _resp(status, body):
-    if not isinstance(body, str):
-        body = json.dumps(_json_sanitize(body), ensure_ascii=False)
-    return {
-        "statusCode": int(status),
-        "headers": HEADERS,
-        "body": body,
-        "isBase64Encoded": False,
-    }
-
-def _json_sanitize(obj):
-    """
-    Convierte Decimals de DynamoDB a int/float para que json.dumps no falle.
-    Mantiene dict/list recursivamente.
-    """
-    if isinstance(obj, Decimal):
-        # si es entero -> int, si no -> float
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def _get_claims(event: dict) -> dict:
-    rc = (event or {}).get("requestContext") or {}
-    auth = rc.get("authorizer") or {}
-    jwt = auth.get("jwt") or {}
-    return jwt.get("claims") or auth.get("claims") or {}
-
-def _read_json_body(event):
-    raw = event.get("body") or "{}"
-    try:
-        return json.loads(raw) if isinstance(raw, str) else (raw or {})
-    except Exception:
-        return None
-
 def _get_query_params(event):
     return event.get("queryStringParameters") or {}
-
-def _parse_iso_dt(s: str):
-    if not s or not isinstance(s, str):
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
 
 def _is_user_pro(user_item: dict) -> bool:
     if not user_item:
@@ -98,7 +43,7 @@ def _is_user_pro(user_item: dict) -> bool:
     plan = (user_item.get("plan") or "FREE").upper().strip()
     if plan == "FREE":
         return False
-    au = _parse_iso_dt(user_item.get("activeUntil"))
+    au = _parse_iso(user_item.get("activeUntil"))
     if not au:
         return False
     return au > datetime.now(timezone.utc)
@@ -401,7 +346,7 @@ def _handle_post(event):
             log("GameName uniqueness check failed", {"error": str(e)})
             return _resp(500, {"error": "GameNameCheckFailed", "detail": str(e)})
 
-    now = _now_iso()
+    now = _iso_now()
     max_players = 25 if not is_pro else 9999
 
     # Generate unique join code (gameId) with retries
@@ -478,7 +423,7 @@ def _handle_put(event):
     if not isinstance(is_active, bool):
         return _resp(400, {"error": "Field 'isActive' must be a boolean."})
 
-    now = _now_iso()
+    now = _iso_now()
 
     try:
         resp = games_table.update_item(

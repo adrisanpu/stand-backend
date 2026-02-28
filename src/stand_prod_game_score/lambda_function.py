@@ -5,6 +5,7 @@ import base64
 from decimal import Decimal
 
 import boto3
+from stand_common.utils import log, _json_sanitize, _resp
 
 import games.t1mer as t1mer
 
@@ -16,33 +17,6 @@ GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-tab
 dynamo_r = boto3.resource("dynamodb")
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
-
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": _json_sanitize(obj)}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-
-def _json_sanitize(obj):
-    if isinstance(obj, Decimal):
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-
-def _resp(status, body):
-    if not isinstance(body, str):
-        body = json.dumps(_json_sanitize(body), ensure_ascii=False)
-    return {
-        "statusCode": int(status),
-        "headers": {"Content-Type": "application/json"},
-        "body": body,
-    }
 
 
 def _parse_body(event):
