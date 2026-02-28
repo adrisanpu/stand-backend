@@ -24,7 +24,7 @@ Globals:
         GAMEPLAYER_TABLE: !Ref StandProdGameplayerTable
         CATALOG_TABLE: !Ref StandProdCatalogTable
         INSTAGRAM_SECRET_NAME: stand/prod/instagram
-        STRIPE_SECRET_NAME: stand/dev/stripe
+        STRIPE_SECRET_NAME: stand/prod/stripe
 
 Resources:
 
@@ -92,8 +92,19 @@ Resources:
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-instagramPSID"
                 - TableName: !Ref StandProdGameplayerTable
               - !Sub
+                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-raffleEligible"
+                - TableName: !Ref StandProdGameplayerTable
+              - !Sub
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdCatalogTable
+          - Sid: SQSQuizQueue
+            Effect: Allow
+            Action:
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt StandProdQuizQueue.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -111,10 +122,130 @@ Resources:
               - ssm:GetParameter
               - ssm:GetParameters
             Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/prod/config/*"
-          - Sid: SecretsManager
-            Effect: Allow
-            Action: secretsmanager:GetSecretValue
-            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/*"
+          # Game functions invoke the sender Lambda for all IG/Stripe calls — no secret access needed here.
+
+# ----- Webhook role (Instagram webhook dispatcher) -----
+
+  StandProdWebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stand-prod-webhook-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: stand-prod-webhook-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Sid: LambdaInvoke
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-game-fn-assign"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-game-fn-quiz"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-messaging-fn-instagram-sender"
+              - Sid: SecretsManager
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/instagram*"
+
+# ----- Billing role (Stripe webhook + checkout + user) -----
+
+  StandProdBillingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stand-prod-billing-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: stand-prod-billing-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !Sub
+                    - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                    - TableName: !Ref StandProdUserTable
+              - Sid: SecretsManager
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/stripe*"
+
+# ----- Sender role (Instagram DM sender — no DB, just calls Graph API) -----
+
+  StandProdSenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stand-prod-sender-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: stand-prod-sender-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Sid: SecretsManager
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/instagram*"
+
+# =========================
+# LAMBDA LAYERS
+# =========================
+
+  StandCommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: stand-common
+      Description: Shared utilities (log, _resp, _iso_now, etc.) for all Stand Lambda functions.
+      ContentUri: layers/stand_common/
+      CompatibleRuntimes:
+        - python3.13
+      RetentionPolicy: Delete
 
 # =========================
 # DYNAMODB TABLES
@@ -173,6 +304,8 @@ Resources:
           AttributeType: N
         - AttributeName: instagramPSID
           AttributeType: S
+        - AttributeName: eligibleForGameId
+          AttributeType: S
       KeySchema:
         - AttributeName: gameId
           KeyType: HASH
@@ -187,6 +320,14 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+        - IndexName: gsi-raffleEligible
+          KeySchema:
+            - AttributeName: eligibleForGameId
+              KeyType: HASH
+            - AttributeName: playerId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
 
   StandProdCatalogTable:
     Type: AWS::DynamoDB::Table
@@ -205,6 +346,24 @@ Resources:
           KeyType: RANGE
 
 # =========================
+# SQS
+# =========================
+
+  StandProdQuizDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: stand-prod-quiz-dlq
+      MessageRetentionPeriod: 86400  # 1 day
+
+  StandProdQuizQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: stand-prod-quiz-queue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt StandProdQuizDLQ.Arn
+        maxReceiveCount: 3
+
+# =========================
 # S3
 # =========================
 
@@ -212,6 +371,17 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "stand-prod-empareja2-characters-${AWS::AccountId}"
+
+  InfocardsUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stand-prod-infocards-uploads-${AWS::AccountId}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [PUT]
+            AllowedOrigins: ["*"]
+            MaxAge: 3600
 
 # =========================
 # HTTP APIs
@@ -275,7 +445,9 @@ Resources:
       Description: Receives and dispatches Instagram webhook events to the appropriate internal game and messaging services.
       CodeUri: src/stand_prod_webhook_fn_instagram/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandProdWebhookRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
@@ -301,9 +473,10 @@ Resources:
       Description: Processes Stripe webhook events to handle payments, subscriptions, and billing state changes.
       CodeUri: src/stand_prod_webhook_fn_stripe/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandProdBillingRole.Arn
       Layers:
         - !Ref StripeLayerArn
+        - !Ref StandCommonLayer
       Events:
         StripePost:
           Type: HttpApi
@@ -324,6 +497,8 @@ Resources:
       CodeUri: src/stand_prod_game_fn_game/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Events:
         GameCrudGet:
           Type: HttpApi
@@ -358,10 +533,12 @@ Resources:
       CodeUri: src/stand_prod_game_fn_assign/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          QUIZ_LAMBDA: !Ref StandProdGameFnQuiz
+          QUIZ_QUEUE_URL: !Ref StandProdQuizQueue
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
       Events:
         AssignPost:
@@ -379,6 +556,8 @@ Resources:
       CodeUri: src/stand_prod_game_validate/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
@@ -404,6 +583,8 @@ Resources:
       CodeUri: src/stand_prod_game_score/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Events:
         ScoreGet:
           Type: HttpApi
@@ -426,6 +607,8 @@ Resources:
       CodeUri: src/stand_prod_game_fn_quiz/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
@@ -442,6 +625,11 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/quiz
             Method: POST
+        QuizSQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt StandProdQuizQueue.Arn
+            BatchSize: 1
 
   StandProdGameFnRaffle:
     Type: AWS::Serverless::Function
@@ -451,6 +639,8 @@ Resources:
       CodeUri: src/stand_prod_game_fn_raffle/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
@@ -473,9 +663,10 @@ Resources:
       Description: Creates and manages Stripe checkout sessions for purchasing plans and subscriptions.
       CodeUri: src/stand_prod_billing_fn_checkout/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandProdBillingRole.Arn
       Layers:
         - !Ref StripeLayerArn
+        - !Ref StandCommonLayer
       Environment:
         Variables:
           STRIPE_SUCCESS_URL: https://www.playstand.app/home
@@ -499,7 +690,9 @@ Resources:
       Description: Manages user accounts, authentication-related data, and user-level configuration and limits.
       CodeUri: src/stand_prod_user_fn_user/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandProdBillingRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
       Events:
         UserPost:
           Type: HttpApi
@@ -521,7 +714,166 @@ Resources:
       Description: Sends text messages, quick replies, and media to Instagram users via the Instagram Graph API.
       CodeUri: src/stand_prod_messaging_fn_instagram_sender/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandProdSenderRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+
+# =========================
+# INFOCARDS
+# =========================
+
+  StandProdInfocardsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stand-prod-infocards-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: stand-prod-infocards-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub
+                    - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                    - TableName: !Ref StandProdGameTable
+              - Sid: S3InfocardsUploads
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::stand-prod-infocards-uploads-${AWS::AccountId}/*"
+              - Sid: S3InfocardsPresign
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::stand-prod-infocards-uploads-${AWS::AccountId}/*"
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0"
+              - Sid: LambdaInvokeQuizGenerate
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-quiz-fn-generate"
+
+  StandProdInfocardsFnGet:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-infocards-fn-get
+      Description: Returns info cards for an INFOCARDS game (GET) and persists updated cards with media keys (PUT).
+      CodeUri: src/stand_prod_infocards_fn_get/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdInfocardsRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
+      Events:
+        InfocardsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/infocards
+            Method: GET
+        InfocardsPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/infocards
+            Method: PUT
+
+  StandProdInfocardsFnUploadUrl:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-infocards-fn-upload-url
+      Description: Generates S3 presigned PUT URLs for infocards content uploads.
+      CodeUri: src/stand_prod_infocards_fn_upload_url/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdInfocardsRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Timeout: 15
+      Environment:
+        Variables:
+          INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
+      Events:
+        InfocardsUploadUrlPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/infocards/upload-url
+            Method: POST
+
+  StandProdInfocardsFnProcess:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-infocards-fn-process
+      Description: Processes uploaded content with Bedrock AI to generate info cards (and optionally a quiz).
+      CodeUri: src/stand_prod_infocards_fn_process/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdInfocardsRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
+          BEDROCK_REGION: us-east-1
+          BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
+          QUIZ_GENERATE_FUNCTION_NAME: stand-prod-quiz-fn-generate
+      Events:
+        InfocardsProcessPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/infocards/process
+            Method: POST
+
+  StandProdQuizFnGenerate:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-quiz-fn-generate
+      Description: Generates quiz questions from a text prompt using Bedrock AI and saves them.
+      CodeUri: src/stand_prod_quiz_fn_generate/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdInfocardsRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Timeout: 60
+      Environment:
+        Variables:
+          BEDROCK_REGION: us-east-1
+          BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
+      Events:
+        QuizGeneratePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/quiz/generate
+            Method: POST
+
 # =========================
 # OUTPUTS
 # =========================
