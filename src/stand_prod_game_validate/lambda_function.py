@@ -7,6 +7,7 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now
 
 # ===== ENV =====
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "")
@@ -26,33 +27,6 @@ s3 = boto3.client("s3")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
-
-HEADERS = {"Content-Type": "application/json"}
-
-# ===== Logging / JSON =====
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-def _json_sanitize(obj):
-    if isinstance(obj, Decimal):
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-def _resp(code: int, body):
-    if not isinstance(body, str):
-        body = json.dumps(_json_sanitize(body), ensure_ascii=False)
-    return {"statusCode": int(code), "headers": HEADERS, "body": body}
-
-def _iso_now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 # ===== Parsing =====
 
@@ -222,15 +196,11 @@ def is_quiz_completed(player_item: dict, game_type_upper: str) -> bool:
 
 # ===== Validators registry =====
 from validators.empareja2 import validate_empareja2
-from validators.t1mer import validate_single_code_t1mer
-from validators.rulet4 import validate_single_code_rulet4
 from validators.generic import validate_generic
 from validators.semaforo import validate_semaforo
 
 VALIDATORS = {
     "EMPAREJA2": validate_empareja2,
-    "T1MER": validate_single_code_t1mer,
-    "RULET4": validate_single_code_rulet4,
     "SEMAFORO": validate_semaforo,
 }
 

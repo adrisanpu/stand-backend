@@ -12,7 +12,7 @@ EMPAREJA2_CATALOG_ID = os.environ.get("EMPAREJA2_CATALOG_ID", "EMPAREJA2#CHARACT
 # Optional character images
 CHAR_BUCKET = os.environ.get("CHAR_BUCKET", "")
 CHAR_REGION = os.environ.get("CHAR_REGION", "us-east-1")
-CHAR_URL_EXPIRES = int(os.environ.get("CHAR_URL_EXPIRES", "120"))
+CHAR_URL_EXPIRES = int(os.environ.get("CHAR_URL_EXPIRES", "7200"))
 
 _CATALOG_CACHE = {}
 _s3 = boto3.client("s3", region_name=CHAR_REGION)

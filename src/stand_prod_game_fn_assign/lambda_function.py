@@ -1,19 +1,19 @@
 import os
 import json
 import random
-import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
+from stand_common.utils import log, _json_sanitize, _iso_now
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
-QUIZ_LAMBDA = os.environ.get("QUIZ_LAMBDA", "stand-prod-game-fn-quiz")
+QUIZ_QUEUE_URL = os.environ.get("QUIZ_QUEUE_URL", "")
 
 
 # Optional GSI
@@ -22,30 +22,10 @@ GSI_INSTAGRAM_PSID = os.environ.get("GSI_INSTAGRAM_PSID", "gsi-instagramPSID")
 # ========= AWS =========
 dynamo_r = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
+sqs_client = boto3.client("sqs")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
-
-# ========= Helpers =========
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-def _json_sanitize(obj):
-    """Convert Dynamo Decimals to int/float recursively (safe for logging/returns)."""
-    if isinstance(obj, Decimal):
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 def _code4() -> int:
     return random.randint(1000, 9999)
@@ -181,53 +161,25 @@ def _put_player(item: dict) -> None:
     )
 
 
-def _invoke_quiz_start(game_id: str, psid: str):
-    if not QUIZ_LAMBDA:
-        log("assign_quiz_lambda_missing", {"gameId": game_id})
+def _enqueue_quiz_start(game_id: str, psid: str, delay_seconds: int = 3):
+    """Send a quiz_start event to SQS with a short delay so the welcome DM
+    has time to be delivered before the quiz intro arrives."""
+    if not QUIZ_QUEUE_URL:
+        log("assign_quiz_queue_missing", {"gameId": game_id})
         return
     try:
-        lambda_client.invoke(
-            FunctionName=QUIZ_LAMBDA,
-            InvocationType="Event",
-            Payload=json.dumps({
+        sqs_client.send_message(
+            QueueUrl=QUIZ_QUEUE_URL,
+            MessageBody=json.dumps({
                 "kind": "quiz_start",
                 "gameId": game_id,
                 "psid": [psid],
-            }, ensure_ascii=False).encode("utf-8"),
+            }, ensure_ascii=False),
+            DelaySeconds=delay_seconds,
         )
     except Exception as e:
-        log("assign_quiz_invoke_error", {"error": repr(e), "quizLambda": QUIZ_LAMBDA})
+        log("assign_quiz_enqueue_error", {"error": repr(e), "gameId": game_id})
 
-
-def _invoke_quiz_start_sync(game_id: str, psid: str) -> dict:
-    if not QUIZ_LAMBDA:
-        return {"ok": False, "error": "no_quiz_config"}
-    try:
-        resp = lambda_client.invoke(
-            FunctionName=QUIZ_LAMBDA,
-            InvocationType="RequestResponse",
-            Payload=json.dumps({
-                "kind": "quiz_start",
-                "gameId": game_id,
-                "psid": [psid],
-            }, ensure_ascii=False).encode("utf-8"),
-        )
-        payload_bytes = resp.get("Payload").read() if resp.get("Payload") else b""
-        payload_str = payload_bytes.decode("utf-8", errors="replace").strip()
-        out = json.loads(payload_str) if payload_str else {}
-        print(out)
-        if resp.get("FunctionError"):
-            return {"ok": False, "error": "quiz_function_error", "detail": out}
-        return out if isinstance(out, dict) else {"ok": False, "error": "quiz_bad_payload"}
-    except Exception as e:
-        log("assign_quiz_invoke_error", {"error": repr(e), "quizLambda": QUIZ_LAMBDA})
-        return {"ok": False, "error": "quiz_invoke_error"}
-
-
-QUIZ_TAIL = (
-    "Antes de jugar, tienes que responder un mini quiz.\n"
-    "Cuando lo termines, te enviaré tu código para validar en la pantalla. ✅"
-)
 
 def _code_tail(code) -> str:
     return f"🎟️ Tu código para jugar es: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀"
@@ -237,16 +189,10 @@ def _code_tail(code) -> str:
 # ========= Assigners registry =========
 # Import here (not top) to avoid circular imports
 from assigners.empareja2 import assign_empareja2
-from assigners.t1mer import assign_t1mer
-from assigners.rulet4 import assign_rulet4
-from assigners.semaforo import assign_semaforo
 from assigners.generic import assign_generic
 
 ASSIGNERS = {
     "EMPAREJA2": assign_empareja2,
-    "T1MER": assign_t1mer,
-    "RULET4": assign_rulet4,
-    "SEMAFORO": assign_semaforo,
 }
 
 def lambda_handler(event, context):
@@ -297,12 +243,13 @@ def lambda_handler(event, context):
         if existing:
             pid = existing.get("playerId")
             _send_single_dm(psid, "Ya estabas dentro del juego ✅\nSi no has completado el quiz, te lo vuelvo a enviar ahora.")
-            qr = _invoke_quiz_start_sync(game_id, psid)
-            # If quiz is not configured, reveal the code immediately
-            if (qr or {}).get("ok") is False and (qr or {}).get("error") == "no_quiz_config":
+            quiz_enabled = bool(meta.get("quizOrder"))
+            if quiz_enabled:
+                _enqueue_quiz_start(game_id, psid)
+            else:
                 code = existing.get("validationCode")
                 if code is not None:
-                    _send_code_now(psid, code)
+                    _send_single_dm(psid, _code_tail(code))
             log("assign_already_joined", {"gameId": game_id, "psid": psid, "playerId": pid})
             return _json_sanitize({
                 "ok": True,
@@ -346,6 +293,7 @@ def lambda_handler(event, context):
                 "joinedAt": now,
                 "validated": False,
                 "validationCode": _code4(),
+                "eligibleForGameId": game_id,  # sparse GSI key for raffle candidate queries
             }
 
             assigner = ASSIGNERS.get(game_type, assign_generic)
@@ -382,13 +330,11 @@ def lambda_handler(event, context):
                 if welcome_header:
                     _send_single_dm(psid, welcome_header)
 
-                time.sleep(1)
-                # 3) attempt to start quiz (sync)
-                qr = _invoke_quiz_start_sync(game_id, psid)
-                no_quiz = (qr or {}).get("ok") is False and (qr or {}).get("error") == "no_quiz_config"
-
-                # 4) if no quiz, send code now
-                if no_quiz:
+                # 3) start quiz or send code
+                quiz_enabled = bool(meta.get("quizOrder"))
+                if quiz_enabled:
+                    _enqueue_quiz_start(game_id, psid)
+                else:
                     _send_single_dm(psid, _code_tail(base_item["validationCode"]))
 
                 log("assign_ok", {
@@ -398,7 +344,7 @@ def lambda_handler(event, context):
                     "gameType": game_type,
                     "playerId": new_pid,
                     "created_new": True,
-                    "no_quiz": no_quiz,
+                    "quiz_enabled": quiz_enabled,
                 })
 
                 safe = _json_sanitize(base_item)
@@ -408,7 +354,7 @@ def lambda_handler(event, context):
                     "gameId": game_id,
                     "gameType": game_type,
                     "player": safe,
-                    "quizStart": qr,
+                    "quizEnabled": quiz_enabled,
                 }
 
             except ClientError as e:
