@@ -81,7 +81,19 @@ def _handle_get(event, owner_user_id):
     raw_cards = blob.get("cards") or []
     cards = [_presign_card_urls(c) for c in raw_cards]
 
-    return _resp(200, {"ok": True, "gameId": game_id, "cards": cards})
+    # Participation/sorteo: defaults for existing games
+    requires_validation = blob.get("requiresValidation", False)
+    if not isinstance(requires_validation, bool):
+        requires_validation = False
+    quiz_completed_message = (blob.get("quizCompletedMessage") or "").strip()
+
+    return _resp(200, {
+        "ok": True,
+        "gameId": game_id,
+        "cards": cards,
+        "requiresValidation": requires_validation,
+        "quizCompletedMessage": quiz_completed_message,
+    })
 
 
 def _handle_put(event, owner_user_id):
@@ -112,24 +124,45 @@ def _handle_put(event, owner_user_id):
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
+    # Optional participation settings (merge into blob)
+    requires_validation = body.get("requiresValidation")
+    quiz_completed_message = body.get("quizCompletedMessage")
+
+    # Current blob to merge (preserve other keys)
+    blob = get_game_type_blob(item, "INFOCARDS")
+    new_blob = dict(blob)
+    new_blob["cards"] = []  # set below
+
+    if requires_validation is not None:
+        new_blob["requiresValidation"] = bool(requires_validation)
+    if quiz_completed_message is not None:
+        new_blob["quizCompletedMessage"] = (quiz_completed_message or "").strip()
+
     # Strip ephemeral client-side fields; keep only persisted fields
     clean_cards = []
     for card in cards:
-        clean_cards.append({
+        clean = {
             "id": card.get("id", ""),
             "title": card.get("title", ""),
             "body": card.get("body", ""),
             "imageKey": card.get("imageKey"),
             "videoKey": card.get("videoKey"),
             "order": card.get("order", 0),
-        })
+        }
+        if card.get("imagePositionX") is not None:
+            clean["imagePositionX"] = card["imagePositionX"]
+        if card.get("imagePositionY") is not None:
+            clean["imagePositionY"] = card["imagePositionY"]
+        clean_cards.append(clean)
+
+    new_blob["cards"] = clean_cards
 
     try:
         set_game_type_blob(
             games_table,
             game_id,
             "INFOCARDS",
-            {"cards": clean_cards},
+            new_blob,
             updated_at=_iso_now(),
             condition_expression="attribute_exists(gameId)",
         )

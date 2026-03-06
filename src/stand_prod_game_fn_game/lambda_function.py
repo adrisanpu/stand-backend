@@ -29,9 +29,9 @@ catalog_table = dynamodb.Table(CATALOG_TABLE)
 # ========= CONST =========
 SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS"}
 
-# numeric 6 digits
+# numeric 4 digits
 JOIN_CODE_ALPHABET = "0123456789"
-JOIN_CODE_LENGTH = 6
+JOIN_CODE_LENGTH = 4
 JOIN_CODE_MAX_ATTEMPTS = 10
 
 def _get_query_params(event):

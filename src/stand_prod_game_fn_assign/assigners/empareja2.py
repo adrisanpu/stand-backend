@@ -5,6 +5,8 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Key
 
+from stand_common.utils import log
+
 # Catalog
 CATALOG_TABLE = os.environ.get("CATALOG_TABLE", "stand-prod-catalog-table")
 EMPAREJA2_CATALOG_ID = os.environ.get("EMPAREJA2_CATALOG_ID", "EMPAREJA2#CHARACTERS#v1")
@@ -37,7 +39,7 @@ def _query_empareja2_catalog(dynamo_r):
 
     kwargs = {
         "KeyConditionExpression": Key("catalogId").eq(EMPAREJA2_CATALOG_ID),
-        "ProjectionExpression": "pairId, characterId, characterName",
+        "ProjectionExpression": "pairId, pairGroupId, pairNumericId, characterId, characterName",
     }
 
     while True:
@@ -55,19 +57,33 @@ def _query_empareja2_catalog(dynamo_r):
     return items
 
 
+def _pair_group_id(item) -> str | None:
+    """Same value for both characters in a pair; used to find partner and store in Gameplayer."""
+    g = item.get("pairGroupId") or item.get("pairNumericId")
+    if g is None:
+        return None
+    if isinstance(g, Decimal):
+        return str(int(g))
+    if isinstance(g, int):
+        return str(g)
+    return str(g).strip() or None
+
+
 def _pick_random_character(items):
     choice = random.choice(items)
     cid = _as_int(choice.get("characterId"))
     if cid is None:
         raise RuntimeError("characterId must be numeric in catalog")
     cname = choice.get("characterName") or "Personaje"
-    pair_id = str(choice.get("pairId") or "")
-    return cid, cname, pair_id
+    pair_group_id = _pair_group_id(choice)
+    if pair_group_id is None:
+        raise RuntimeError("pairGroupId or pairNumericId required in catalog")
+    return cid, cname, pair_group_id
 
 
-def _partner_name(items, pair_id: str, assigned_cid: int) -> str:
+def _partner_name(items, pair_group_id: str, assigned_cid: int) -> str:
     for it in items:
-        if str(it.get("pairId") or "") == pair_id and _as_int(it.get("characterId")) != assigned_cid:
+        if _pair_group_id(it) == pair_group_id and _as_int(it.get("characterId")) != assigned_cid:
             return it.get("characterName") or "tu pareja"
     return "tu pareja"
 
@@ -92,24 +108,38 @@ def assign_empareja2(ctx: dict):
     New contract:
       returns (patch, welcome_header, extra_messages)
 
-    - welcome_header: ONLY custom intro (no quiz mention, no code)
-    - extra_messages: images etc (sent before welcome by assign.py)
+    - welcome_header: bienvenida + te toca/busca (sin código ni mención al quiz); lambda añade aviso quiz o código.
+    - extra_messages: imagen del personaje (lambda envía primero).
     """
     psid = ctx["psid"]
     username_at = ctx["username_at"]
     dynamo_r = ctx["dynamo_r"]
 
     catalog_items = _query_empareja2_catalog(dynamo_r)
-    cid, cname, pair_id = _pick_random_character(catalog_items)
-    partner = _partner_name(catalog_items, pair_id, cid)
+    valid_items = [
+        it for it in catalog_items
+        if _as_int(it.get("characterId")) is not None and _pair_group_id(it) is not None
+    ]
+    if not valid_items:
+        raise RuntimeError(
+            f"No catalog items with numeric characterId for {EMPAREJA2_CATALOG_ID} - check catalog data"
+        )
+    if len(valid_items) < len(catalog_items):
+        skipped = len(catalog_items) - len(valid_items)
+        log("assign_empareja2_catalog_skipped_invalid", {
+            "catalogId": EMPAREJA2_CATALOG_ID,
+            "skipped": skipped,
+            "total": len(catalog_items),
+        })
+    cid, cname, pair_group_id = _pick_random_character(valid_items)
+    partner = _partner_name(valid_items, pair_group_id, cid)
 
     patch = {
         "type": {
             "EMPAREJA2": {
                 "characterId": cid,
                 "characterName": cname,
-                "pairId": pair_id,
-                "partnerName": partner,      # helpful later (quiz completion message / UI)
+                "pairGroupId": pair_group_id,
                 "raffleEligible": True,
                 "quizAnswers": {},
             }
@@ -121,11 +151,11 @@ def assign_empareja2(ctx: dict):
     if img:
         extra_messages.append({"psid": psid, "image_url": img})
 
-    # IMPORTANT: Instagram DMs don't support Markdown like **bold**
+    # Lambda sends: image first, then welcome_header + tail (quiz notice or code)
     welcome_header = (
-        f"👋 ¡Hola {username_at}!\n\n"
+        f"¡Hola {username_at}! 👋\n\n"
         f"Te toca: {cname}.\n"
-        f"Tu misión es encontrar a: {partner}.\n\n"
+        f"Tu misión es encontrar a: {partner}."
     )
 
     return (patch, welcome_header, extra_messages)

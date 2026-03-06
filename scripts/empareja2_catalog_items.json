@@ -1,0 +1,15 @@
+{
+  "catalogId": "EMPAREJA2#CHARACTERS#v1",
+  "items": [
+    { "pairId": "CHAR#0001", "pairGroupId": "1", "characterId": 1, "characterName": "Mario" },
+    { "pairId": "CHAR#0002", "pairGroupId": "1", "characterId": 2, "characterName": "Luigi" },
+    { "pairId": "CHAR#0003", "pairGroupId": "2", "characterId": 3, "characterName": "Lionel Messi" },
+    { "pairId": "CHAR#0004", "pairGroupId": "2", "characterId": 4, "characterName": "Cristiano Ronaldo" },
+    { "pairId": "CHAR#0005", "pairGroupId": "3", "characterId": 5, "characterName": "Ash Ketchum" },
+    { "pairId": "CHAR#0006", "pairGroupId": "3", "characterId": 6, "characterName": "Pikachu" },
+    { "pairId": "CHAR#0007", "pairGroupId": "4", "characterId": 7, "characterName": "Bob Esponja" },
+    { "pairId": "CHAR#0008", "pairGroupId": "4", "characterId": 8, "characterName": "Patricio Estrella" },
+    { "pairId": "CHAR#0009", "pairGroupId": "5", "characterId": 9, "characterName": "Sulley" },
+    { "pairId": "CHAR#0010", "pairGroupId": "5", "characterId": 10, "characterName": "Mike Wazowski" }
+  ]
+}

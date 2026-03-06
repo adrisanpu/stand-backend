@@ -7,7 +7,7 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -86,7 +86,7 @@ def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> boo
 
 
 def _build_quiz_question_message(psid: str, question_id: str, questions_cfg: dict) -> dict | None:
-    """Build a single message dict for a quiz question (for batching with intro)."""
+    """Build a single message dict for a quiz question."""
     q = questions_cfg.get(question_id) or {}
     text = (q.get("text") or "").strip()
     options = q.get("options", []) or []
@@ -476,10 +476,6 @@ def lambda_handler(event, context):
 
         # ---- quiz_start ----
         if kind == "quiz_start":
-            QUIZ_INTRO_TEXT = (
-                "Antes de jugar, tienes que responder unas preguntas...\n"
-            )
-
             game_id = (event.get("gameId") or event.get("game_id") or "").strip()
             raw_psids = event.get("psid") or []
 
@@ -514,12 +510,10 @@ def lambda_handler(event, context):
                     results.append({"psid": psid, "started": False, "reason": "bad_playerId"})
                     continue
 
-                # Send intro then first question in one batch so order is guaranteed
+                # Intro is sent in assign; here we only send the first question
                 first_q_msg = _build_quiz_question_message(psid, first_qid, quiz_questions)
-                messages = [{"psid": psid, "text": QUIZ_INTRO_TEXT}]
                 if first_q_msg:
-                    messages.append(first_q_msg)
-                _invoke_instagram_sender(messages)
+                    _invoke_instagram_sender([first_q_msg])
 
                 _set_quiz_state(game_id, pid, game_type, first_qid, completed=False)
 
@@ -573,14 +567,28 @@ def lambda_handler(event, context):
 
         next_qid = _next_question_id(question_id, quiz_order)
 
-        code = player.get("validationCode")
         if not next_qid:
             _set_quiz_state(game_id, pid, game_type, None, completed=True)
 
-            if code:
-                _send_dm(psid, f"🎟️ Tu código para jugar es: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀")
+            # Games can opt out of validation: send custom message instead of code
+            type_blob = get_game_type_blob(meta, game_type)
+            requires_validation = type_blob.get("requiresValidation", True)
+            if isinstance(requires_validation, str):
+                requires_validation = requires_validation.strip().lower() in ("1", "true", "yes")
+            elif not isinstance(requires_validation, bool):
+                requires_validation = True
+
+            if not requires_validation:
+                msg = (type_blob.get("quizCompletedMessage") or "").strip()
+                if not msg:
+                    msg = "¡Gracias! Ya estás participando en el sorteo."
+                _send_dm(psid, msg)
             else:
-                _send_dm(psid, "He tenido un problema generando tu código. Escribe 'AYUDA' y te lo soluciono.")
+                code = player.get("validationCode")
+                if code:
+                    _send_dm(psid, f"🎟️ Tu código para jugar es: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀")
+                else:
+                    _send_dm(psid, "He tenido un problema generando tu código. Escribe 'AYUDA' y te lo soluciono.")
 
             return {"ok": True, "completed": True, "gameId": game_id, "playerId": pid}
 

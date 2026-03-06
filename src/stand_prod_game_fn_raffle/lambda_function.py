@@ -10,7 +10,7 @@ from collections import defaultdict
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -245,6 +245,24 @@ def _is_validated(it: dict) -> bool:
     return bool(it.get("validated", False))
 
 
+def _requires_validation(game: dict, game_type: str) -> bool:
+    """True if game uses validation code for raffle eligibility; False for no-validation games (e.g. INFOCARDS)."""
+    blob = get_game_type_blob(game or {}, game_type)
+    default = False if (game_type or "").upper() == "INFOCARDS" else True
+    val = blob.get("requiresValidation", default)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes")
+    return bool(val)
+
+
+def _is_quiz_completed(it: dict, game_type_upper: str) -> bool:
+    """Read type.<gameType>.quizCompleted."""
+    gk = (game_type_upper or "").upper()
+    t = it.get("type") or {}
+    tb = t.get(gk) or {}
+    return bool(tb.get("quizCompleted", False))
+
+
 def _has_psid(it: dict) -> bool:
     psid = it.get("instagramPSID")
     return bool(psid and psid != "#")
@@ -354,6 +372,9 @@ def lambda_handler(event, context):
 
         # 3) candidates — query the sparse GSI so only eligible players are returned
         eligible_items = _query_eligible_players(game_id)
+        quiz_configured = bool(game.get("quizOrder"))
+        use_validation_filter = _requires_validation(game, game_type)
+
         candidates = []
         for it in eligible_items:
             pid = _as_int(it.get("playerId"))
@@ -361,8 +382,14 @@ def lambda_handler(event, context):
                 continue
             if not _has_psid(it):
                 continue
-            if only_validated and not _is_validated(it):
-                continue
+            # When only_validated: for validation games filter by validated; for no-validation games filter by quiz completed (or include all if no quiz)
+            if only_validated:
+                if use_validation_filter:
+                    if not _is_validated(it):
+                        continue
+                else:
+                    if quiz_configured and not _is_quiz_completed(it, game_type):
+                        continue
             candidates.append({
                 "playerId": pid,
                 "instagramPSID": it.get("instagramPSID"),

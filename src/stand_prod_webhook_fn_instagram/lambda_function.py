@@ -105,8 +105,8 @@ def _get_quick_payload(m: dict):
     return None
 
 
-# gameId nuevo: 6 dígitos numéricos (string, permite ceros iniciales)
-_GAMEID_RE = re.compile(r"^\d{6}$")
+# gameId nuevo: 4 dígitos numéricos (string, permite ceros iniciales)
+_GAMEID_RE = re.compile(r"^\d{4}$")
 
 def _looks_like_game_id(text: str) -> bool:
     if not text:

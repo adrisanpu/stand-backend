@@ -1,13 +1,14 @@
 import os
 import json
 import random
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _iso_now
+from stand_common.utils import log, _json_sanitize, _iso_now, get_game_type_blob
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -181,9 +182,44 @@ def _enqueue_quiz_start(game_id: str, psid: str, delay_seconds: int = 3):
         log("assign_quiz_enqueue_error", {"error": repr(e), "gameId": game_id})
 
 
-def _code_tail(code) -> str:
-    return f"🎟️ Tu código para jugar es: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀"
+# Code tail por juego (solo para requiresValidation = True). Fallback para INFOCARDS/UNKNOWN.
+CODE_TAIL_TEMPLATES = {
+    "EMPAREJA2": "🎟️ Tu código: {code}\n\nCuando encuentres a tu pareja, introducid los dos códigos en la pantalla para validar.",
+    "CUPIDO": "🎟️ Tu código: {code}\n\nCuando encuentres a tu pareja, introducid los dos códigos en la pantalla para validar.",
+    "SEMAFORO": "🎟️ Tu código: {code}\n\nCuando os encontréis, introducid los dos códigos en la pantalla para validar.",
+    "L3TRAS": "🎟️ Tu código: {code}\n\nReuníos y juntad todos los códigos en la pantalla para formar la palabra.",
+    "T1MER": "🎟️ Tu código: {code}\n\nIntrodúcelo en la pantalla para activar tu temporizador.",
+    "RULET4": "🎟️ Tu código: {code}\n\nIntrodúcelo en la pantalla para activar la ruleta.",
+}
+CODE_TAIL_DEFAULT = "🎟️ Tu código: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀"
 
+
+def _code_tail(code, game_type: str = "") -> str:
+    """Mensaje del código de validación; texto adaptado al tipo de juego (requiresValidation = True)."""
+    key = (game_type or "").upper().strip()
+    template = CODE_TAIL_TEMPLATES.get(key, CODE_TAIL_DEFAULT)
+    return template.format(code=code)
+
+
+# Empareja2: aviso cuando hay quiz (el código llega tras responder)
+EMPAREJA2_QUIZ_NOTICE = "Para conseguir tu código de validación necesitas responder unas preguntas."
+
+
+def _requires_validation(meta: dict, game_type: str) -> bool:
+    """True if game requires validation code; False for no-validation games (e.g. INFOCARDS)."""
+    blob = get_game_type_blob(meta or {}, game_type)
+    default = False if (game_type or "").upper() == "INFOCARDS" else True
+    val = blob.get("requiresValidation", default)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes")
+    return bool(val)
+
+
+def _quiz_completed_message(meta: dict, game_type: str) -> str:
+    """Message to send when no validation; from blob or default."""
+    blob = get_game_type_blob(meta or {}, game_type)
+    msg = (blob.get("quizCompletedMessage") or "").strip()
+    return msg if msg else "¡Gracias! Ya estás participando en el sorteo."
 
 
 # ========= Assigners registry =========
@@ -242,14 +278,17 @@ def lambda_handler(event, context):
         existing = _find_existing_player_by_psid(game_id, psid)
         if existing:
             pid = existing.get("playerId")
-            _send_single_dm(psid, "Ya estabas dentro del juego ✅\nSi no has completado el quiz, te lo vuelvo a enviar ahora.")
+            _send_single_dm(psid, "Ya estás dentro ✅\nContinúa jugando! 🚀")
             quiz_enabled = bool(meta.get("quizOrder"))
             if quiz_enabled:
                 _enqueue_quiz_start(game_id, psid)
             else:
-                code = existing.get("validationCode")
-                if code is not None:
-                    _send_single_dm(psid, _code_tail(code))
+                if _requires_validation(meta, game_type):
+                    code = existing.get("validationCode")
+                    if code is not None:
+                        _send_single_dm(psid, _code_tail(code, game_type))
+                else:
+                    _send_single_dm(psid, _quiz_completed_message(meta, game_type))
             log("assign_already_joined", {"gameId": game_id, "psid": psid, "playerId": pid})
             return _json_sanitize({
                 "ok": True,
@@ -322,20 +361,31 @@ def lambda_handler(event, context):
             try:
                 _put_player(base_item)
 
-                # 1) send extra messages first (images, etc.)
-                if extra_messages:
-                    _send_bulk_messages(extra_messages)
-
-                # 2) send welcome header (NO quiz mention here)
-                if welcome_header:
-                    _send_single_dm(psid, welcome_header)
-
-                # 3) start quiz or send code
                 quiz_enabled = bool(meta.get("quizOrder"))
-                if quiz_enabled:
-                    _enqueue_quiz_start(game_id, psid)
+
+                if game_type == "EMPAREJA2":
+                    # 1) Image first, 2) wait so image is delivered first, 3) single message: welcome + (quiz notice or code)
+                    if extra_messages:
+                        _send_bulk_messages(extra_messages)
+                    time.sleep(2)
+                    tail = EMPAREJA2_QUIZ_NOTICE if quiz_enabled else _code_tail(base_item["validationCode"], game_type)
+                    if welcome_header:
+                        _send_single_dm(psid, welcome_header + "\n\n" + tail)
+                    if quiz_enabled:
+                        _enqueue_quiz_start(game_id, psid)
                 else:
-                    _send_single_dm(psid, _code_tail(base_item["validationCode"]))
+                    # Generic flow: extra_messages, welcome_header, then quiz or code
+                    if extra_messages:
+                        _send_bulk_messages(extra_messages)
+                    if welcome_header:
+                        _send_single_dm(psid, welcome_header)
+                    if quiz_enabled:
+                        _enqueue_quiz_start(game_id, psid)
+                    else:
+                        if _requires_validation(meta, game_type):
+                            _send_single_dm(psid, _code_tail(base_item["validationCode"], game_type))
+                        else:
+                            _send_single_dm(psid, _quiz_completed_message(meta, game_type))
 
                 log("assign_ok", {
                     "gameId": game_id,

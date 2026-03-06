@@ -130,9 +130,9 @@ def test_happy_path():
     assert result["pairId"] == "P1"
     pids = {pl["playerId"] for pl in result["players"]}
     assert pids == {1, 2}
-    # send_bulk and invoke_quiz should have been called
-    assert len(ctx["_sent"]) == 2
-    assert len(ctx["_quizzed"]) == 2
+    # No message or quiz on validate (quiz is launched at assign)
+    assert len(ctx["_sent"]) == 0
+    assert len(ctx["_quizzed"]) == 0
 
 
 def test_presign_url_in_response():
