@@ -586,7 +586,7 @@ def lambda_handler(event, context):
             else:
                 code = player.get("validationCode")
                 if code:
-                    _send_dm(psid, f"🎟️ Tu código para jugar es: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀")
+                    _send_dm(psid, f"🎟️ Tu código es: {code}")
                 else:
                     _send_dm(psid, "He tenido un problema generando tu código. Escribe 'AYUDA' y te lo soluciono.")
 

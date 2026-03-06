@@ -446,17 +446,10 @@ def lambda_handler(event, context):
             except Exception:
                 val_code = None
 
-            if val_code is not None:
-                winner_msg = (
-                    f"🎁 ¡Enhorabuena! Te ha tocado premio en el sorteo de {game_type}.\n"
-                    f"Tu código de validación es: {val_code}.\n"
-                    "Pasa por el stand para recoger tu premio. 🎉"
-                )
-            else:
-                winner_msg = (
-                    f"🎁 ¡Enhorabuena! Te ha tocado premio en el sorteo de {game_type}.\n"
-                    "Pasa por el stand para recoger tu premio. 🎉"
-                )
+            winner_msg = (
+                f"🎁 ¡Enhorabuena! Te ha tocado premio en el sorteo de {game_type}.\n"
+                "Pasa por el stand para recoger tu premio. 🎉"
+            )
 
             per_psid_msgs[psid].append(winner_msg)
 
