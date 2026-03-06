@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _parse_iso, _get_claims, _read_json_body
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _parse_iso, _get_claims, _read_json_body, set_game_type_blob
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -73,6 +73,33 @@ def _raffle_winners_from_game(game_item: dict) -> list:
     # si lo guardas en games_table, ideal.
     winners = game_item.get("raffleWinners") or []
     return winners if isinstance(winners, list) else []
+
+
+EMPAREJA2_CATALOG_ID = "EMPAREJA2#CHARACTERS#v1"
+_empareja2_pair_count_cache = None
+
+
+def _empareja2_catalog_pair_count() -> int:
+    """Count distinct pair groups in empareja2 character catalog. Cached per Lambda invocation."""
+    global _empareja2_pair_count_cache
+    if _empareja2_pair_count_cache is not None:
+        return _empareja2_pair_count_cache
+    items = []
+    kwargs = {"KeyConditionExpression": Key("catalogId").eq(EMPAREJA2_CATALOG_ID)}
+    while True:
+        resp = catalog_table.query(**kwargs)
+        items.extend(resp.get("Items") or [])
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    seen = set()
+    for it in items:
+        g = it.get("pairGroupId") or it.get("pairNumericId")
+        if g is not None:
+            seen.add(str(int(g)) if isinstance(g, Decimal) else str(g).strip())
+    _empareja2_pair_count_cache = len(seen) if seen else 0
+    return _empareja2_pair_count_cache
 
 def _get_path(event):
     return (
@@ -182,7 +209,11 @@ def _handle_get(event):
         if not item.get("isActive", True):
             return _resp(403, {"error": "GameInactive", "gameId": game_id})
 
-        return _resp(200, {"ok": True, "game": _public_game_shape(item)})
+        payload = {"ok": True, "game": _public_game_shape(item)}
+        if (item.get("gameType") or "").upper() == "EMPAREJA2":
+            payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
+            payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
+        return _resp(200, payload)
 
     # ---------------- 2) gameName (optional) ----------------
     if game_name:
@@ -234,7 +265,7 @@ def _handle_get(event):
         except Exception:
             validated_count = 0
 
-        return _resp(200, {
+        payload = {
             "ok": True,
             "game": _public_game_shape(item),
             "playerCount": player_count,
@@ -244,7 +275,11 @@ def _handle_get(event):
                 "enabled": _quiz_enabled_from_game(item),
                 "questionsCount": len(item.get("quizOrder") or []) if _quiz_enabled_from_game(item) else 0
             }
-        })
+        }
+        if game_type == "EMPAREJA2":
+            payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
+            payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
+        return _resp(200, payload)
     
     # ---------------- 3) & 4) list user's games ----------------
     game_type = game_type_raw.upper() if game_type_raw else None
@@ -403,8 +438,10 @@ def _handle_post(event):
 
 def _handle_put(event):
     """
-    Update isActive (owner only).
-    body: { "gameId": "XXXXXX", "isActive": true/false }
+    Update game (owner only).
+    body: { "gameId": "XXXXXX", "isActive": true/false?, "settings": { "empareja2": { "numPairs": N?, "maxValidations": M? } }? }
+    - isActive: optional boolean. If provided, updates isActive and updatedAt.
+    - settings.empareja2: optional. If provided, merges into type.EMPAREJA2 (numPairs: int >= 1 or None, maxValidations: int >= 0 or None).
     """
     body = _read_json_body(event)
     if body is None:
@@ -416,34 +453,96 @@ def _handle_put(event):
         return _resp(401, {"error": "Missing sub claim (unauthorized)"})
 
     game_id = (body.get("gameId") or "").strip()
-    is_active = body.get("isActive", None)
-
     if not game_id:
         return _resp(400, {"error": "Missing required field 'gameId'."})
-    if not isinstance(is_active, bool):
-        return _resp(400, {"error": "Field 'isActive' must be a boolean."})
+
+    is_active = body.get("isActive", None)
+    settings = body.get("settings") or {}
+    empareja2_settings = settings.get("empareja2")
+
+    # At least one update
+    if is_active is None and not empareja2_settings:
+        return _resp(400, {"error": "Provide at least one of 'isActive' or 'settings.empareja2'."})
 
     now = _iso_now()
 
     try:
-        resp = games_table.update_item(
-            Key={"gameId": game_id},
-            UpdateExpression="SET isActive = :a, updatedAt = :u",
-            ExpressionAttributeValues={
-                ":a": is_active,
-                ":u": now,
-                ":owner": owner_user_id,
-            },
-            ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
-            ReturnValues="ALL_NEW",
-        )
-        attrs = resp.get("Attributes") or {}
+        resp = games_table.get_item(Key={"gameId": game_id})
+        item = resp.get("Item")
     except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
-        log("Update failed", {"error": str(e)})
-        return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+        log("GetItem failed on PUT", {"error": str(e)})
+        return _resp(500, {"error": "GetItemFailed", "detail": str(e)})
 
+    if not item:
+        return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+    if (item.get("ownerUserId") or "") != owner_user_id:
+        return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+
+    if isinstance(is_active, bool):
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET isActive = :a, updatedAt = :u",
+                ExpressionAttributeValues={
+                    ":a": is_active,
+                    ":u": now,
+                    ":owner": owner_user_id,
+                },
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update isActive failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if empareja2_settings is not None and isinstance(empareja2_settings, dict):
+        num_pairs = empareja2_settings.get("numPairs")
+        max_validations = empareja2_settings.get("maxValidations")
+        if num_pairs is not None:
+            try:
+                n = int(num_pairs)
+                if n < 1:
+                    return _resp(400, {"error": "settings.empareja2.numPairs must be >= 1 or omitted."})
+                num_pairs = n
+            except (TypeError, ValueError):
+                return _resp(400, {"error": "settings.empareja2.numPairs must be a positive integer or omitted."})
+        if max_validations is not None:
+            try:
+                m = int(max_validations)
+                if m < 0:
+                    return _resp(400, {"error": "settings.empareja2.maxValidations must be >= 0 or omitted."})
+                max_validations = m
+            except (TypeError, ValueError):
+                return _resp(400, {"error": "settings.empareja2.maxValidations must be a non-negative integer or omitted."})
+        current_blob = (item.get("type") or {}).get("EMPAREJA2") or {}
+        merged = {**current_blob}
+        if num_pairs is not None:
+            merged["numPairs"] = num_pairs
+        if max_validations is not None:
+            merged["maxValidations"] = max_validations
+        try:
+            set_game_type_blob(
+                games_table,
+                game_id,
+                "EMPAREJA2",
+                merged,
+                updated_at=now,
+                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
+                condition_values={":owner": owner_user_id},
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update type.EMPAREJA2 failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    # Return current state
+    try:
+        resp = games_table.get_item(Key={"gameId": game_id})
+        attrs = resp.get("Item") or item
+    except Exception:
+        attrs = item
     return _resp(200, {"message": "Game updated successfully", "game": attrs})
 
 # ---------------- DELETE ----------------

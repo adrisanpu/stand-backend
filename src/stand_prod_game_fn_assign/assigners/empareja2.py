@@ -131,6 +131,18 @@ def assign_empareja2(ctx: dict):
             "skipped": skipped,
             "total": len(catalog_items),
         })
+
+    # Limit to first N pair groups if game settings specify numPairs (difficulty: fewer pairs = easier)
+    game_meta = ctx.get("gameMeta") or {}
+    empareja2_blob = (game_meta.get("type") or {}).get("EMPAREJA2") or {}
+    num_pairs = empareja2_blob.get("numPairs")
+    if isinstance(num_pairs, int) and num_pairs >= 1:
+        group_ids = sorted({_pair_group_id(it) for it in valid_items if _pair_group_id(it)}, key=lambda x: int(x) if str(x).isdigit() else x)
+        allowed_groups = set(group_ids[:num_pairs])
+        filtered = [it for it in valid_items if _pair_group_id(it) in allowed_groups]
+        if filtered:
+            valid_items = filtered
+
     cid, cname, pair_group_id = _pick_random_character(valid_items)
     partner = _partner_name(valid_items, pair_group_id, cid)
 
