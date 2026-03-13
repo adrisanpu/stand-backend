@@ -29,9 +29,9 @@ catalog_table = dynamodb.Table(CATALOG_TABLE)
 # ========= CONST =========
 SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS"}
 
-# numeric 4 digits
-JOIN_CODE_ALPHABET = "0123456789"
-JOIN_CODE_LENGTH = 4
+# 6-char alphanumeric join code (Crockford-style base32 without I, L, O to avoid confusion)
+JOIN_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTUVWXYZ"
+JOIN_CODE_LENGTH = 6
 JOIN_CODE_MAX_ATTEMPTS = 10
 
 def _get_query_params(event):
@@ -73,6 +73,27 @@ def _raffle_winners_from_game(game_item: dict) -> list:
     # si lo guardas en games_table, ideal.
     winners = game_item.get("raffleWinners") or []
     return winners if isinstance(winners, list) else []
+
+
+def _raffle_required_follows_from_game(game_item: dict) -> list:
+    """List of Instagram handles (no @) required to participate in raffle."""
+    follows = game_item.get("raffleRequiredFollows") or []
+    if not isinstance(follows, list):
+        return []
+    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+
+
+def _get_player_prize_delivered(game_id: str, player_id: int, game_type: str) -> bool:
+    """Read type.<gameType>.prizeDelivered for a specific player, default False."""
+    try:
+        resp = gp_table.get_item(Key={"gameId": game_id, "playerId": int(player_id)})
+    except ClientError as e:
+        log("GetPlayerFailed", {"error": str(e), "gameId": game_id, "playerId": player_id})
+        return False
+    it = resp.get("Item") or {}
+    t = it.get("type") or {}
+    blob = t.get((game_type or "").upper()) or {}
+    return bool(blob.get("prizeDelivered", False))
 
 
 EMPAREJA2_CATALOG_ID = "EMPAREJA2#CHARACTERS#v1"
@@ -271,11 +292,27 @@ def _handle_get(event):
             "playerCount": player_count,
             "validatedCount": validated_count,
             "raffleWinners": _raffle_winners_from_game(item),
+            "raffleRequiredFollows": _raffle_required_follows_from_game(item),
             "quiz": {
                 "enabled": _quiz_enabled_from_game(item),
                 "questionsCount": len(item.get("quizOrder") or []) if _quiz_enabled_from_game(item) else 0
             }
         }
+        # enrich raffleWinners with prizeDelivered flag per player
+        try:
+            game_type = (item.get("gameType") or "").upper()
+            winners_with_flags = []
+            for w in payload.get("raffleWinners") or []:
+                pid = w.get("playerId")
+                delivered = False
+                if pid is not None:
+                    delivered = _get_player_prize_delivered(game_id, int(pid), game_type)
+                row = dict(w)
+                row["prizeDelivered"] = delivered
+                winners_with_flags.append(row)
+            payload["raffleWinners"] = winners_with_flags
+        except Exception as e:
+            log("RaffleWinnersPrizeDeliveredEnrichFailed", {"error": repr(e), "gameId": game_id})
         if game_type == "EMPAREJA2":
             payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
             payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
@@ -318,7 +355,7 @@ def _handle_post(event):
     """
     Create game (auth required).
     body: { "gameType": "...", "gameName": "..."? }
-    - gameId is a 6-char base32 join code (PK).
+    - gameId is a 6-char alphanumeric join code (PK).
     - FREE plan: max 1 game (uses GSI_OWNER).
     - Optional uniqueness check for gameName if you created GSI_GAMENAME.
     """
@@ -390,6 +427,7 @@ def _handle_post(event):
 
     for _ in range(JOIN_CODE_MAX_ATTEMPTS):
         candidate = _new_join_code()
+        requires_validation = (game_type or "").upper() != "INFOCARDS"
         item = {
             "gameId": candidate,
             "ownerUserId": owner_user_id,
@@ -400,6 +438,7 @@ def _handle_post(event):
             "playersCount": 0,
             "validatedCount": 0,
             "raffleWinners": [],
+            "requiresValidation": requires_validation,
             "createdAt": now,
             "updatedAt": now,
         }
@@ -459,10 +498,12 @@ def _handle_put(event):
     is_active = body.get("isActive", None)
     settings = body.get("settings") or {}
     empareja2_settings = settings.get("empareja2")
+    raffle_settings = settings.get("raffle")
+    prize_update = settings.get("prizeDelivered")
 
     # At least one update
-    if is_active is None and not empareja2_settings:
-        return _resp(400, {"error": "Provide at least one of 'isActive' or 'settings.empareja2'."})
+    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update:
+        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', or 'settings.prizeDelivered'."})
 
     now = _iso_now()
 
@@ -535,6 +576,71 @@ def _handle_put(event):
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
             log("Update type.EMPAREJA2 failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if raffle_settings is not None and isinstance(raffle_settings, dict):
+        required_follows = raffle_settings.get("requiredFollows")
+        if required_follows is not None:
+            if not isinstance(required_follows, list):
+                return _resp(400, {"error": "settings.raffle.requiredFollows must be an array of strings or omitted."})
+            normalized = []
+            for h in required_follows:
+                if h is None:
+                    continue
+                s = str(h).strip().lower().lstrip("@")
+                if s and s not in normalized:
+                    normalized.append(s)
+            try:
+                games_table.update_item(
+                    Key={"gameId": game_id},
+                    UpdateExpression="SET raffleRequiredFollows = :r, updatedAt = :u",
+                    ExpressionAttributeValues={
+                        ":r": normalized,
+                        ":u": now,
+                        ":owner": owner_user_id,
+                    },
+                    ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+                log("Update raffleRequiredFollows failed", {"error": str(e)})
+                return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    # settings.prizeDelivered: { gameType, playerId, delivered: bool }
+    if prize_update is not None and isinstance(prize_update, dict):
+        p_game_type = (prize_update.get("gameType") or "").upper()
+        p_player_id = prize_update.get("playerId")
+        delivered_flag = prize_update.get("delivered")
+        if not p_game_type or p_player_id is None or not isinstance(delivered_flag, bool):
+            return _resp(400, {"error": "settings.prizeDelivered requires 'gameType', 'playerId' and boolean 'delivered'."})
+        try:
+            pid_int = int(p_player_id)
+        except Exception:
+            return _resp(400, {"error": "settings.prizeDelivered.playerId must be numeric."})
+        try:
+            # Three separate updates: DynamoDB does not allow overlapping paths in one expression
+            # (e.g. [type] and [type, T1MER], or [type, T1MER] and [type, T1MER, prizeDelivered])
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": pid_int},
+                UpdateExpression="SET #type = if_not_exists(#type, :tinit)",
+                ExpressionAttributeNames={"#type": "type"},
+                ExpressionAttributeValues={":tinit": {}},
+            )
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": pid_int},
+                UpdateExpression="SET #type.#g = if_not_exists(#type.#g, :ginit)",
+                ExpressionAttributeNames={"#type": "type", "#g": p_game_type},
+                ExpressionAttributeValues={":ginit": {}},
+            )
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": pid_int},
+                UpdateExpression="SET #type.#g.prizeDelivered = :d",
+                ExpressionAttributeNames={"#type": "type", "#g": p_game_type},
+                ExpressionAttributeValues={":d": delivered_flag},
+            )
+        except ClientError as e:
+            log("UpdatePrizeDeliveredFailed", {"error": str(e), "gameId": game_id, "playerId": pid_int})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
     # Return current state

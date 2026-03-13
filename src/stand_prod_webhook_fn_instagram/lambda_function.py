@@ -1,4 +1,4 @@
-import os, json, base64, urllib.parse, urllib.request, re
+import os, json, base64, urllib.parse, urllib.request
 import boto3
 from stand_common.utils import log
 
@@ -6,6 +6,9 @@ from stand_common.utils import log
 IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
 ASSIGN_LAMBDA = os.environ.get("ASSIGN_LAMBDA", "stand-prod-game-fn-assign")
 QUIZ_LAMBDA   = os.environ.get("QUIZ_LAMBDA", "stand-prod-game-fn-quizz")
+
+# Payload del Ice Breaker configurado en Meta (botón tipo "JUGAR"); no se envía al quiz
+ICE_BREAKER_PLAY_PAYLOAD = "PLAY"
 
 # Instagram keys solo desde Secrets Manager (INSTAGRAM_SECRET_NAME obligatorio)
 # Secret: PAGE_TOKEN, VERIFY_TOKEN, SENDER_ID
@@ -23,7 +26,6 @@ if _instagram_secret_name:
             IG_PAGE_TOKEN = data.get("PAGE_TOKEN") or ""
             VERIFY_TOKEN  = data.get("VERIFY_TOKEN") or ""
             IG_SENDER_ID  = data.get("SENDER_ID") or ""
-            log("instagram_secret_loaded", {"keys": list(data.keys()), "has_page_token": bool(IG_PAGE_TOKEN)})
     except Exception as e:
         print(json.dumps({"msg": "instagram_secret_load_failed", "error": repr(e)}))
 # ======================
@@ -105,32 +107,38 @@ def _get_quick_payload(m: dict):
     return None
 
 
-# gameId nuevo: 4 dígitos numéricos (string, permite ceros iniciales)
-_GAMEID_RE = re.compile(r"^\d{4}$")
-
-def _looks_like_game_id(text: str) -> bool:
-    if not text:
-        return False
-    t = text.strip()
-    return bool(_GAMEID_RE.fullmatch(t))
+def _ref_from_referral(m: dict) -> str | None:
+    """
+    Extrae ref de un evento referral o postback con referral.
+    Orden: referral (messaging_referral), postback.referral (messaging_postbacks desde ig.me?ref=).
+    """
+    referral = m.get("referral")
+    if not referral:
+        referral = (m.get("postback") or {}).get("referral")
+    if not referral:
+        return None
+    ref = referral.get("ref")
+    if ref is None or not isinstance(ref, str):
+        return None
+    ref = ref.strip()
+    return ref if ref else None
 
 
 def _classify_message(m: dict):
     """
     Devuelve (kind, data):
       - ("quiz_answer", payload)
-      - ("game_id", game_id_str)
       - ("other", None)
+    Entrada por código de partida ya no es por texto; solo por referral (QR + Ice Breaker).
     """
     msg = m.get("message") or {}
-    text = (msg.get("text") or "").strip()
 
     quick_payload = _get_quick_payload(m)
     if quick_payload:
+        # Ice Breaker "PLAY" sin ref: no es una respuesta de quiz, ignorar
+        if quick_payload == ICE_BREAKER_PLAY_PAYLOAD:
+            return "other", None
         return "quiz_answer", quick_payload
-
-    if _looks_like_game_id(text):
-        return "game_id", text.strip().upper()
 
     return "other", None
 
@@ -160,7 +168,22 @@ def _handle_and_dispatch(m: dict):
 
     # 🚫 Ignorar mensajes enviados por tu propia cuenta (echo)
     if (IG_SENDER_ID and psid == IG_SENDER_ID) or msg.get("is_echo"):
-        log("ignored_echo_or_self_message", {"psid": psid})
+        return
+
+    # ----- Referral / postback con referral (ig.me?ref=, Ice Breaker payload "PLAY") -----
+    ref = _ref_from_referral(m)
+    if ref:
+        # ref como game_id; assign valida existencia en Dynamo
+        username_at = _get_username_from_graph(psid)
+        normalized_event = {
+            "kind": "game_id",
+            "psid": psid,
+            "username_at": username_at,
+            "game_id": ref,
+            "raw_event": m,
+        }
+        log("dispatching_referral", {"psid": psid, "ref": ref, "username_at": username_at})
+        _invoke_async(ASSIGN_LAMBDA, normalized_event)
         return
 
     kind, data = _classify_message(m)
@@ -177,21 +200,6 @@ def _handle_and_dispatch(m: dict):
         }
         log("dispatching_quiz_answer", {"psid": psid, "quizPayload": str(data)[:120]})
         _invoke_async(QUIZ_LAMBDA, normalized_event)
-        return
-
-    if kind == "game_id":
-        game_id = data
-        username_at = _get_username_from_graph(psid)
-
-        normalized_event = {
-            "kind": "game_id",
-            "psid": psid,
-            "username_at": username_at,  # puede ser None
-            "game_id": game_id,
-            "raw_event": m,
-        }
-        log("dispatching_game_id", {"psid": psid, "game_id": game_id, "username_at": username_at})
-        _invoke_async(ASSIGN_LAMBDA, normalized_event)
         return
 
     log("unhandled_kind", {"kind": kind})

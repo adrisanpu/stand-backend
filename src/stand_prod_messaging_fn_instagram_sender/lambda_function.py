@@ -96,6 +96,57 @@ def _normalize_quick_replies(quick_replies):
     return out or None
 
 
+def _build_follow_accounts_template(handles: list) -> dict:
+    """
+    Build Generic Template payload for follow_accounts.
+    handles: list of Instagram usernames (no @). Each element becomes a card with button to open profile.
+    """
+    if not handles or not isinstance(handles, list):
+        return None
+    elements = []
+    for h in handles:
+        handle = (str(h).strip().lower().lstrip("@") if h else "").strip()
+        if not handle:
+            continue
+        url = f"https://www.instagram.com/{handle}/"
+        elements.append({
+            "title": f"@{handle}",
+            "subtitle": "Toca para abrir y seguir",
+            "buttons": [
+                {"type": "web_url", "url": url, "title": "Abrir perfil"}
+            ]
+        })
+    if not elements:
+        return None
+    return {
+        "attachment": {
+            "type": "template",
+            "payload": {
+                "template_type": "generic",
+                "elements": elements
+            }
+        }
+    }
+
+
+def _send_template_message(psid: str, message_payload: dict) -> dict:
+    """Send a message with a pre-built attachment (e.g. Generic Template)."""
+    if not psid or psid == "#":
+        return {"ok": False, "error": "invalid_psid"}
+    if not message_payload or "attachment" not in message_payload:
+        return {"ok": False, "error": "missing_attachment"}
+    payload = {
+        "recipient": {"id": psid},
+        "messaging_type": "RESPONSE",
+        "message": message_payload
+    }
+    ok, status, _ = _graph_post(f"{IG_SENDER_ID}/messages", payload)
+    if not ok:
+        log("dm_send_failed", {"psid": psid, "status": status, "type": "template"})
+        return {"ok": False, "status": status, "error": "send_failed"}
+    return {"ok": True, "status": status}
+
+
 def _send_single_message(psid: str, text: str = None, quick_replies=None, image_url: str = None) -> dict:
     """
     Send a single message:
@@ -151,7 +202,8 @@ def lambda_handler(event, context):
       "messages": [
         { "psid": "123", "text": "Hola" },
         { "psid": "456", "text": "Pregunta", "quick_replies": [ ... ] },
-        { "psid": "789", "image_url": "https://..." }
+        { "psid": "789", "image_url": "https://..." },
+        { "psid": "999", "template": "follow_accounts", "handles": ["marca", "stand_official"] }
       ]
     }
     """
@@ -177,6 +229,22 @@ def lambda_handler(event, context):
             text = msg.get("text")
             quick_replies = msg.get("quick_replies")
             image_url = msg.get("image_url")
+            template_type = msg.get("template")
+            handles = msg.get("handles") if isinstance(msg.get("handles"), list) else None
+
+            # follow_accounts: send Generic Template with one card per handle
+            if psid and template_type == "follow_accounts" and handles:
+                template_payload = _build_follow_accounts_template(handles)
+                if template_payload:
+                    r = _send_template_message(psid, template_payload)
+                else:
+                    r = {"ok": False, "error": "invalid_handles"}
+                if r.get("ok"):
+                    success += 1
+                else:
+                    failed += 1
+                results.append({"psid": psid, **r})
+                continue
 
             # Permitimos text O image_url (al menos uno)
             if not psid or (not text and not image_url):

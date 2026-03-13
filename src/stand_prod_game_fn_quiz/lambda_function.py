@@ -13,6 +13,7 @@ from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, ge
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
 # ==================================
 
 dynamo_r = boto3.resource("dynamodb")
@@ -75,6 +76,42 @@ def _send_dm(psid: str, text: str) -> bool:
         return False
     _invoke_instagram_sender([{"psid": psid, "text": text}])
     return True
+
+
+def _raffle_required_follows_with_stand_last(meta: dict) -> list:
+    """List of handles (no @) for raffle follow requirement, with Stand account last."""
+    follows = meta.get("raffleRequiredFollows") or []
+    if not isinstance(follows, list):
+        follows = []
+    out = [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
+        out.append(RAFFLE_STAND_HANDLE)
+    return out
+
+
+def _requires_validation(meta: dict, game_type: str) -> bool:
+    """True if game requires validation code; False for no-validation games (e.g. INFOCARDS)."""
+    if "requiresValidation" in (meta or {}):
+        val = meta.get("requiresValidation")
+    else:
+        val = None
+    if val is None:
+        val = False if (game_type or "").upper() == "INFOCARDS" else True
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes")
+    return bool(val)
+
+
+def _send_raffle_follow_requirement(psid: str, meta: dict):
+    """If game has raffleRequiredFollows, send intro text + Generic Template with accounts (Stand last)."""
+    handles = _raffle_required_follows_with_stand_last(meta)
+    if not handles:
+        return
+    intro = "⚠️ Para participar en el sorteo, sigue estas cuentas:"
+    _invoke_instagram_sender([
+        {"psid": psid, "text": intro},
+        {"psid": psid, "template": "follow_accounts", "handles": handles},
+    ])
 
 
 def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> bool:
@@ -572,11 +609,7 @@ def lambda_handler(event, context):
 
             # Games can opt out of validation: send custom message instead of code
             type_blob = get_game_type_blob(meta, game_type)
-            requires_validation = type_blob.get("requiresValidation", True)
-            if isinstance(requires_validation, str):
-                requires_validation = requires_validation.strip().lower() in ("1", "true", "yes")
-            elif not isinstance(requires_validation, bool):
-                requires_validation = True
+            requires_validation = _requires_validation(meta, game_type)
 
             if not requires_validation:
                 msg = (type_blob.get("quizCompletedMessage") or "").strip()
@@ -590,6 +623,9 @@ def lambda_handler(event, context):
                 else:
                     _send_dm(psid, "He tenido un problema generando tu código. Escribe 'AYUDA' y te lo soluciono.")
 
+            # Only send follow notification when game does NOT require validation (e.g. INFOCARDS)
+            if not requires_validation:
+                _send_raffle_follow_requirement(psid, meta)
             return {"ok": True, "completed": True, "gameId": game_id, "playerId": pid}
 
         _set_quiz_state(game_id, pid, game_type, next_qid, completed=False)

@@ -21,6 +21,9 @@ IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "")
 CHAR_BUCKET = os.environ.get("CHAR_BUCKET", "")            # e.g. "empareja2-characters"
 CHAR_URL_TTL = int(os.environ.get("CHAR_URL_TTL", "120"))  # seconds
 
+# Raffle follow notification (same as assign)
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
+
 dynamo_r = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
 s3 = boto3.client("s3")
@@ -194,6 +197,75 @@ def is_quiz_completed(player_item: dict, game_type_upper: str) -> bool:
     g = t.get(game_type_upper) or {}
     return bool(g.get("quizCompleted", False))
 
+
+def _requires_validation(meta: dict, game_type: str) -> bool:
+    """True if game requires validation; False for no-validation games (e.g. INFOCARDS)."""
+    if "requiresValidation" in (meta or {}):
+        val = meta.get("requiresValidation")
+    else:
+        val = None
+    if val is None:
+        val = False if (game_type or "").upper() == "INFOCARDS" else True
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes")
+    return bool(val)
+
+
+def _raffle_required_follows_with_stand_last(meta: dict) -> list:
+    """List of handles (no @) for raffle follow requirement, with Stand account last."""
+    follows = (meta or {}).get("raffleRequiredFollows") or []
+    if not isinstance(follows, list):
+        follows = []
+    out = [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
+        out.append(RAFFLE_STAND_HANDLE)
+    return out
+
+
+def _send_raffle_follow_to_validated(game_id: str, result: dict, meta: dict) -> None:
+    """If game has raffleRequiredFollows and requires validation, send follow notification to validated players."""
+    handles = _raffle_required_follows_with_stand_last(meta)
+    if not handles:
+        return
+    # Collect player IDs from result
+    player_ids = []
+    if result.get("playerId") is not None:
+        pid = result["playerId"]
+        if isinstance(pid, Decimal):
+            pid = int(pid)
+        player_ids.append(int(pid))
+    for p in result.get("players") or []:
+        pid = p.get("playerId")
+        if pid is not None:
+            if isinstance(pid, Decimal):
+                pid = int(pid)
+            player_ids.append(int(pid))
+    if not player_ids:
+        return
+    # Dedupe and fetch psids from gp_table
+    seen = set()
+    messages = []
+    intro = "⚠️ Para participar en el sorteo, sigue estas cuentas:"
+    for pid in player_ids:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        try:
+            resp = gp_table.get_item(Key={"gameId": game_id, "playerId": pid})
+            it = resp.get("Item")
+            if not it:
+                continue
+            psid = (it.get("instagramPSID") or "").strip()
+            if not psid:
+                continue
+            messages.append({"psid": psid, "text": intro})
+            messages.append({"psid": psid, "template": "follow_accounts", "handles": handles})
+        except Exception as e:
+            log("validate_raffle_follow_get_player_error", {"gameId": game_id, "playerId": pid, "error": repr(e)})
+    if messages:
+        send_bulk(messages)
+
+
 # ===== Validators registry =====
 from validators.empareja2 import validate_empareja2
 from validators.generic import validate_generic
@@ -261,6 +333,10 @@ def lambda_handler(event, context):
             "valid": result.get("valid"),
             "reason": result.get("reason"),
         })
+
+        # Send raffle follow notification when validation succeeds (games that require validation)
+        if result.get("valid") and _requires_validation(meta, game_type):
+            _send_raffle_follow_to_validated(game_id, result, meta)
 
         return _resp(200, result)
 

@@ -15,6 +15,8 @@ GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
 QUIZ_QUEUE_URL = os.environ.get("QUIZ_QUEUE_URL", "")
+# Stand account handle (shown last in follow list); default matches frontend INSTAGRAM_HANDLE
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
 
 
 # Optional GSI
@@ -52,6 +54,18 @@ def _send_single_dm(psid: str, text: str):
     if not psid:
         return
     _send_bulk_messages([{"psid": psid, "text": text}])
+
+
+def _raffle_required_follows_with_stand_last(meta: dict) -> list:
+    """List of handles (no @) for raffle follow requirement, with Stand account last."""
+    follows = meta.get("raffleRequiredFollows") or []
+    if not isinstance(follows, list):
+        follows = []
+    out = [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
+        out.append(RAFFLE_STAND_HANDLE)
+    return out
+
 
 def _get_game_meta(game_id: str) -> dict | None:
     resp = games_table.get_item(Key={"gameId": game_id})
@@ -207,9 +221,13 @@ EMPAREJA2_QUIZ_NOTICE = "Para conseguir tu código de validación necesitas resp
 
 def _requires_validation(meta: dict, game_type: str) -> bool:
     """True if game requires validation code; False for no-validation games (e.g. INFOCARDS)."""
-    blob = get_game_type_blob(meta or {}, game_type)
-    default = False if (game_type or "").upper() == "INFOCARDS" else True
-    val = blob.get("requiresValidation", default)
+    # Prefer top-level requiresValidation; fallback for legacy games without the field
+    if "requiresValidation" in (meta or {}):
+        val = meta.get("requiresValidation")
+    else:
+        val = None
+    if val is None:
+        val = False if (game_type or "").upper() == "INFOCARDS" else True
     if isinstance(val, str):
         return val.strip().lower() in ("1", "true", "yes")
     return bool(val)
@@ -332,7 +350,6 @@ def lambda_handler(event, context):
                 "joinedAt": now,
                 "validated": False,
                 "validationCode": _code4(),
-                "eligibleForGameId": game_id,  # sparse GSI key for raffle candidate queries
             }
 
             assigner = ASSIGNERS.get(game_type, assign_generic)
@@ -386,7 +403,6 @@ def lambda_handler(event, context):
                             _send_single_dm(psid, _code_tail(base_item["validationCode"], game_type))
                         else:
                             _send_single_dm(psid, _quiz_completed_message(meta, game_type))
-
                 log("assign_ok", {
                     "gameId": game_id,
                     "psid": psid,
