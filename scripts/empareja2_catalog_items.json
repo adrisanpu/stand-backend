@@ -3,13 +3,104 @@
   "items": [
     { "pairId": "CHAR#0001", "pairGroupId": "1", "characterId": 1, "characterName": "Mario" },
     { "pairId": "CHAR#0002", "pairGroupId": "1", "characterId": 2, "characterName": "Luigi" },
-    { "pairId": "CHAR#0003", "pairGroupId": "2", "characterId": 3, "characterName": "Lionel Messi" },
-    { "pairId": "CHAR#0004", "pairGroupId": "2", "characterId": 4, "characterName": "Cristiano Ronaldo" },
-    { "pairId": "CHAR#0005", "pairGroupId": "3", "characterId": 5, "characterName": "Ash Ketchum" },
-    { "pairId": "CHAR#0006", "pairGroupId": "3", "characterId": 6, "characterName": "Pikachu" },
-    { "pairId": "CHAR#0007", "pairGroupId": "4", "characterId": 7, "characterName": "Bob Esponja" },
-    { "pairId": "CHAR#0008", "pairGroupId": "4", "characterId": 8, "characterName": "Patricio Estrella" },
-    { "pairId": "CHAR#0009", "pairGroupId": "5", "characterId": 9, "characterName": "Sulley" },
-    { "pairId": "CHAR#0010", "pairGroupId": "5", "characterId": 10, "characterName": "Mike Wazowski" }
+
+    { "pairId": "CHAR#0003", "pairGroupId": "2", "characterId": 3, "characterName": "Shrek" },
+    { "pairId": "CHAR#0004", "pairGroupId": "2", "characterId": 4, "characterName": "Fiona" },
+
+    { "pairId": "CHAR#0005", "pairGroupId": "3", "characterId": 5, "characterName": "Woody" },
+    { "pairId": "CHAR#0006", "pairGroupId": "3", "characterId": 6, "characterName": "Buzz Lightyear" },
+
+    { "pairId": "CHAR#0007", "pairGroupId": "4", "characterId": 7, "characterName": "Sullivan" },
+    { "pairId": "CHAR#0008", "pairGroupId": "4", "characterId": 8, "characterName": "Mike Wazowski" },
+
+    { "pairId": "CHAR#0009", "pairGroupId": "5", "characterId": 9, "characterName": "Bob Esponja" },
+    { "pairId": "CHAR#0010", "pairGroupId": "5", "characterId": 10, "characterName": "Patricio Estrella" },
+
+    { "pairId": "CHAR#0011", "pairGroupId": "6", "characterId": 11, "characterName": "Phineas" },
+    { "pairId": "CHAR#0012", "pairGroupId": "6", "characterId": 12, "characterName": "Ferb" },
+
+    { "pairId": "CHAR#0013", "pairGroupId": "7", "characterId": 13, "characterName": "Timón" },
+    { "pairId": "CHAR#0014", "pairGroupId": "7", "characterId": 14, "characterName": "Pumba" },
+
+    { "pairId": "CHAR#0015", "pairGroupId": "8", "characterId": 15, "characterName": "Lilo" },
+    { "pairId": "CHAR#0016", "pairGroupId": "8", "characterId": 16, "characterName": "Stitch" },
+
+    { "pairId": "CHAR#0017", "pairGroupId": "9", "characterId": 17, "characterName": "Tom" },
+    { "pairId": "CHAR#0018", "pairGroupId": "9", "characterId": 18, "characterName": "Jerry" },
+
+    { "pairId": "CHAR#0019", "pairGroupId": "10", "characterId": 19, "characterName": "Shaggy" },
+    { "pairId": "CHAR#0020", "pairGroupId": "10", "characterId": 20, "characterName": "Scooby-Doo" },
+
+    { "pairId": "CHAR#0021", "pairGroupId": "11", "characterId": 21, "characterName": "Ash Ketchum" },
+    { "pairId": "CHAR#0022", "pairGroupId": "11", "characterId": 22, "characterName": "Pikachu" },
+
+    { "pairId": "CHAR#0023", "pairGroupId": "12", "characterId": 23, "characterName": "Naruto" },
+    { "pairId": "CHAR#0024", "pairGroupId": "12", "characterId": 24, "characterName": "Sasuke" },
+
+    { "pairId": "CHAR#0025", "pairGroupId": "13", "characterId": 25, "characterName": "Mickey Mouse" },
+    { "pairId": "CHAR#0026", "pairGroupId": "13", "characterId": 26, "characterName": "Minnie Mouse" },
+
+    { "pairId": "CHAR#0027", "pairGroupId": "14", "characterId": 27, "characterName": "Batman" },
+    { "pairId": "CHAR#0028", "pairGroupId": "14", "characterId": 28, "characterName": "Robin" },
+
+    { "pairId": "CHAR#0029", "pairGroupId": "15", "characterId": 29, "characterName": "Joker" },
+    { "pairId": "CHAR#0030", "pairGroupId": "15", "characterId": 30, "characterName": "Harley Quinn" },
+
+    { "pairId": "CHAR#0031", "pairGroupId": "16", "characterId": 31, "characterName": "Harry Potter" },
+    { "pairId": "CHAR#0032", "pairGroupId": "16", "characterId": 32, "characterName": "Hermione Granger" },
+
+    { "pairId": "CHAR#0033", "pairGroupId": "17", "characterId": 33, "characterName": "Ron Weasley" },
+    { "pairId": "CHAR#0034", "pairGroupId": "17", "characterId": 34, "characterName": "Hagrid" },
+
+    { "pairId": "CHAR#0035", "pairGroupId": "18", "characterId": 35, "characterName": "Spider-Man" },
+    { "pairId": "CHAR#0036", "pairGroupId": "18", "characterId": 36, "characterName": "Peter Parker" },
+
+    { "pairId": "CHAR#0037", "pairGroupId": "19", "characterId": 37, "characterName": "Han Solo" },
+    { "pairId": "CHAR#0038", "pairGroupId": "19", "characterId": 38, "characterName": "Chewbacca" },
+
+    { "pairId": "CHAR#0039", "pairGroupId": "20", "characterId": 39, "characterName": "R2-D2" },
+    { "pairId": "CHAR#0040", "pairGroupId": "20", "characterId": 40, "characterName": "C-3PO" },
+
+    { "pairId": "CHAR#0041", "pairGroupId": "21", "characterId": 41, "characterName": "Ross" },
+    { "pairId": "CHAR#0042", "pairGroupId": "21", "characterId": 42, "characterName": "Rachel" },
+
+    { "pairId": "CHAR#0043", "pairGroupId": "22", "characterId": 43, "characterName": "Sheldon Cooper" },
+    { "pairId": "CHAR#0044", "pairGroupId": "22", "characterId": 44, "characterName": "Amy Farrah Fowler" },
+
+    { "pairId": "CHAR#0045", "pairGroupId": "23", "characterId": 45, "characterName": "Tokio" },
+    { "pairId": "CHAR#0046", "pairGroupId": "23", "characterId": 46, "characterName": "Río" },
+
+    { "pairId": "CHAR#0047", "pairGroupId": "24", "characterId": 47, "characterName": "Barbie" },
+    { "pairId": "CHAR#0048", "pairGroupId": "24", "characterId": 48, "characterName": "Ken" },
+
+    { "pairId": "CHAR#0049", "pairGroupId": "25", "characterId": 49, "characterName": "Romeo" },
+    { "pairId": "CHAR#0050", "pairGroupId": "25", "characterId": 50, "characterName": "Julieta" },
+
+    { "pairId": "CHAR#0051", "pairGroupId": "26", "characterId": 51, "characterName": "Jack" },
+    { "pairId": "CHAR#0052", "pairGroupId": "26", "characterId": 52, "characterName": "Rose" },
+
+    { "pairId": "CHAR#0053", "pairGroupId": "27", "characterId": 53, "characterName": "Bella" },
+    { "pairId": "CHAR#0054", "pairGroupId": "27", "characterId": 54, "characterName": "Bestia" },
+
+    { "pairId": "CHAR#0055", "pairGroupId": "28", "characterId": 55, "characterName": "Aladdín" },
+    { "pairId": "CHAR#0056", "pairGroupId": "28", "characterId": 56, "characterName": "Jasmín" },
+
+    { "pairId": "CHAR#0057", "pairGroupId": "29", "characterId": 57, "characterName": "Peter Pan" },
+    { "pairId": "CHAR#0058", "pairGroupId": "29", "characterId": 58, "characterName": "Campanilla" },
+
+    { "pairId": "CHAR#0059", "pairGroupId": "30", "characterId": 59, "characterName": "Simba" },
+    { "pairId": "CHAR#0060", "pairGroupId": "30", "characterId": 60, "characterName": "Nala" },
+
+    { "pairId": "CHAR#0061", "pairGroupId": "31", "characterId": 61, "characterName": "Asterix" },
+    { "pairId": "CHAR#0062", "pairGroupId": "31", "characterId": 62, "characterName": "Obelix" },
+
+    { "pairId": "CHAR#0063", "pairGroupId": "32", "characterId": 63, "characterName": "Mortadelo" },
+    { "pairId": "CHAR#0064", "pairGroupId": "32", "characterId": 64, "characterName": "Filemón" },
+
+    { "pairId": "CHAR#0065", "pairGroupId": "33", "characterId": 65, "characterName": "Marty McFly" },
+    { "pairId": "CHAR#0066", "pairGroupId": "33", "characterId": 66, "characterName": "Doc Brown" },
+
+    { "pairId": "CHAR#0067", "pairGroupId": "34", "characterId": 67, "characterName": "Don Quijote" },
+    { "pairId": "CHAR#0068", "pairGroupId": "34", "characterId": 68, "characterName": "Sancho Panza" }
   ]
 }

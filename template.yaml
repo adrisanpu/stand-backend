@@ -122,6 +122,11 @@ Resources:
               - ssm:GetParameter
               - ssm:GetParameters
             Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/prod/config/*"
+          # Raffle Lambda needs Instagram PAGE_TOKEN to check is_user_follow_business
+          - Sid: InstagramSecretRaffle
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/instagram*"
           # Game functions invoke the sender Lambda for all IG/Stripe calls — no secret access needed here.
 
 # ----- Webhook role (Instagram webhook dispatcher) -----
@@ -450,6 +455,7 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
+          ASSIGN_LAMBDA: !Ref StandProdGameFnAssign
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
           QUIZ_LAMBDA: !Ref StandProdGameFnQuiz
       Events:
@@ -563,6 +569,7 @@ Resources:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
           QUIZ_LAMBDA_NAME: !Ref StandProdGameFnQuiz
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
+          RAFFLE_STAND_HANDLE: stand_official
       Events:
         ValidatePost:
           Type: HttpApi
@@ -644,6 +651,8 @@ Resources:
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          INSTAGRAM_SECRET_NAME: stand/prod/instagram
+          IG_GRAPH_VERSION: v24.0
       Events:
         RafflePost:
           Type: HttpApi
