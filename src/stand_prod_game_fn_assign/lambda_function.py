@@ -208,9 +208,15 @@ CODE_TAIL_TEMPLATES = {
 CODE_TAIL_DEFAULT = "🎟️ Tu código: {code}\n\nVe a la pantalla, introdúcelo y ¡a jugar! 🚀"
 
 
-def _code_tail(code, game_type: str = "") -> str:
+def _code_tail(code, game_type: str = "", letter: str | None = None) -> str:
     """Mensaje del código de validación; texto adaptado al tipo de juego (requiresValidation = True)."""
     key = (game_type or "").upper().strip()
+    if key == "L3TRAS" and letter:
+        return (
+            f"🎟️ Tu código: {code}\n"
+            f"🔤 Tu letra: {letter}\n\n"
+            "Reuníos y juntad todos los códigos en la pantalla para formar la palabra."
+        )
     template = CODE_TAIL_TEMPLATES.get(key, CODE_TAIL_DEFAULT)
     return template.format(code=code)
 
@@ -244,9 +250,11 @@ def _quiz_completed_message(meta: dict, game_type: str) -> str:
 # Import here (not top) to avoid circular imports
 from assigners.empareja2 import assign_empareja2
 from assigners.generic import assign_generic
+from assigners.l3tras import assign_l3tras
 
 ASSIGNERS = {
     "EMPAREJA2": assign_empareja2,
+    "L3TRAS": assign_l3tras,
 }
 
 def lambda_handler(event, context):
@@ -304,7 +312,10 @@ def lambda_handler(event, context):
                 if _requires_validation(meta, game_type):
                     code = existing.get("validationCode")
                     if code is not None:
-                        _send_single_dm(psid, _code_tail(code, game_type))
+                        letter = None
+                        if game_type == "L3TRAS":
+                            letter = (((existing.get("type") or {}).get("L3TRAS") or {}).get("letter") or None)
+                        _send_single_dm(psid, _code_tail(code, game_type, letter=letter))
                 else:
                     _send_single_dm(psid, _quiz_completed_message(meta, game_type))
             log("assign_already_joined", {"gameId": game_id, "psid": psid, "playerId": pid})
@@ -400,7 +411,10 @@ def lambda_handler(event, context):
                         _enqueue_quiz_start(game_id, psid)
                     else:
                         if _requires_validation(meta, game_type):
-                            _send_single_dm(psid, _code_tail(base_item["validationCode"], game_type))
+                            letter = None
+                            if game_type == "L3TRAS":
+                                letter = (((base_item.get("type") or {}).get("L3TRAS") or {}).get("letter") or None)
+                            _send_single_dm(psid, _code_tail(base_item["validationCode"], game_type, letter=letter))
                         else:
                             _send_single_dm(psid, _quiz_completed_message(meta, game_type))
                 log("assign_ok", {

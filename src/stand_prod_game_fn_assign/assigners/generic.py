@@ -14,6 +14,7 @@ WELCOME_TEMPLATES = {
     "RULET4": "🎡 ¡Bienvenid@ a Rulet4, {username_at}!\n\n",
     "SEMAFORO": "🚦 ¡Bienvenid@ a SEMÁFORO, {username_at}!\n\n",
     "INFOCARDS": "📇 ¡Bienvenid@ a Infocards, {username_at}!\n\n",
+    "L3TRAS": "🔤 ¡Bienvenid@ a L3tras, {username_at}!\n\n",
 }
 
 
