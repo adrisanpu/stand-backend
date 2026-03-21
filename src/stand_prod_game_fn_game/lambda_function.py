@@ -234,6 +234,8 @@ def _handle_get(event):
         if (item.get("gameType") or "").upper() == "EMPAREJA2":
             payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
             payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
+        elif (item.get("gameType") or "").upper() == "L3TRAS":
+            payload["settings"] = {"l3tras": (item.get("type") or {}).get("L3TRAS") or {}}
         return _resp(200, payload)
 
     # ---------------- 2) gameName (optional) ----------------
@@ -481,6 +483,7 @@ def _handle_put(event):
     body: { "gameId": "XXXXXX", "isActive": true/false?, "settings": { "empareja2": { "numPairs": N?, "maxValidations": M? } }? }
     - isActive: optional boolean. If provided, updates isActive and updatedAt.
     - settings.empareja2: optional. If provided, merges into type.EMPAREJA2 (numPairs: int >= 1 or None, maxValidations: int >= 0 or None).
+    - settings.l3tras: optional. Merges into type.L3TRAS (objectiveWord, always stored uppercase).
     """
     body = _read_json_body(event)
     if body is None:
@@ -500,10 +503,11 @@ def _handle_put(event):
     empareja2_settings = settings.get("empareja2")
     raffle_settings = settings.get("raffle")
     prize_update = settings.get("prizeDelivered")
+    l3tras_settings = settings.get("l3tras")
 
     # At least one update
-    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update:
-        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', or 'settings.prizeDelivered'."})
+    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update and not l3tras_settings:
+        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', or 'settings.prizeDelivered'."})
 
     now = _iso_now()
 
@@ -576,6 +580,36 @@ def _handle_put(event):
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
             log("Update type.EMPAREJA2 failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if l3tras_settings is not None and isinstance(l3tras_settings, dict) and l3tras_settings:
+        if (item.get("gameType") or "").upper() != "L3TRAS":
+            return _resp(400, {"error": "settings.l3tras is only valid for L3TRAS games."})
+        current_blob = (item.get("type") or {}).get("L3TRAS") or {}
+        merged = {**current_blob}
+        if "objectiveWord" in l3tras_settings and l3tras_settings["objectiveWord"] is not None:
+            raw = str(l3tras_settings["objectiveWord"]).strip()
+            letters_only = "".join(c for c in raw if c.isalpha())
+            if not letters_only:
+                return _resp(400, {"error": "settings.l3tras.objectiveWord must contain at least one letter."})
+            if len(letters_only) > 40:
+                return _resp(400, {"error": "settings.l3tras.objectiveWord must be at most 40 letters."})
+            merged["objectiveWord"] = letters_only.upper()
+        merged.pop("normalize", None)
+        try:
+            set_game_type_blob(
+                games_table,
+                game_id,
+                "L3TRAS",
+                merged,
+                updated_at=now,
+                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
+                condition_values={":owner": owner_user_id},
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update type.L3TRAS failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
     if raffle_settings is not None and isinstance(raffle_settings, dict):
