@@ -269,11 +269,13 @@ def _send_raffle_follow_to_validated(game_id: str, result: dict, meta: dict) -> 
 # ===== Validators registry =====
 from validators.empareja2 import validate_empareja2
 from validators.generic import validate_generic
+from validators.l3tras import validate_l3tras
 from validators.semaforo import validate_semaforo
 
 VALIDATORS = {
     "EMPAREJA2": validate_empareja2,
     "SEMAFORO": validate_semaforo,
+    "L3TRAS": validate_l3tras,
 }
 
 # ===== Entry =====
@@ -334,8 +336,9 @@ def lambda_handler(event, context):
             "reason": result.get("reason"),
         })
 
-        # Send raffle follow notification when validation succeeds (games that require validation)
-        if result.get("valid") and _requires_validation(meta, game_type):
+        # Send raffle follow notification when validation succeeds (games that require validation),
+        # except for T1MER, where we notify after score is stored.
+        if result.get("valid") and _requires_validation(meta, game_type) and game_type not in ("T1MER", "L3TRAS"):
             _send_raffle_follow_to_validated(game_id, result, meta)
 
         return _resp(200, result)
