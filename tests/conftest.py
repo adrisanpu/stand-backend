@@ -23,12 +23,12 @@ sys.modules.setdefault("boto3.dynamodb.conditions", MagicMock())
 # 2. Add the Lambda Layer (stand_common) to sys.path so imports resolve
 # ---------------------------------------------------------------------------
 BACKEND_ROOT = Path(__file__).parent.parent
-LAYER_PATH = BACKEND_ROOT / "src" / "stand_common" / "python"
+LAYER_PATH = BACKEND_ROOT / "layers" / "stand_common" / "python"
 if LAYER_PATH.exists() and str(LAYER_PATH) not in sys.path:
     sys.path.insert(0, str(LAYER_PATH))
 
-# Fallback: if the layer hasn't been built yet, provide a minimal stub
-if "stand_common" not in sys.modules:
+# Fallback: if the layer tree is missing, provide a minimal stub (no submodules)
+if not LAYER_PATH.exists() and "stand_common" not in sys.modules:
     stand_common = types.ModuleType("stand_common")
     utils = types.ModuleType("stand_common.utils")
 
