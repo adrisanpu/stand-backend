@@ -4,41 +4,10 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from stand_common.utils import log, _resp, _iso_now, _parse_iso, _get_claims, _get_http_method
 
 dynamodb = boto3.resource("dynamodb")
 USERS_TABLE = os.environ.get("USERS_TABLE", "")
-
-
-def log(msg, data=None):
-    if data is not None:
-        print(json.dumps({"msg": msg, "data": data}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-def _resp(status: int, body):
-    return {
-        "statusCode": int(status),
-        "Content-Type": "application/json",
-        "body": json.dumps(body, ensure_ascii=False),
-    }
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-def _get_http_method(event: dict) -> str:
-    method = event.get("requestContext", {}).get("http", {}).get("method")
-    if method:
-        return method.upper()
-    return (event.get("httpMethod") or "").upper()
-
-def _get_claims(event: dict) -> dict:
-    rc = (event or {}).get("requestContext") or {}
-    auth = rc.get("authorizer") or {}
-    jwt = auth.get("jwt") or {}
-    return jwt.get("claims") or auth.get("claims") or {}
-
-def _parse_iso(s: str):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 def _is_expired(active_until: str | None) -> bool:
     if not active_until:

@@ -1,0 +1,43 @@
+---
+description: Python Lambda handler conventions for stand-backend
+globs: src/**/*.py
+alwaysApply: true
+---
+
+# Python Lambda Rules
+
+## Handler pattern
+```python
+from stand_common.utils import log, _resp, _get_claims, _read_json_body, _json_sanitize
+
+def lambda_handler(event, context):
+    claims = _get_claims(event)   # raises 401 automatically if missing/invalid
+    user_id = claims["sub"]       # always use sub as userId
+    body = _read_json_body(event) # raises 400 if not valid JSON
+    # ... logic ...
+    return _resp(200, _json_sanitize(result))  # sanitize before _resp
+```
+
+## Auth
+- `_get_claims(event)` — extracts JWT claims from the Cognito authorizer context
+- Backend receives **idToken** claims; `sub` is the userId
+- Never manually parse Authorization headers
+
+## DynamoDB
+- **Never** pass raw DynamoDB Decimal to json.dumps — always use `_as_int()` or `_json_sanitize()`
+- `get_game_type_blob(game_item, "GAME_TYPE")` — read type config
+- `set_game_type_blob(table, game_id, "GAME_TYPE", payload, updated_at=now)` — two update_item calls, do NOT merge into one
+- Game types stored as UPPERCASE: EMPAREJA2, T1MER, RULET4, L3TRAS, SEMAFORO, INFOCARDS, CUPIDO
+
+## Response format
+```python
+return _resp(200, {"key": value})   # success
+return _resp(400, {"error": "msg"}) # client error
+return _resp(500, {"error": "msg"}) # server error
+```
+
+## Tables (env vars)
+- `os.environ["GAMES_TABLE"]` → stand-prod-game-table
+- `os.environ["USERS_TABLE"]` → stand-prod-user-table
+- `os.environ["GAMEPLAYER_TABLE"]` → stand-prod-gameplayer-table
+- `os.environ["CATALOG_TABLE"]` → stand-prod-catalog-table

@@ -8,6 +8,7 @@ from typing import Optional
 import boto3
 import stripe
 from botocore.exceptions import ClientError
+from stand_common.utils import log, _resp, _iso_now, _parse_iso
 
 # ========= AWS =========
 dynamodb = boto3.resource("dynamodb")
@@ -32,20 +33,6 @@ if _stripe_secret_name:
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-HEADERS = {"Content-Type": "application/json"}
-
-
-def log(msg, data=None):
-    print(json.dumps({"msg": msg, "data": data}, ensure_ascii=False))
-
-
-def _resp(status: int, body: dict):
-    return {
-        "statusCode": int(status),
-        "headers": HEADERS,
-        "body": json.dumps(body, ensure_ascii=False),
-    }
-
 
 def _raw_body(event: dict) -> bytes:
     body = (event or {}).get("body") or ""
@@ -60,14 +47,6 @@ def _get_header(event: dict, name: str) -> Optional[str]:
         if k.lower() == name.lower():
             return v
     return None
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
 def _iso_from_dt(dt: datetime) -> str:

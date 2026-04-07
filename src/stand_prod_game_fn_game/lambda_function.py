@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _parse_iso, _get_claims, _read_json_body, set_game_type_blob
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -26,71 +27,15 @@ gp_table = dynamodb.Table(GAMEPLAYER_TABLE)
 catalog_table = dynamodb.Table(CATALOG_TABLE)
 
 # ========= CONST =========
-SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO"}
+SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS"}
 
-# numeric 6 digits 
-JOIN_CODE_ALPHABET = "0123456789"
+# 6-char alphanumeric join code (Crockford-style base32 without I, L, O to avoid confusion)
+JOIN_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTUVWXYZ"
 JOIN_CODE_LENGTH = 6
 JOIN_CODE_MAX_ATTEMPTS = 10
 
-HEADERS = {"Content-Type": "application/json"}
-
-def log(msg, obj=None):
-    if obj is not None:
-        print(json.dumps({"msg": msg, "data": obj}, ensure_ascii=False))
-    else:
-        print(json.dumps({"msg": msg}, ensure_ascii=False))
-
-def _resp(status, body):
-    if not isinstance(body, str):
-        body = json.dumps(_json_sanitize(body), ensure_ascii=False)
-    return {
-        "statusCode": int(status),
-        "headers": HEADERS,
-        "body": body,
-        "isBase64Encoded": False,
-    }
-
-def _json_sanitize(obj):
-    """
-    Convierte Decimals de DynamoDB a int/float para que json.dumps no falle.
-    Mantiene dict/list recursivamente.
-    """
-    if isinstance(obj, Decimal):
-        # si es entero -> int, si no -> float
-        return int(obj) if obj % 1 == 0 else float(obj)
-    if isinstance(obj, dict):
-        return {k: _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_sanitize(v) for v in obj]
-    return obj
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def _get_claims(event: dict) -> dict:
-    rc = (event or {}).get("requestContext") or {}
-    auth = rc.get("authorizer") or {}
-    jwt = auth.get("jwt") or {}
-    return jwt.get("claims") or auth.get("claims") or {}
-
-def _read_json_body(event):
-    raw = event.get("body") or "{}"
-    try:
-        return json.loads(raw) if isinstance(raw, str) else (raw or {})
-    except Exception:
-        return None
-
 def _get_query_params(event):
     return event.get("queryStringParameters") or {}
-
-def _parse_iso_dt(s: str):
-    if not s or not isinstance(s, str):
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
 
 def _is_user_pro(user_item: dict) -> bool:
     if not user_item:
@@ -98,7 +43,7 @@ def _is_user_pro(user_item: dict) -> bool:
     plan = (user_item.get("plan") or "FREE").upper().strip()
     if plan == "FREE":
         return False
-    au = _parse_iso_dt(user_item.get("activeUntil"))
+    au = _parse_iso(user_item.get("activeUntil"))
     if not au:
         return False
     return au > datetime.now(timezone.utc)
@@ -128,6 +73,54 @@ def _raffle_winners_from_game(game_item: dict) -> list:
     # si lo guardas en games_table, ideal.
     winners = game_item.get("raffleWinners") or []
     return winners if isinstance(winners, list) else []
+
+
+def _raffle_required_follows_from_game(game_item: dict) -> list:
+    """List of Instagram handles (no @) required to participate in raffle."""
+    follows = game_item.get("raffleRequiredFollows") or []
+    if not isinstance(follows, list):
+        return []
+    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+
+
+def _get_player_prize_delivered(game_id: str, player_id: int, game_type: str) -> bool:
+    """Read type.<gameType>.prizeDelivered for a specific player, default False."""
+    try:
+        resp = gp_table.get_item(Key={"gameId": game_id, "playerId": int(player_id)})
+    except ClientError as e:
+        log("GetPlayerFailed", {"error": str(e), "gameId": game_id, "playerId": player_id})
+        return False
+    it = resp.get("Item") or {}
+    t = it.get("type") or {}
+    blob = t.get((game_type or "").upper()) or {}
+    return bool(blob.get("prizeDelivered", False))
+
+
+EMPAREJA2_CATALOG_ID = "EMPAREJA2#CHARACTERS#v1"
+_empareja2_pair_count_cache = None
+
+
+def _empareja2_catalog_pair_count() -> int:
+    """Count distinct pair groups in empareja2 character catalog. Cached per Lambda invocation."""
+    global _empareja2_pair_count_cache
+    if _empareja2_pair_count_cache is not None:
+        return _empareja2_pair_count_cache
+    items = []
+    kwargs = {"KeyConditionExpression": Key("catalogId").eq(EMPAREJA2_CATALOG_ID)}
+    while True:
+        resp = catalog_table.query(**kwargs)
+        items.extend(resp.get("Items") or [])
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    seen = set()
+    for it in items:
+        g = it.get("pairGroupId") or it.get("pairNumericId")
+        if g is not None:
+            seen.add(str(int(g)) if isinstance(g, Decimal) else str(g).strip())
+    _empareja2_pair_count_cache = len(seen) if seen else 0
+    return _empareja2_pair_count_cache
 
 def _get_path(event):
     return (
@@ -237,7 +230,13 @@ def _handle_get(event):
         if not item.get("isActive", True):
             return _resp(403, {"error": "GameInactive", "gameId": game_id})
 
-        return _resp(200, {"ok": True, "game": _public_game_shape(item)})
+        payload = {"ok": True, "game": _public_game_shape(item)}
+        if (item.get("gameType") or "").upper() == "EMPAREJA2":
+            payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
+            payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
+        elif (item.get("gameType") or "").upper() == "L3TRAS":
+            payload["settings"] = {"l3tras": (item.get("type") or {}).get("L3TRAS") or {}}
+        return _resp(200, payload)
 
     # ---------------- 2) gameName (optional) ----------------
     if game_name:
@@ -289,17 +288,37 @@ def _handle_get(event):
         except Exception:
             validated_count = 0
 
-        return _resp(200, {
+        payload = {
             "ok": True,
             "game": _public_game_shape(item),
             "playerCount": player_count,
             "validatedCount": validated_count,
             "raffleWinners": _raffle_winners_from_game(item),
+            "raffleRequiredFollows": _raffle_required_follows_from_game(item),
             "quiz": {
                 "enabled": _quiz_enabled_from_game(item),
                 "questionsCount": len(item.get("quizOrder") or []) if _quiz_enabled_from_game(item) else 0
             }
-        })
+        }
+        # enrich raffleWinners with prizeDelivered flag per player
+        try:
+            game_type = (item.get("gameType") or "").upper()
+            winners_with_flags = []
+            for w in payload.get("raffleWinners") or []:
+                pid = w.get("playerId")
+                delivered = False
+                if pid is not None:
+                    delivered = _get_player_prize_delivered(game_id, int(pid), game_type)
+                row = dict(w)
+                row["prizeDelivered"] = delivered
+                winners_with_flags.append(row)
+            payload["raffleWinners"] = winners_with_flags
+        except Exception as e:
+            log("RaffleWinnersPrizeDeliveredEnrichFailed", {"error": repr(e), "gameId": game_id})
+        if game_type == "EMPAREJA2":
+            payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
+            payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
+        return _resp(200, payload)
     
     # ---------------- 3) & 4) list user's games ----------------
     game_type = game_type_raw.upper() if game_type_raw else None
@@ -338,7 +357,7 @@ def _handle_post(event):
     """
     Create game (auth required).
     body: { "gameType": "...", "gameName": "..."? }
-    - gameId is a 6-char base32 join code (PK).
+    - gameId is a 6-char alphanumeric join code (PK).
     - FREE plan: max 1 game (uses GSI_OWNER).
     - Optional uniqueness check for gameName if you created GSI_GAMENAME.
     """
@@ -401,7 +420,7 @@ def _handle_post(event):
             log("GameName uniqueness check failed", {"error": str(e)})
             return _resp(500, {"error": "GameNameCheckFailed", "detail": str(e)})
 
-    now = _now_iso()
+    now = _iso_now()
     max_players = 25 if not is_pro else 9999
 
     # Generate unique join code (gameId) with retries
@@ -410,6 +429,7 @@ def _handle_post(event):
 
     for _ in range(JOIN_CODE_MAX_ATTEMPTS):
         candidate = _new_join_code()
+        requires_validation = (game_type or "").upper() != "INFOCARDS"
         item = {
             "gameId": candidate,
             "ownerUserId": owner_user_id,
@@ -420,6 +440,7 @@ def _handle_post(event):
             "playersCount": 0,
             "validatedCount": 0,
             "raffleWinners": [],
+            "requiresValidation": requires_validation,
             "createdAt": now,
             "updatedAt": now,
         }
@@ -458,8 +479,11 @@ def _handle_post(event):
 
 def _handle_put(event):
     """
-    Update isActive (owner only).
-    body: { "gameId": "XXXXXX", "isActive": true/false }
+    Update game (owner only).
+    body: { "gameId": "XXXXXX", "isActive": true/false?, "settings": { "empareja2": { "numPairs": N?, "maxValidations": M? } }? }
+    - isActive: optional boolean. If provided, updates isActive and updatedAt.
+    - settings.empareja2: optional. If provided, merges into type.EMPAREJA2 (numPairs: int >= 1 or None, maxValidations: int >= 0 or None).
+    - settings.l3tras: optional. Merges into type.L3TRAS (objectiveWord, always stored uppercase).
     """
     body = _read_json_body(event)
     if body is None:
@@ -471,34 +495,194 @@ def _handle_put(event):
         return _resp(401, {"error": "Missing sub claim (unauthorized)"})
 
     game_id = (body.get("gameId") or "").strip()
-    is_active = body.get("isActive", None)
-
     if not game_id:
         return _resp(400, {"error": "Missing required field 'gameId'."})
-    if not isinstance(is_active, bool):
-        return _resp(400, {"error": "Field 'isActive' must be a boolean."})
 
-    now = _now_iso()
+    is_active = body.get("isActive", None)
+    settings = body.get("settings") or {}
+    empareja2_settings = settings.get("empareja2")
+    raffle_settings = settings.get("raffle")
+    prize_update = settings.get("prizeDelivered")
+    l3tras_settings = settings.get("l3tras")
+
+    # At least one update
+    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update and not l3tras_settings:
+        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', or 'settings.prizeDelivered'."})
+
+    now = _iso_now()
 
     try:
-        resp = games_table.update_item(
-            Key={"gameId": game_id},
-            UpdateExpression="SET isActive = :a, updatedAt = :u",
-            ExpressionAttributeValues={
-                ":a": is_active,
-                ":u": now,
-                ":owner": owner_user_id,
-            },
-            ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
-            ReturnValues="ALL_NEW",
-        )
-        attrs = resp.get("Attributes") or {}
+        resp = games_table.get_item(Key={"gameId": game_id})
+        item = resp.get("Item")
     except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
-        log("Update failed", {"error": str(e)})
-        return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+        log("GetItem failed on PUT", {"error": str(e)})
+        return _resp(500, {"error": "GetItemFailed", "detail": str(e)})
 
+    if not item:
+        return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+    if (item.get("ownerUserId") or "") != owner_user_id:
+        return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+
+    if isinstance(is_active, bool):
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET isActive = :a, updatedAt = :u",
+                ExpressionAttributeValues={
+                    ":a": is_active,
+                    ":u": now,
+                    ":owner": owner_user_id,
+                },
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update isActive failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if empareja2_settings is not None and isinstance(empareja2_settings, dict):
+        num_pairs = empareja2_settings.get("numPairs")
+        max_validations = empareja2_settings.get("maxValidations")
+        if num_pairs is not None:
+            try:
+                n = int(num_pairs)
+                if n < 1:
+                    return _resp(400, {"error": "settings.empareja2.numPairs must be >= 1 or omitted."})
+                num_pairs = n
+            except (TypeError, ValueError):
+                return _resp(400, {"error": "settings.empareja2.numPairs must be a positive integer or omitted."})
+        if max_validations is not None:
+            try:
+                m = int(max_validations)
+                if m < 0:
+                    return _resp(400, {"error": "settings.empareja2.maxValidations must be >= 0 or omitted."})
+                max_validations = m
+            except (TypeError, ValueError):
+                return _resp(400, {"error": "settings.empareja2.maxValidations must be a non-negative integer or omitted."})
+        current_blob = (item.get("type") or {}).get("EMPAREJA2") or {}
+        merged = {**current_blob}
+        if num_pairs is not None:
+            merged["numPairs"] = num_pairs
+        if max_validations is not None:
+            merged["maxValidations"] = max_validations
+        try:
+            set_game_type_blob(
+                games_table,
+                game_id,
+                "EMPAREJA2",
+                merged,
+                updated_at=now,
+                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
+                condition_values={":owner": owner_user_id},
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update type.EMPAREJA2 failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if l3tras_settings is not None and isinstance(l3tras_settings, dict) and l3tras_settings:
+        if (item.get("gameType") or "").upper() != "L3TRAS":
+            return _resp(400, {"error": "settings.l3tras is only valid for L3TRAS games."})
+        current_blob = (item.get("type") or {}).get("L3TRAS") or {}
+        merged = {**current_blob}
+        if "objectiveWord" in l3tras_settings and l3tras_settings["objectiveWord"] is not None:
+            raw = str(l3tras_settings["objectiveWord"]).strip()
+            letters_only = "".join(c for c in raw if c.isalpha())
+            if not letters_only:
+                return _resp(400, {"error": "settings.l3tras.objectiveWord must contain at least one letter."})
+            if len(letters_only) > 40:
+                return _resp(400, {"error": "settings.l3tras.objectiveWord must be at most 40 letters."})
+            merged["objectiveWord"] = letters_only.upper()
+        merged.pop("normalize", None)
+        try:
+            set_game_type_blob(
+                games_table,
+                game_id,
+                "L3TRAS",
+                merged,
+                updated_at=now,
+                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
+                condition_values={":owner": owner_user_id},
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update type.L3TRAS failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if raffle_settings is not None and isinstance(raffle_settings, dict):
+        required_follows = raffle_settings.get("requiredFollows")
+        if required_follows is not None:
+            if not isinstance(required_follows, list):
+                return _resp(400, {"error": "settings.raffle.requiredFollows must be an array of strings or omitted."})
+            normalized = []
+            for h in required_follows:
+                if h is None:
+                    continue
+                s = str(h).strip().lower().lstrip("@")
+                if s and s not in normalized:
+                    normalized.append(s)
+            try:
+                games_table.update_item(
+                    Key={"gameId": game_id},
+                    UpdateExpression="SET raffleRequiredFollows = :r, updatedAt = :u",
+                    ExpressionAttributeValues={
+                        ":r": normalized,
+                        ":u": now,
+                        ":owner": owner_user_id,
+                    },
+                    ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+                log("Update raffleRequiredFollows failed", {"error": str(e)})
+                return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    # settings.prizeDelivered: { gameType, playerId, delivered: bool }
+    if prize_update is not None and isinstance(prize_update, dict):
+        p_game_type = (prize_update.get("gameType") or "").upper()
+        p_player_id = prize_update.get("playerId")
+        delivered_flag = prize_update.get("delivered")
+        if not p_game_type or p_player_id is None or not isinstance(delivered_flag, bool):
+            return _resp(400, {"error": "settings.prizeDelivered requires 'gameType', 'playerId' and boolean 'delivered'."})
+        try:
+            pid_int = int(p_player_id)
+        except Exception:
+            return _resp(400, {"error": "settings.prizeDelivered.playerId must be numeric."})
+        try:
+            # Three separate updates: DynamoDB does not allow overlapping paths in one expression
+            # (e.g. [type] and [type, T1MER], or [type, T1MER] and [type, T1MER, prizeDelivered])
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": pid_int},
+                UpdateExpression="SET #type = if_not_exists(#type, :tinit)",
+                ExpressionAttributeNames={"#type": "type"},
+                ExpressionAttributeValues={":tinit": {}},
+            )
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": pid_int},
+                UpdateExpression="SET #type.#g = if_not_exists(#type.#g, :ginit)",
+                ExpressionAttributeNames={"#type": "type", "#g": p_game_type},
+                ExpressionAttributeValues={":ginit": {}},
+            )
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": pid_int},
+                UpdateExpression="SET #type.#g.prizeDelivered = :d",
+                ExpressionAttributeNames={"#type": "type", "#g": p_game_type},
+                ExpressionAttributeValues={":d": delivered_flag},
+            )
+        except ClientError as e:
+            log("UpdatePrizeDeliveredFailed", {"error": str(e), "gameId": game_id, "playerId": pid_int})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    # Return current state
+    try:
+        resp = games_table.get_item(Key={"gameId": game_id})
+        attrs = resp.get("Item") or item
+    except Exception:
+        attrs = item
     return _resp(200, {"message": "Game updated successfully", "game": attrs})
 
 # ---------------- DELETE ----------------

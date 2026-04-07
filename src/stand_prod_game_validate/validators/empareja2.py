@@ -4,6 +4,42 @@ from datetime import datetime, timezone
 def _iso_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+
+def _norm_char_id(x):
+    if x is None:
+        return None
+    if isinstance(x, Decimal):
+        return int(x)
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pair_group_id_from_player(t: dict) -> str:
+    """pairGroupId stored in Gameplayer; fallback to pairId for legacy data."""
+    return str(t.get("pairGroupId") or t.get("pairId") or "").strip()
+
+
+def _is_valid_pair(t1: dict, t2: dict) -> bool:
+    """True if both have same non-empty pairGroupId and different characterId."""
+    g1 = _pair_group_id_from_player(t1)
+    g2 = _pair_group_id_from_player(t2)
+    if not g1 or not g2 or g1 != g2:
+        return False
+    # Compare characterIds: support numeric (int/Decimal) and string (e.g. "C1", "C2")
+    c1 = t1.get("characterId")
+    c2 = t2.get("characterId")
+    n1, n2 = _norm_char_id(c1), _norm_char_id(c2)
+    if n1 is not None and n2 is not None:
+        if n1 == n2:
+            return False
+    else:
+        if str(c1 or "") == str(c2 or ""):
+            return False
+    return True
+
+
 def validate_empareja2(ctx: dict):
     game_id = ctx["gameId"]
     codes = ctx["codes"]
@@ -11,8 +47,6 @@ def validate_empareja2(ctx: dict):
     to_int = ctx["to_int_code"]
     query_by_code = ctx["query_players_by_code"]
     set_validated = ctx["set_validated"]
-    send_bulk = ctx["send_bulk"]
-    invoke_quiz = ctx["invoke_quiz"]
     presign = ctx.get("presign_character_png")
     inc_validated_count = ctx.get("inc_validated_count")
 
@@ -52,16 +86,16 @@ def validate_empareja2(ctx: dict):
     t1 = (p1.get("type") or {}).get("EMPAREJA2") or {}
     t2 = (p2.get("type") or {}).get("EMPAREJA2") or {}
 
-    pair1 = str(t1.get("pairId") or "")
-    pair2 = str(t2.get("pairId") or "")
+    pair_group_1 = _pair_group_id_from_player(t1)
+    pair_group_2 = _pair_group_id_from_player(t2)
 
-    if not pair1 or not pair2:
+    if not pair_group_1 or not pair_group_2:
         return {"valid": False, "gameId": game_id, "reason": "missing_pair_data", "message": "Faltan datos de emparejamiento."}
 
     if str(t1.get("characterId")) == str(t2.get("characterId")):
         return {"valid": False, "gameId": game_id, "reason": "same_character", "message": "No puedes validar contigo mismo 😉"}
 
-    if pair1 != pair2:
+    if not _is_valid_pair(t1, t2):
         return {"valid": False, "gameId": game_id, "reason": "different_pair", "message": "No sois la pareja correcta 💘"}
 
     pid1 = int(p1["playerId"]) if isinstance(p1["playerId"], (int, Decimal)) else int(p1["playerId"])
@@ -78,22 +112,14 @@ def validate_empareja2(ctx: dict):
         except Exception as e:
             ctx["log"]("validatedCount_update_failed", {"error": repr(e), "gameId": game_id})
 
-    psids = [p for p in [p1.get("instagramPSID"), p2.get("instagramPSID")] if p]
-
-    msg = "🎉 ¡Pareja correcta! Si tenéis quiz activo, os llegará ahora. 🎁"
-    if psids:
-        send_bulk([{"psid": p, "text": msg} for p in psids])
-
-    invoke_quiz(game_id, psids)
-
     c1_name = t1.get("characterName")
     c2_name = t2.get("characterName")
 
     return {
         "valid": True,
         "gameId": game_id,
-        "pairId": pair1,
-        "message": msg,
+        "pairId": pair_group_1,
+        "message": "",
         "players": [
             {
                 "playerId": pid1,

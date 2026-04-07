@@ -109,10 +109,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
     if not item:
         return {"ok": False, "error": "player_not_found", "message": "No existe ningún jugador con ese playerId."}
 
-    # 2) asegurar mapas type.<GAME>
-    _ensure_type_maps(game_id, player_id, gk, gp_table)
-
-    # 3) escribir score/timer
+    # 2) escribir score/timer (type map pre-initialized by assigner on join)
     now = _iso_now()
 
     gp_table.update_item(
@@ -126,6 +123,48 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         },
     )
 
+    # 3) compute rank (full ranking, then find this player's 1-based position)
+    items = []
+    last = None
+    while True:
+        kwargs = {"KeyConditionExpression": Key("gameId").eq(game_id)}
+        if last:
+            kwargs["ExclusiveStartKey"] = last
+        resp = gp_table.query(**kwargs)
+        items.extend(resp.get("Items") or [])
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            break
+
+    ranking = []
+    for it in items:
+        pid = _as_int(it.get("playerId"))
+        if pid is None or pid <= 0:
+            continue
+
+        tb = (it.get("type") or {}).get(gk) or {}
+        score_val = tb.get("score")
+        timer_val = tb.get("timer")
+
+        score_float = _as_float(score_val)
+        timer_float = _as_float(timer_val)
+        if score_float is None or timer_float is None:
+            continue
+
+        ranking.append({
+            "playerId": pid,
+            "username": it.get("instagramUsername", ""),
+            "timer": timer_float,
+            "score": score_float,
+        })
+
+    ranking.sort(key=lambda x: x["score"])  # ASC = mejor
+    rank = None
+    for idx, entry in enumerate(ranking, start=1):
+        if entry["playerId"] == player_id:
+            rank = idx
+            break
+
     return {
         "ok": True,
         "gameId": game_id,
@@ -134,6 +173,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         "timer": timer_float,
         "score": score_int,
         "scoreUpdatedAt": now,
+        "rank": rank,
     }
 
 
