@@ -1,5 +1,6 @@
 import os
 import boto3
+from decimal import Decimal
 from botocore.exceptions import ClientError
 from stand_common.utils import log, _resp, _get_claims, _read_json_body, _iso_now, get_game_type_blob, set_game_type_blob
 
@@ -13,6 +14,17 @@ games_table = dynamodb.Table(GAMES_TABLE)
 s3 = boto3.client("s3")
 
 PRESIGNED_GET_TTL = 3600  # 1 hour
+
+
+def _to_dynamodb_number(value):
+    """Convert Python float numbers to Decimal recursively for DynamoDB."""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {k: _to_dynamodb_number(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_dynamodb_number(v) for v in value]
+    return value
 
 
 def _get_query_params(event):
@@ -153,7 +165,7 @@ def _handle_put(event, owner_user_id):
             clean["imagePositionX"] = card["imagePositionX"]
         if card.get("imagePositionY") is not None:
             clean["imagePositionY"] = card["imagePositionY"]
-        clean_cards.append(clean)
+        clean_cards.append(_to_dynamodb_number(clean))
 
     new_blob["cards"] = clean_cards
 

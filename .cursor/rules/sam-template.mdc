@@ -1,0 +1,61 @@
+---
+description: SAM template.yaml naming and structure conventions
+globs: template.yaml
+alwaysApply: false
+---
+
+# SAM Template Rules
+
+## Naming conventions
+- Stack name: `stand-backend-prod`
+- Lambda logical IDs: `StandProd<Component>Fn<Action>` (PascalCase)
+- Lambda function names: `stand-prod-<component>-fn-<action>` (kebab-case)
+- IAM role IDs: `StandProd<Component>Role`
+
+## IAM Roles (existing — reuse, don't create new ones)
+- `StandProdGameRole` — game, assign, validate, score, quiz, raffle, infocards-get
+- `StandProdBillingRole` — billing, user
+- `StandProdWebhookRole` — webhook-instagram, webhook-stripe
+- `StandProdSenderRole` — instagram-sender
+- `StandProdInfocardsRole` — infocards-process, quiz-generate (needs Bedrock)
+
+## Globals (already set — don't override per-function unless necessary)
+```yaml
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 30
+    MemorySize: 128
+    Layers:
+      - !Ref StandCommonLayer
+    Environment:
+      Variables:
+        STAGE: prod
+        GAMES_TABLE: stand-prod-game-table
+        USERS_TABLE: stand-prod-user-table
+        GAMEPLAYER_TABLE: stand-prod-gameplayer-table
+        CATALOG_TABLE: stand-prod-catalog-table
+```
+
+## New function template
+```yaml
+StandProdNewFn:
+  Type: AWS::Serverless::Function
+  Properties:
+    FunctionName: stand-prod-<component>-fn-<action>
+    CodeUri: src/stand_prod_<component>_fn_<action>/
+    Handler: lambda_function.lambda_handler
+    Role: !GetAtt StandProdGameRole.Arn
+    Events:
+      ApiEvent:
+        Type: HttpApi
+        Properties:
+          ApiId: !Ref GameApi
+          Path: /v1/<route>
+          Method: <METHOD>
+```
+
+## Deploy commands
+- `sam build` — builds all functions
+- `sam deploy --config-env prod` — deploys to production
+- `sam local invoke StandProd<Fn> -e events/test.json` — local test

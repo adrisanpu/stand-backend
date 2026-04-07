@@ -682,8 +682,8 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
-          STRIPE_SUCCESS_URL: https://www.playstand.app/home
-          STRIPE_CANCEL_URL: https://www.playstand.app/home
+          STRIPE_SUCCESS_URL: https://playstand.app/home
+          STRIPE_CANCEL_URL: https://playstand.app/home
       Events:
         CheckoutPost:
           Type: HttpApi
