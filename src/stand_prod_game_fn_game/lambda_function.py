@@ -595,6 +595,17 @@ def _handle_put(event):
             if len(letters_only) > 40:
                 return _resp(400, {"error": "settings.l3tras.objectiveWord must be at most 40 letters."})
             merged["objectiveWord"] = letters_only.upper()
+        if "validationTimeLimitSeconds" in l3tras_settings and l3tras_settings["validationTimeLimitSeconds"] is not None:
+            try:
+                tls = int(l3tras_settings["validationTimeLimitSeconds"])
+            except Exception:
+                return _resp(400, {"error": "settings.l3tras.validationTimeLimitSeconds must be an integer."})
+            if tls < 15 or tls > 3600:
+                return _resp(
+                    400,
+                    {"error": "settings.l3tras.validationTimeLimitSeconds must be between 15 and 3600 (seconds)."},
+                )
+            merged["validationTimeLimitSeconds"] = tls
         merged.pop("normalize", None)
         try:
             set_game_type_blob(
