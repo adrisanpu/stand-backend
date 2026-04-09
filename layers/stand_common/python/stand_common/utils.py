@@ -13,6 +13,15 @@ from decimal import Decimal
 
 HEADERS = {"Content-Type": "application/json"}
 
+# gameId format from game create; Instagram webhook accepts same token as plain text
+JOIN_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTUVWXYZ"
+JOIN_CODE_LENGTH = 6
+_JOIN_CODE_CHARS = frozenset(JOIN_CODE_ALPHABET)
+
+
+def is_valid_join_code(s: str) -> bool:
+    return len(s) == JOIN_CODE_LENGTH and all(c in _JOIN_CODE_CHARS for c in s)
+
 
 def log(msg, obj=None):
     """Structured JSON logger. Sanitizes obj so DynamoDB Decimals never crash json.dumps."""
