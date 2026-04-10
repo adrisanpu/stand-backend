@@ -1,6 +1,6 @@
 import os, json, base64, urllib.parse, urllib.request
 import boto3
-from stand_common.utils import log
+from stand_common.utils import log, is_valid_join_code
 
 # ====== ENV VARS ======
 IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
@@ -129,7 +129,7 @@ def _classify_message(m: dict):
     Devuelve (kind, data):
       - ("quiz_answer", payload)
       - ("other", None)
-    Entrada por código de partida ya no es por texto; solo por referral (QR + Ice Breaker).
+    Unión por código: referral/postback o mensaje de texto (6 chars, ver is_valid_join_code).
     """
     msg = m.get("message") or {}
 
@@ -185,6 +185,22 @@ def _handle_and_dispatch(m: dict):
         log("dispatching_referral", {"psid": psid, "ref": ref, "username_at": username_at})
         _invoke_async(ASSIGN_LAMBDA, normalized_event)
         return
+
+    # Texto plano = código de partida (p. ej. QR no envía referral con el chat ya abierto)
+    if not (msg.get("quick_reply") or {}).get("payload"):
+        token = (msg.get("text") or "").strip().upper()
+        if token and is_valid_join_code(token):
+            username_at = _get_username_from_graph(psid)
+            normalized_event = {
+                "kind": "game_id",
+                "psid": psid,
+                "username_at": username_at,
+                "game_id": token,
+                "raw_event": m,
+            }
+            log("dispatching_text_join", {"psid": psid, "game_id": token, "username_at": username_at})
+            _invoke_async(ASSIGN_LAMBDA, normalized_event)
+            return
 
     kind, data = _classify_message(m)
 

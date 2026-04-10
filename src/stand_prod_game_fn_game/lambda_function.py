@@ -7,7 +7,18 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _parse_iso, _get_claims, _read_json_body, set_game_type_blob
+from stand_common.utils import (
+    log,
+    _json_sanitize,
+    _resp,
+    _iso_now,
+    _parse_iso,
+    _get_claims,
+    _read_json_body,
+    set_game_type_blob,
+    JOIN_CODE_ALPHABET,
+    JOIN_CODE_LENGTH,
+)
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -29,9 +40,6 @@ catalog_table = dynamodb.Table(CATALOG_TABLE)
 # ========= CONST =========
 SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS"}
 
-# 6-char alphanumeric join code (Crockford-style base32 without I, L, O to avoid confusion)
-JOIN_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTUVWXYZ"
-JOIN_CODE_LENGTH = 6
 JOIN_CODE_MAX_ATTEMPTS = 10
 
 def _get_query_params(event):
