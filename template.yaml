@@ -207,6 +207,13 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/stripe*"
+              - Sid: S3UserMedia
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::stand-prod-user-media-${AWS::AccountId}/*"
 
 # ----- Sender role (Instagram DM sender — no DB, just calls Graph API) -----
 
@@ -385,6 +392,17 @@ Resources:
         CorsRules:
           - AllowedHeaders: ["*"]
             AllowedMethods: [PUT, GET]
+            AllowedOrigins: ["*"]
+            MaxAge: 3600
+
+  UserMediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "stand-prod-user-media-${AWS::AccountId}"
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [PUT, GET, DELETE]
             AllowedOrigins: ["*"]
             MaxAge: 3600
 
@@ -719,6 +737,50 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/user/me
             Method: GET
+
+  StandProdUserFnMedia:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-user-fn-media
+      Description: Manages per-user media library (logos and avatar videos) with S3-backed storage.
+      CodeUri: src/stand_prod_user_fn_media/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdBillingRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
+          DEFAULT_STAND_LOGO_DARK_KEY: defaults/logo/logo_stand_letters_white.png
+          DEFAULT_STAND_LOGO_LIGHT_KEY: defaults/logo/logo_stand_letters_black.png
+          DEFAULT_STAND_AVATAR_IDLE_KEY: defaults/avatar/stand-idle.mp4
+          DEFAULT_STAND_AVATAR_WIN_KEY: defaults/avatar/stand-win.mp4
+          DEFAULT_STAND_AVATAR_LOSE_KEY: defaults/avatar/stand-lose.mp4
+      Events:
+        UserMediaGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/user/media
+            Method: GET
+        UserMediaPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/user/media
+            Method: POST
+        UserMediaPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/user/media
+            Method: PUT
+        UserMediaDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/user/media
+            Method: DELETE
 
   StandProdMessagingInstagramSender:
     Type: AWS::Serverless::Function
