@@ -101,6 +101,8 @@ Empty S3 buckets first if delete fails.
 
 ## CI/CD
 
+Full cross-repo workflow (branches, CI jobs, prod, Cursor agents): **[DEVELOPMENT_WORKFLOW.md](DEVELOPMENT_WORKFLOW.md)**.
+
 ### Branch flow
 
 | Step | Action |
