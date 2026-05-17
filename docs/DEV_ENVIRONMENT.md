@@ -105,7 +105,7 @@ Empty S3 buckets first if delete fails.
 
 | Step | Action |
 |------|--------|
-| Feature work | Open PR **into `dev`** → **squash merge** (required by repo ruleset) |
+| Feature work | Open PR **into `dev`** → **squash merge** (repo allows only squash) |
 | After merge to `dev` | GitHub Actions runs `pytest` (on PR) then **deploys** `stand-backend-dev` (on push to `dev`) |
 | Production | Merge `dev` → `main` when ready; deploy prod **manually**: `sam deploy --config-env prod` |
 
@@ -132,16 +132,16 @@ Frontend/website: PRs to `dev` also use squash merge; `npm run build` runs on PR
 
 4. Workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml): `test` on PRs to `dev`/`main`; `deploy-dev` on push to `dev` only. Prod is never deployed from CI.
 
-### Squash merge (all 3 repos)
+### Squash merge (all 3 repos, GitHub Free)
 
-**Private repos (Free):** branch rulesets that require squash on `dev` only need GitHub Pro. Use repo-level squash-only instead:
+Private repos on the free plan cannot use branch rulesets. Use **squash-only** at repo level (applies to all branches, including `main`):
 
 ```powershell
-gh api repos/adrisanpu/stand-backend -X PATCH -f allow_squash_merge=true -f allow_merge_commit=false -f allow_rebase_merge=false
-# repeat for stand-frontend, stand-website
+cd stand-backend
+.\scripts\apply-squash-merge-settings.ps1
 ```
 
-**GitHub Pro:** optional ruleset from [`docs/github-ruleset-dev-squash.json`](github-ruleset-dev-squash.json) via `.\scripts\apply-github-rulesets.ps1` (squash enforced only on branch `dev`).
+Already applied if merge commit and rebase are disabled in **Settings → General → Pull requests**.
 
 ### SAM config note
 

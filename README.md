@@ -125,8 +125,8 @@ Prefer extending existing endpoint patterns over introducing a new endpoint fami
 
 | Target | Merge method | Deploy |
 |--------|--------------|--------|
-| PR → `dev` | **Squash merge** (ruleset) | On merge: CI deploys `stand-backend-dev` via GitHub Actions |
-| `main` | Your choice | **Manual** `sam deploy --config-env prod` |
+| PR → `dev` | **Squash merge** (only method enabled) | On merge: CI deploys `stand-backend-dev` via GitHub Actions |
+| `main` | **Squash merge** (same repo setting) | **Manual** `sam deploy --config-env prod` |
 
 CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `pytest` on PRs; SAM deploy to dev on push to `dev` only. Setup: [docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md#cicd).
 
