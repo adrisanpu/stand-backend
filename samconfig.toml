@@ -13,7 +13,7 @@ parameter_overrides = "Environment=prod"
 stack_name = "stand-backend-dev"
 resolve_s3 = true
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-confirm_changeset = true
+confirm_changeset = false
 fail_on_empty_changeset = false
 region = "us-east-1"
 parameter_overrides = "Environment=dev CognitoAppClientId=7634rvppo09l7s2qg5qikk3rlu StripeSuccessUrl=https://dev.playstand.app/home StripeCancelUrl=https://dev.playstand.app/home"

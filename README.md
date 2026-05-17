@@ -119,6 +119,15 @@ Prefer extending existing endpoint patterns over introducing a new endpoint fami
 ## Repo
 
 - **Remote:** [stand-backend](https://github.com/adrisanpu/stand-backend)
-- **Default branch:** `main`
+- **Branches:** `main` (default), `dev` (integration / auto-deploy target)
+
+### Branch flow and merge
+
+| Target | Merge method | Deploy |
+|--------|--------------|--------|
+| PR → `dev` | **Squash merge** (ruleset) | On merge: CI deploys `stand-backend-dev` via GitHub Actions |
+| `main` | Your choice | **Manual** `sam deploy --config-env prod` |
+
+CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `pytest` on PRs; SAM deploy to dev on push to `dev` only. Setup: [docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md#cicd).
 
 To use `main` as the default on GitHub: **Settings → General → Default branch** → switch to `main` → Save. Then you can delete the `master` branch on the remote if desired.

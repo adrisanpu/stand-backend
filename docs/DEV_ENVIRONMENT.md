@@ -99,8 +99,52 @@ aws cloudformation delete-stack --stack-name stand-backend-dev --region us-east-
 
 Empty S3 buckets first if delete fails.
 
-## CI/CD (futuro)
+## CI/CD
 
-- GitHub Actions: `pytest` / `npm run build` en PRs; deploy opcional a dev en merge a `dev`.
-- Amplify: rama o app por entorno (`dev` → dev.playstand.app, prod → playstand.app).
-- Documentar el flujo en cada repo cuando se implemente.
+### Branch flow
+
+| Step | Action |
+|------|--------|
+| Feature work | Open PR **into `dev`** → **squash merge** (required by repo ruleset) |
+| After merge to `dev` | GitHub Actions runs `pytest` (on PR) then **deploys** `stand-backend-dev` (on push to `dev`) |
+| Production | Merge `dev` → `main` when ready; deploy prod **manually**: `sam deploy --config-env prod` |
+
+Frontend/website: PRs to `dev` also use squash merge; `npm run build` runs on PRs. Hosted UI deploy stays on Amplify (branch/app per environment).
+
+### One-time: GitHub Actions OIDC (backend deploy)
+
+1. Deploy the IAM role (us-east-1):
+
+   ```powershell
+   cd stand-backend
+   .\scripts\setup-github-oidc.ps1
+   ```
+
+   Or manually: `aws cloudformation deploy --template-file infra/github-actions-oidc.yaml --stack-name stand-github-actions-oidc --capabilities CAPABILITY_NAMED_IAM --region us-east-1`
+
+2. Copy the stack output `RoleArn`.
+
+3. In GitHub **adrisanpu/stand-backend** → Settings → Secrets → Actions, add:
+
+   | Secret | Value |
+   |--------|--------|
+   | `AWS_ROLE_ARN_DEV` | Role ARN from step 2 |
+
+4. Workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml): `test` on PRs to `dev`/`main`; `deploy-dev` on push to `dev` only. Prod is never deployed from CI.
+
+### One-time: squash merge on `dev` (all 3 repos)
+
+Apply ruleset `dev-squash-merge` (requires [GitHub CLI](https://cli.github.com/)):
+
+```powershell
+cd stand-backend
+.\scripts\apply-github-rulesets.ps1
+```
+
+Or per repo: Settings → Rules → Rulesets → import from [`docs/github-ruleset-dev-squash.json`](github-ruleset-dev-squash.json).
+
+Same JSON exists in `stand-frontend/docs/` and `stand-website/docs/`.
+
+### SAM config note
+
+`[dev.deploy.parameters]` uses `confirm_changeset = false` so CI can deploy non-interactively. Prod keeps `confirm_changeset = true` for local deploys.

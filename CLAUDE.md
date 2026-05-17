@@ -9,6 +9,8 @@ Template parametrized by `Environment` (`prod` | `dev`). All business logic live
 
 **Deploy:** `samconfig.toml` — prod uses defaults; dev needs `CognitoAppClientId` in `parameter_overrides`. See `docs/DEV_ENVIRONMENT.md`.
 
+**CI:** PRs → `pytest` (`.github/workflows/ci.yml`). Push to `dev` → auto `sam deploy --config-env dev`. Prod deploy is **manual** only. PRs to `dev` use squash merge (ruleset).
+
 **DynamoDB Tables (4 per env):** `stand-{prod|dev}-game-table`, `stand-{prod|dev}-gameplayer-table`, `stand-{prod|dev}-user-table`, `stand-{prod|dev}-catalog-table`
 
 Prod details:
