@@ -16,7 +16,7 @@ GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-tab
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
 QUIZ_QUEUE_URL = os.environ.get("QUIZ_QUEUE_URL", "")
 # Stand account handle (shown last in follow list); default matches frontend INSTAGRAM_HANDLE
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 
 
 # Optional GSI
@@ -152,7 +152,7 @@ def _find_existing_player_by_psid(game_id: str, psid: str) -> dict | None:
     try:
         kwargs = {
             "KeyConditionExpression": Key("gameId").eq(game_id),
-            "ProjectionExpression": "gameId, playerId, instagramPSID, instagramUsername, joinedAt, validated, validationCode, type",
+            "ProjectionExpression": "gameId, playerId, instagramPSID, instagramUsername, instagramProfilePicUrl, joinedAt, validated, validationCode, type",
         }
         while True:
             page = gp_table.query(**kwargs)
@@ -263,6 +263,7 @@ def lambda_handler(event, context):
     {
       "psid": "USER_PSID",
       "username_at": "@usuario" | None,
+      "instagram_profile_pic_url": "https://..." | None,
       "game_id": "K9R4QM",
       "raw_event": {...}
     }
@@ -270,6 +271,8 @@ def lambda_handler(event, context):
     try:
         psid = (event or {}).get("psid")
         username_at = (event or {}).get("username_at")
+        profile_pic_raw = (event or {}).get("instagram_profile_pic_url")
+        profile_pic_url = (str(profile_pic_raw).strip() if profile_pic_raw else "") or None
         game_id = (event or {}).get("game_id")
 
         # 1) sanity
@@ -362,6 +365,8 @@ def lambda_handler(event, context):
                 "validated": False,
                 "validationCode": _code4(),
             }
+            if profile_pic_url:
+                base_item["instagramProfilePicUrl"] = profile_pic_url
 
             assigner = ASSIGNERS.get(game_type, assign_generic)
             ctx = {

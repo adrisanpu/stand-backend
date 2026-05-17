@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 GAME_LABELS = {
     "T1MER": "T1mer",
     "RULET4": "Rulet4",
+    "IMPOSTOR": "Impostor",
 }
 
 SINGLE_CODE_TYPES = frozenset(GAME_LABELS)
@@ -70,11 +71,15 @@ def _validate_single_code(ctx: dict, game_label: str):
                 except Exception as e:
                     _log("validatedCount_update_failed", {"error": repr(e), "gameId": game_id})
 
+            pic = it.get("instagramProfilePicUrl") or ""
+            pic = pic.strip() if isinstance(pic, str) else ""
+
             return {
                 "valid": True,
                 "gameId": game_id,
                 "playerId": pid,
                 "username": it.get("instagramUsername", ""),
+                "profilePicUrl": pic,
                 "validatedAt": _iso_now(),
                 "message": f"✅ Validación correcta ({game_label})."
             }

@@ -22,7 +22,7 @@ CHAR_BUCKET = os.environ.get("CHAR_BUCKET", "")            # e.g. "empareja2-cha
 CHAR_URL_TTL = int(os.environ.get("CHAR_URL_TTL", "120"))  # seconds
 
 # Raffle follow notification (same as assign)
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 
 dynamo_r = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")

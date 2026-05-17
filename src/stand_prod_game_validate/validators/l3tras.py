@@ -1,6 +1,11 @@
 from decimal import Decimal
 
 
+def _profile_pic_url(player_item: dict) -> str:
+    pic = player_item.get("instagramProfilePicUrl") or ""
+    return pic.strip() if isinstance(pic, str) else ""
+
+
 def validate_l3tras(ctx: dict):
     game_id = ctx["gameId"]
     codes = ctx["codes"]
@@ -71,6 +76,7 @@ def validate_l3tras(ctx: dict):
                 "playerId": pid,
                 "instagramUsername": it.get("instagramUsername", ""),
                 "letter": letter,
+                "profilePicUrl": _profile_pic_url(it),
             }
         ],
         "results": [{"code": str(code_int), "letter": letter}],

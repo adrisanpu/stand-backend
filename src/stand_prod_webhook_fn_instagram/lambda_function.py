@@ -71,23 +71,28 @@ def _graph_get(path: str, params: dict):
         return None
 
 
-def _get_username_from_graph(psid: str):
+def _get_ig_profile_for_assign(psid: str) -> tuple[str | None, str | None]:
+    """
+    Instagram User Profile API (IGSID): username + profile_pic.
+    Returns (username_at with @ prefix or None, profile picture URL or None).
+    """
     if not psid:
-        return None
+        return None, None
 
-    data = _graph_get(psid, {"fields": "username"})
+    data = _graph_get(psid, {"fields": "username,profile_pic"})
     if not data:
-        return None
+        return None, None
 
     uname = (data.get("username") or "").strip()
     if not uname:
-        return None
+        return None, None
 
-    # normaliza: empieza con @ y en minúsculas
     uname = uname.lower()
     if not uname.startswith("@"):
         uname = "@" + uname
-    return uname
+
+    pic = (data.get("profile_pic") or "").strip()
+    return uname, (pic or None)
 
 
 # ---------- Clasificación de mensajes ----------
@@ -174,11 +179,12 @@ def _handle_and_dispatch(m: dict):
     ref = _ref_from_referral(m)
     if ref:
         # ref como game_id; assign valida existencia en Dynamo
-        username_at = _get_username_from_graph(psid)
+        username_at, instagram_profile_pic_url = _get_ig_profile_for_assign(psid)
         normalized_event = {
             "kind": "game_id",
             "psid": psid,
             "username_at": username_at,
+            "instagram_profile_pic_url": instagram_profile_pic_url,
             "game_id": ref,
             "raw_event": m,
         }
@@ -190,11 +196,12 @@ def _handle_and_dispatch(m: dict):
     if not (msg.get("quick_reply") or {}).get("payload"):
         token = (msg.get("text") or "").strip().upper()
         if token and is_valid_join_code(token):
-            username_at = _get_username_from_graph(psid)
+            username_at, instagram_profile_pic_url = _get_ig_profile_for_assign(psid)
             normalized_event = {
                 "kind": "game_id",
                 "psid": psid,
                 "username_at": username_at,
+                "instagram_profile_pic_url": instagram_profile_pic_url,
                 "game_id": token,
                 "raw_event": m,
             }

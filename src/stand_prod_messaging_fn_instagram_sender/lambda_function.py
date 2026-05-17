@@ -203,7 +203,7 @@ def lambda_handler(event, context):
         { "psid": "123", "text": "Hola" },
         { "psid": "456", "text": "Pregunta", "quick_replies": [ ... ] },
         { "psid": "789", "image_url": "https://..." },
-        { "psid": "999", "template": "follow_accounts", "handles": ["marca", "stand_official"] }
+        { "psid": "999", "template": "follow_accounts", "handles": ["marca", "playstand_"] }
       ]
     }
     """

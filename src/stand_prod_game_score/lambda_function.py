@@ -13,7 +13,7 @@ import games.t1mer as t1mer
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "")
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 # ==============
 
 dynamo_r = boto3.resource("dynamodb")
