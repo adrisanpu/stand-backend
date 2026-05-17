@@ -58,9 +58,7 @@ npm run dev
 
 ## 5. Amplify (dev.playstand.app)
 
-See [stand-frontend README](../../stand-frontend/README.md#environments-prod-vs-dev) and `stand-frontend/amplify.yml`.
-
-Set Amplify environment variables at build time (override localhost redirects):
+Connect the `stand-frontend` repo to a separate Amplify app with [`amplify.yml`](../../stand-frontend/amplify.yml). Set environment variables at build time (override localhost redirects):
 
 ```env
 VITE_API_BASE_URL=https://<game-api-id>.execute-api.us-east-1.amazonaws.com/prod
@@ -88,7 +86,7 @@ python scripts/upload_user_media_defaults.py --bucket stand-dev-user-media-<AWS_
 ## Validation checklist
 
 - [ ] `sam deploy --config-env dev` creates tables `stand-dev-*` and API (stage path `/prod` on dev API host)
-- [ ] Login at `http://localhost:5173` hits dev API (check Network tab: URL ends with `/dev`)
+- [ ] Login at `http://localhost:5173` hits dev API (check Network tab: dev API host, path `/prod`)
 - [ ] Login at `https://dev.playstand.app` works
 - [ ] Create a test game; prod tables unchanged
 - [ ] `sam deploy --config-env prod` changeset has no resource replacements (only metadata or empty)
@@ -100,3 +98,9 @@ aws cloudformation delete-stack --stack-name stand-backend-dev --region us-east-
 ```
 
 Empty S3 buckets first if delete fails.
+
+## CI/CD (futuro)
+
+- GitHub Actions: `pytest` / `npm run build` en PRs; deploy opcional a dev en merge a `dev`.
+- Amplify: rama o app por entorno (`dev` → dev.playstand.app, prod → playstand.app).
+- Documentar el flujo en cada repo cuando se implemente.

@@ -32,12 +32,12 @@ sam deploy --config-env dev
 
 Deploy config is in `samconfig.toml`:
 
-| Config env | Stack | API stage | Resource prefix |
-|------------|-------|-----------|-----------------|
-| `prod` | `stand-backend-prod` | `prod` | `stand-prod-*` |
-| `dev` | `stand-backend-dev` | `dev` | `stand-dev-*` |
+| Config env | Stack | URL path (Game API) | Resource prefix |
+|------------|-------|---------------------|-----------------|
+| `prod` | `stand-backend-prod` | `/prod` | `stand-prod-*` |
+| `dev` | `stand-backend-dev` | `/prod` (different API host) | `stand-dev-*` |
 
-Region: `us-east-1`. Dev setup (secrets, Cognito app client, first deploy): **[docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md)**.
+Region: `us-east-1`. Full dev setup: **[docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md)**.
 
 ## Structure
 
