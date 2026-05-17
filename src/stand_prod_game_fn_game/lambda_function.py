@@ -38,7 +38,7 @@ gp_table = dynamodb.Table(GAMEPLAYER_TABLE)
 catalog_table = dynamodb.Table(CATALOG_TABLE)
 
 # ========= CONST =========
-SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS"}
+SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS", "IMPOSTOR"}
 
 JOIN_CODE_MAX_ATTEMPTS = 10
 
@@ -244,6 +244,8 @@ def _handle_get(event):
             payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
         elif (item.get("gameType") or "").upper() == "L3TRAS":
             payload["settings"] = {"l3tras": (item.get("type") or {}).get("L3TRAS") or {}}
+        elif (item.get("gameType") or "").upper() == "IMPOSTOR":
+            payload["settings"] = {"impostor": (item.get("type") or {}).get("IMPOSTOR") or {}}
         return _resp(200, payload)
 
     # ---------------- 2) gameName (optional) ----------------
@@ -326,6 +328,8 @@ def _handle_get(event):
         if game_type == "EMPAREJA2":
             payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
             payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
+        elif game_type == "IMPOSTOR":
+            payload["settings"] = {"impostor": (item.get("type") or {}).get("IMPOSTOR") or {}}
         return _resp(200, payload)
     
     # ---------------- 3) & 4) list user's games ----------------
@@ -512,10 +516,11 @@ def _handle_put(event):
     raffle_settings = settings.get("raffle")
     prize_update = settings.get("prizeDelivered")
     l3tras_settings = settings.get("l3tras")
+    impostor_settings = settings.get("impostor")
 
     # At least one update
-    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update and not l3tras_settings:
-        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', or 'settings.prizeDelivered'."})
+    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update and not l3tras_settings and not impostor_settings:
+        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', 'settings.impostor', or 'settings.prizeDelivered'."})
 
     now = _iso_now()
 
@@ -629,6 +634,59 @@ def _handle_put(event):
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
             log("Update type.L3TRAS failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if impostor_settings is not None and isinstance(impostor_settings, dict) and impostor_settings:
+        if (item.get("gameType") or "").upper() != "IMPOSTOR":
+            return _resp(400, {"error": "settings.impostor is only valid for IMPOSTOR games."})
+        current_blob = (item.get("type") or {}).get("IMPOSTOR") or {}
+        merged = {**current_blob}
+        if "maxPlayers" in impostor_settings and impostor_settings["maxPlayers"] is not None:
+            try:
+                mp = int(impostor_settings["maxPlayers"])
+            except Exception:
+                return _resp(400, {"error": "settings.impostor.maxPlayers must be an integer."})
+            if mp < 3 or mp > 25:
+                return _resp(400, {"error": "settings.impostor.maxPlayers must be between 3 and 25."})
+            merged["maxPlayers"] = mp
+            try:
+                games_table.update_item(
+                    Key={"gameId": game_id},
+                    UpdateExpression="SET maxPlayers = :m, updatedAt = :u",
+                    ExpressionAttributeValues={":m": mp, ":u": now, ":owner": owner_user_id},
+                    ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+                log("Update maxPlayers failed", {"error": str(e)})
+                return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+        if "words" in impostor_settings and impostor_settings["words"] is not None:
+            words = impostor_settings["words"]
+            if not isinstance(words, list):
+                return _resp(400, {"error": "settings.impostor.words must be an array of strings."})
+            normalized = []
+            for w in words:
+                s = str(w).strip()
+                if s:
+                    normalized.append(s)
+            if not normalized:
+                return _resp(400, {"error": "settings.impostor.words must contain at least one word."})
+            merged["words"] = normalized[:250]
+        try:
+            set_game_type_blob(
+                games_table,
+                game_id,
+                "IMPOSTOR",
+                merged,
+                updated_at=now,
+                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
+                condition_values={":owner": owner_user_id},
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update type.IMPOSTOR failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
     if raffle_settings is not None and isinstance(raffle_settings, dict):

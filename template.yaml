@@ -683,6 +683,33 @@ Resources:
             Path: /v1/game/raffle
             Method: POST
 
+  StandProdGameFnImpostor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stand-prod-game-fn-impostor
+      Description: Manages impostor game state, rounds, voting, and result resolution.
+      CodeUri: src/stand_prod_game_fn_impostor/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+      Events:
+        ImpostorGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/impostor
+            Method: GET
+        ImpostorPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/impostor
+            Method: POST
+
 # =========================
 # BILLING
 # =========================
