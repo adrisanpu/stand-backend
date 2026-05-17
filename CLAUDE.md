@@ -1,13 +1,17 @@
 # stand-backend
 
 ## WHY
-Python 3.13 AWS SAM serverless backend. Stack name: `stand-backend-prod`, region `us-east-1`.
-All business logic lives in Lambda functions; shared utilities in the stand_common layer.
+Python 3.13 AWS SAM serverless backend. Stacks: `stand-backend-prod` | `stand-backend-dev`, region `us-east-1`.
+Template parametrized by `Environment` (`prod` | `dev`). All business logic lives in Lambda functions; shared utilities in the stand_common layer.
 
 ## WHAT
-**Commands:** `sam build` | `sam deploy --config-env prod` | `sam local invoke <Fn> -e events/test.json` | `pytest tests/`
+**Commands:** `sam build` | `sam deploy --config-env prod` | `sam deploy --config-env dev` | `sam local invoke <Fn> -e events/test.json` | `pytest tests/`
 
-**DynamoDB Tables (4):**
+**Deploy:** `samconfig.toml` — prod uses defaults; dev needs `CognitoAppClientId` in `parameter_overrides`. See `docs/DEV_ENVIRONMENT.md`.
+
+**DynamoDB Tables (4 per env):** `stand-{prod|dev}-game-table`, `stand-{prod|dev}-gameplayer-table`, `stand-{prod|dev}-user-table`, `stand-{prod|dev}-catalog-table`
+
+Prod details:
 - `stand-prod-game-table` — PK: gameId; GSI: gsi-ownerUserId, gsi-gameName
 - `stand-prod-gameplayer-table` — PK: gameId, SK: playerId(N); GSI: gsi-instagramPSID, gsi-raffleEligible
 - `stand-prod-user-table` — PK: userId; fields: plan, activeUntil

@@ -13,22 +13,31 @@ delete all EMPAREJA2#CHARACTERS#v1 rows in the table before running this script.
 Usage:
   From stand-backend with AWS credentials configured:
     python scripts/populate_empareja2_catalog.py
+    python scripts/populate_empareja2_catalog.py --table stand-dev-catalog-table
 
   Optional env:
-    CATALOG_TABLE  default: stand-prod-catalog-table
+    CATALOG_TABLE  default: stand-prod-catalog-table (overridden by --table)
 """
+import argparse
 import json
 import os
 from pathlib import Path
 
 import boto3
 
-CATALOG_TABLE = os.environ.get("CATALOG_TABLE", "stand-prod-catalog-table")
 SCRIPT_DIR = Path(__file__).resolve().parent
 ITEMS_JSON = SCRIPT_DIR / "empareja2_catalog_items.json"
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Populate Empareja2 catalog table.")
+    parser.add_argument(
+        "--table",
+        default=os.environ.get("CATALOG_TABLE", "stand-prod-catalog-table"),
+        help="DynamoDB catalog table name (e.g. stand-dev-catalog-table)",
+    )
+    args = parser.parse_args()
+    catalog_table = args.table
     with open(ITEMS_JSON, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -36,7 +45,7 @@ def main():
     items = data["items"]
 
     dynamodb = boto3.resource("dynamodb")
-    table = dynamodb.Table(CATALOG_TABLE)
+    table = dynamodb.Table(catalog_table)
 
     with table.batch_writer() as batch:
         for it in items:
@@ -50,7 +59,7 @@ def main():
             batch.put_item(Item=row)
             print(f"  {row['pairId']}  {row['characterName']}  (pairGroupId={row['pairGroupId']})")
 
-    print(f"Done. Wrote {len(items)} items to {CATALOG_TABLE}.")
+    print(f"Done. Wrote {len(items)} items to {catalog_table}.")
 
 
 if __name__ == "__main__":

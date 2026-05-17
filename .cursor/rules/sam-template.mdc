@@ -6,10 +6,17 @@ alwaysApply: false
 
 # SAM Template Rules
 
-## Naming conventions
-- Stack name: `stand-backend-prod`
+## Environments
+- Parameter `Environment`: `prod` | `dev` (default `prod`)
+- Physical names: `!Sub "stand-${Environment}-..."` (tables, Lambdas, APIs, roles, buckets)
+- API stage: literal `prod` on HttpApi (`StageName: prod`) so prod stack keeps `GameApiprodStage`; URLs always end with `/prod` (dev stack uses a different API id, same `/prod` path)
+- Secrets: `stand/${Environment}/instagram`, `stand/${Environment}/stripe`
+- Cognito JWT: parameters `CognitoUserPoolId`, `CognitoAppClientId`
+
+## Naming conventions (logical IDs unchanged for stack compatibility)
+- Stack names: `stand-backend-prod` | `stand-backend-dev`
 - Lambda logical IDs: `StandProd<Component>Fn<Action>` (PascalCase)
-- Lambda function names: `stand-prod-<component>-fn-<action>` (kebab-case)
+- Lambda function names: `stand-${Environment}-<component>-fn-<action>` (kebab-case)
 - IAM role IDs: `StandProd<Component>Role`
 
 ## IAM Roles (existing — reuse, don't create new ones)
@@ -23,18 +30,11 @@ alwaysApply: false
 ```yaml
 Globals:
   Function:
-    Runtime: python3.13
-    Timeout: 30
-    MemorySize: 128
-    Layers:
-      - !Ref StandCommonLayer
     Environment:
       Variables:
-        STAGE: prod
-        GAMES_TABLE: stand-prod-game-table
-        USERS_TABLE: stand-prod-user-table
-        GAMEPLAYER_TABLE: stand-prod-gameplayer-table
-        CATALOG_TABLE: stand-prod-catalog-table
+        STAGE: !Ref Environment
+        GAMES_TABLE: !Ref StandProdGameTable
+        # ...
 ```
 
 ## New function template
@@ -42,7 +42,7 @@ Globals:
 StandProdNewFn:
   Type: AWS::Serverless::Function
   Properties:
-    FunctionName: stand-prod-<component>-fn-<action>
+    FunctionName: !Sub "stand-${Environment}-<component>-fn-<action>"
     CodeUri: src/stand_prod_<component>_fn_<action>/
     Handler: lambda_function.lambda_handler
     Role: !GetAtt StandProdGameRole.Arn
@@ -57,5 +57,6 @@ StandProdNewFn:
 
 ## Deploy commands
 - `sam build` — builds all functions
-- `sam deploy --config-env prod` — deploys to production
+- `sam deploy --config-env prod` — production stack
+- `sam deploy --config-env dev` — dev stack (see docs/DEV_ENVIRONMENT.md)
 - `sam local invoke StandProd<Fn> -e events/test.json` — local test

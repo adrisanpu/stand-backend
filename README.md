@@ -23,11 +23,21 @@ sam build
 # Local invoke (example)
 sam local invoke StandProdUserFnUserSam --event events/user.json
 
-# Deploy (prod)
+# Deploy prod
 sam deploy --config-env prod
+
+# Deploy dev (after one-time setup — see docs/DEV_ENVIRONMENT.md)
+sam deploy --config-env dev
 ```
 
-Config for deploy is in `samconfig.toml` (stack: `stand-backend-prod`, region: `us-east-1`).
+Deploy config is in `samconfig.toml`:
+
+| Config env | Stack | API stage | Resource prefix |
+|------------|-------|-----------|-----------------|
+| `prod` | `stand-backend-prod` | `prod` | `stand-prod-*` |
+| `dev` | `stand-backend-dev` | `dev` | `stand-dev-*` |
+
+Region: `us-east-1`. Dev setup (secrets, Cognito app client, first deploy): **[docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md)**.
 
 ## Structure
 
@@ -38,11 +48,73 @@ Config for deploy is in `samconfig.toml` (stack: `stand-backend-prod`, region: `
 
 ## Data model: game-table `type` column
 
-The table **stand-prod-game-table** uses a generic **`type`** attribute (DynamoDB Map) for game-type-specific configuration, mirroring the pattern used in **stand-prod-gameplayer-table**. This avoids adding a new top-level column for each new game type.
+The game table (`stand-prod-game-table` in prod, `stand-dev-game-table` in dev) uses a generic **`type`** attribute (DynamoDB Map) for game-type-specific configuration, mirroring the pattern used in **stand-prod-gameplayer-table**. This avoids adding a new top-level column for each new game type.
 
 - **Structure:** `type.<GAME_TYPE>` where `GAME_TYPE` is the same value as `gameType` in uppercase (e.g. `INFOCARDS`, `EMPAREJA2`).
 - **Example:** For an INFOCARDS game, cards are stored under `type.INFOCARDS.cards`; the blob can include other keys (e.g. `sourceUploadKey`, `generatedQuizGameId`) as needed.
 - **Usage:** Use the helpers from `stand_common.utils`: `get_game_type_blob(game_item, "INFOCARDS")` to read and `set_game_type_blob(games_table, game_id, "INFOCARDS", {"cards": [...]}, updated_at=...)` to write. New game types that need type-specific blobs should follow the same pattern and reuse the `type` column instead of defining new top-level attributes.
+
+## Adding a new backend game (lean checklist)
+
+Follow this sequence to add backend support for a new game type without overengineering.
+
+Frontend counterpart playbook:
+
+- [stand-frontend/docs/new-game-playbook.md](../stand-frontend/docs/new-game-playbook.md)
+
+### 1) Define canonical identifiers
+
+- Frontend id: lowercase (example: `mygame1`)
+- Backend game type: uppercase (example: `MYGAME1`)
+- Keep naming aligned with frontend mapping (`mapGameTypeToId` in frontend)
+
+### 2) Reuse the existing data model
+
+- Store game-specific payload in `type.<GAME_TYPE>`
+- Read with `get_game_type_blob(game_item, "<GAME_TYPE>")`
+- Write with `set_game_type_blob(games_table, game_id, "<GAME_TYPE>", payload, updated_at=...)`
+- Do not add top-level DynamoDB attributes for type-specific data
+
+### 3) Implement handlers with standard utilities
+
+In each Lambda handler, reuse the common flow from `stand_common.utils`:
+
+- `_get_claims(event)` for auth identity
+- `_read_json_body(event)` for request parsing
+- `_resp(status, body)` for responses
+- `_json_sanitize(data)` (or `_as_int`) before returning DynamoDB-derived values
+
+Keep handlers focused: validate input, execute game logic, persist/retrieve blob, return sanitized response.
+
+### 4) Add/extend API routes in SAM
+
+- Add route/function entries in `template.yaml` only when needed
+- Follow existing naming patterns (`StandProd...Fn...Sam`)
+- Reuse existing IAM roles when permissions match
+- Keep CORS/auth behavior consistent with current API setup
+
+### 5) Keep contract minimal and explicit
+
+For each new endpoint, define:
+
+- expected request body/query params
+- success response shape
+- error cases and status codes
+
+Prefer extending existing endpoint patterns over introducing a new endpoint family.
+
+### 6) Test before deploy
+
+- Unit test business logic where possible (`pytest tests/`)
+- Smoke test Lambda locally (`sam local invoke ...`)
+- Validate a real HTTP path in a non-production-safe flow before prod use
+
+### 7) Common mistakes to avoid
+
+- Mismatching frontend `id` and backend `GAME_TYPE`
+- Creating custom serialization instead of `_json_sanitize`
+- Adding extra tables/attributes for data that belongs in `type.<GAME_TYPE>`
+- Creating new roles/routes when an existing one already fits
 
 ## Repo
 
