@@ -1,8 +1,31 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: STAND Backend PROD - Fully Managed Infrastructure
+Description: STAND Backend - Fully Managed Infrastructure
 
 Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - prod
+      - dev
+    Description: Deployment environment (prod or dev)
+  CognitoUserPoolId:
+    Type: String
+    Default: us-east-1_54eXBuNq1
+    Description: Cognito User Pool ID for JWT authorizer
+  CognitoAppClientId:
+    Type: String
+    Default: 52ekpup21eo5ic4caokn2a33k3
+    Description: Cognito App Client ID (JWT audience)
+  StripeSuccessUrl:
+    Type: String
+    Default: https://playstand.app/home
+    Description: Stripe checkout success redirect URL
+  StripeCancelUrl:
+    Type: String
+    Default: https://playstand.app/home
+    Description: Stripe checkout cancel redirect URL
   StripeLayerArn:
     Type: String
     Default: arn:aws:lambda:us-east-1:781283585341:layer:stripe-layer:5
@@ -18,13 +41,14 @@ Globals:
     Tracing: PassThrough
     Environment:
       Variables:
-        STAGE: prod
+        STAGE: !Ref Environment
         GAMES_TABLE: !Ref StandProdGameTable
         USERS_TABLE: !Ref StandProdUserTable
         GAMEPLAYER_TABLE: !Ref StandProdGameplayerTable
         CATALOG_TABLE: !Ref StandProdCatalogTable
-        INSTAGRAM_SECRET_NAME: stand/prod/instagram
-        STRIPE_SECRET_NAME: stand/prod/stripe
+        INSTAGRAM_SECRET_NAME: !Sub "stand/${Environment}/instagram"
+        STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
+
 
 Resources:
 
@@ -35,7 +59,7 @@ Resources:
   StandProdGameRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: stand-prod-game-role
+      RoleName: !Sub "stand-${Environment}-game-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -49,7 +73,7 @@ Resources:
   StandProdGameRolePolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: stand-prod-game-role-policy
+      ManagedPolicyName: !Sub "stand-${Environment}-game-role-policy"
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -108,7 +132,7 @@ Resources:
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
-            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-*"
+            Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-*"
           - Sid: S3Presign
             Effect: Allow
             Action:
@@ -121,12 +145,12 @@ Resources:
             Action:
               - ssm:GetParameter
               - ssm:GetParameters
-            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/prod/config/*"
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/config/*"
           # Raffle Lambda needs Instagram PAGE_TOKEN to check is_user_follow_business
           - Sid: InstagramSecretRaffle
             Effect: Allow
             Action: secretsmanager:GetSecretValue
-            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/instagram*"
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
           # Game functions invoke the sender Lambda for all IG/Stripe calls — no secret access needed here.
 
 # ----- Webhook role (Instagram webhook dispatcher) -----
@@ -134,7 +158,7 @@ Resources:
   StandProdWebhookRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: stand-prod-webhook-role
+      RoleName: !Sub "stand-${Environment}-webhook-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -143,7 +167,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: stand-prod-webhook-policy
+        - PolicyName: !Sub "stand-${Environment}-webhook-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -158,20 +182,20 @@ Resources:
                 Effect: Allow
                 Action: lambda:InvokeFunction
                 Resource:
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-game-fn-assign"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-game-fn-quiz"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-messaging-fn-instagram-sender"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-game-fn-assign"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-game-fn-quiz"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-messaging-fn-instagram-sender"
               - Sid: SecretsManager
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/instagram*"
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
 
 # ----- Billing role (Stripe webhook + checkout + user) -----
 
   StandProdBillingRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: stand-prod-billing-role
+      RoleName: !Sub "stand-${Environment}-billing-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -180,7 +204,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: stand-prod-billing-policy
+        - PolicyName: !Sub "stand-${Environment}-billing-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -206,21 +230,21 @@ Resources:
               - Sid: SecretsManager
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/stripe*"
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/stripe*"
               - Sid: S3UserMedia
                 Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:DeleteObject
-                Resource: !Sub "arn:aws:s3:::stand-prod-user-media-${AWS::AccountId}/*"
+                Resource: !Sub "arn:aws:s3:::stand-${Environment}-user-media-${AWS::AccountId}/*"
 
 # ----- Sender role (Instagram DM sender — no DB, just calls Graph API) -----
 
   StandProdSenderRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: stand-prod-sender-role
+      RoleName: !Sub "stand-${Environment}-sender-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -229,7 +253,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: stand-prod-sender-policy
+        - PolicyName: !Sub "stand-${Environment}-sender-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -243,7 +267,7 @@ Resources:
               - Sid: SecretsManager
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/prod/instagram*"
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
 
 # =========================
 # LAMBDA LAYERS
@@ -266,7 +290,7 @@ Resources:
   StandProdUserTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: stand-prod-user-table
+      TableName: !Sub "stand-${Environment}-user-table"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: userId
@@ -278,7 +302,7 @@ Resources:
   StandProdGameTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: stand-prod-game-table
+      TableName: !Sub "stand-${Environment}-game-table"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: gameId
@@ -307,7 +331,7 @@ Resources:
   StandProdGameplayerTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: stand-prod-gameplayer-table
+      TableName: !Sub "stand-${Environment}-gameplayer-table"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: gameId
@@ -344,7 +368,7 @@ Resources:
   StandProdCatalogTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: stand-prod-catalog-table
+      TableName: !Sub "stand-${Environment}-catalog-table"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: catalogId
@@ -364,13 +388,13 @@ Resources:
   StandProdQuizDLQ:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: stand-prod-quiz-dlq
+      QueueName: !Sub "stand-${Environment}-quiz-dlq"
       MessageRetentionPeriod: 86400  # 1 day
 
   StandProdQuizQueue:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: stand-prod-quiz-queue
+      QueueName: !Sub "stand-${Environment}-quiz-queue"
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt StandProdQuizDLQ.Arn
         maxReceiveCount: 3
@@ -382,12 +406,12 @@ Resources:
   StandProdEmpareja2CharBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "stand-prod-empareja2-characters-${AWS::AccountId}"
+      BucketName: !Sub "stand-${Environment}-empareja2-characters-${AWS::AccountId}"
 
   InfocardsUploadsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "stand-prod-infocards-uploads-${AWS::AccountId}"
+      BucketName: !Sub "stand-${Environment}-infocards-uploads-${AWS::AccountId}"
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
@@ -398,7 +422,7 @@ Resources:
   UserMediaBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "stand-prod-user-media-${AWS::AccountId}"
+      BucketName: !Sub "stand-${Environment}-user-media-${AWS::AccountId}"
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
@@ -413,22 +437,22 @@ Resources:
   WebhooksApi:
     Type: AWS::Serverless::HttpApi
     Properties:
-      Name: stand-prod-webhook-api
+      Name: !Sub "stand-${Environment}-webhook-api"
       StageName: prod
 
   GameApi:
     Type: AWS::Serverless::HttpApi
     Properties:
-      Name: stand-prod-game-api
+      Name: !Sub "stand-${Environment}-game-api"
       StageName: prod
       Auth:
         Authorizers:
           CognitoAuthorizer:
             IdentitySource: $request.header.Authorization
             JwtConfiguration:
-              issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_54eXBuNq1
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}"
               audience:
-                - 52ekpup21eo5ic4caokn2a33k3
+                - !Ref CognitoAppClientId
         DefaultAuthorizer: CognitoAuthorizer
       CorsConfiguration:
         AllowOrigins: ["*"]
@@ -442,7 +466,7 @@ Resources:
   StandProdCorsFn:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-cors-fn
+      FunctionName: !Sub "stand-${Environment}-cors-fn"
       Description: Handles OPTIONS preflight for GameApi; no JWT so preflight passes.
       CodeUri: src/stand_prod_cors_fn/
       Handler: lambda_function.lambda_handler
@@ -464,7 +488,7 @@ Resources:
   StandProdWebhookFnInstagram:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-webhook-fn-instagram
+      FunctionName: !Sub "stand-${Environment}-webhook-fn-instagram"
       Description: Receives and dispatches Instagram webhook events to the appropriate internal game and messaging services.
       CodeUri: src/stand_prod_webhook_fn_instagram/
       Handler: lambda_function.lambda_handler
@@ -493,7 +517,7 @@ Resources:
   StandProdWebhookFnStripe:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-webhook-fn-stripe
+      FunctionName: !Sub "stand-${Environment}-webhook-fn-stripe"
       Description: Processes Stripe webhook events to handle payments, subscriptions, and billing state changes.
       CodeUri: src/stand_prod_webhook_fn_stripe/
       Handler: lambda_function.lambda_handler
@@ -516,7 +540,7 @@ Resources:
   StandProdGameFnGame:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-game
+      FunctionName: !Sub "stand-${Environment}-game-fn-game"
       Description: Handles game lifecycle (create, list, update and delete games).
       CodeUri: src/stand_prod_game_fn_game/
       Handler: lambda_function.lambda_handler
@@ -552,7 +576,7 @@ Resources:
   StandProdGameFnAssign:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-assign
+      FunctionName: !Sub "stand-${Environment}-game-fn-assign"
       Description: Assigns players to games, enforces plan limits, prevents duplicates, and initializes per-game player state.
       CodeUri: src/stand_prod_game_fn_assign/
       Handler: lambda_function.lambda_handler
@@ -575,7 +599,7 @@ Resources:
   StandProdGameValidate:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-validate
+      FunctionName: !Sub "stand-${Environment}-game-validate"
       Description: Validates player participation and game actions based on game rules, feature flags, and completion status.
       CodeUri: src/stand_prod_game_validate/
       Handler: lambda_function.lambda_handler
@@ -603,7 +627,7 @@ Resources:
   StandProdGameScore:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-score
+      FunctionName: !Sub "stand-${Environment}-game-score"
       Description: Stores player scores and provides rankings for games that support scoring.
       CodeUri: src/stand_prod_game_score/
       Handler: lambda_function.lambda_handler
@@ -631,7 +655,7 @@ Resources:
   StandProdGameFnQuiz:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-quiz
+      FunctionName: !Sub "stand-${Environment}-game-fn-quiz"
       Description: Manages quiz configuration, quiz flow, and player quiz responses for games that include quizzes.
       CodeUri: src/stand_prod_game_fn_quiz/
       Handler: lambda_function.lambda_handler
@@ -663,7 +687,7 @@ Resources:
   StandProdGameFnRaffle:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-raffle
+      FunctionName: !Sub "stand-${Environment}-game-fn-raffle"
       Description: Executes game raffles, selects eligible winners, persists raffle results, and notifies participants.
       CodeUri: src/stand_prod_game_fn_raffle/
       Handler: lambda_function.lambda_handler
@@ -673,7 +697,7 @@ Resources:
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          INSTAGRAM_SECRET_NAME: stand/prod/instagram
+          INSTAGRAM_SECRET_NAME: !Sub "stand/${Environment}/instagram"
           IG_GRAPH_VERSION: v24.0
       Events:
         RafflePost:
@@ -686,7 +710,7 @@ Resources:
   StandProdGameFnImpostor:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-game-fn-impostor
+      FunctionName: !Sub "stand-${Environment}-game-fn-impostor"
       Description: Manages impostor game state, rounds, voting, and result resolution.
       CodeUri: src/stand_prod_game_fn_impostor/
       Handler: lambda_function.lambda_handler
@@ -717,7 +741,7 @@ Resources:
   StandProdBillingFnCheckout:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-billing-fn-checkout
+      FunctionName: !Sub "stand-${Environment}-billing-fn-checkout"
       Description: Creates and manages Stripe checkout sessions for purchasing plans and subscriptions.
       CodeUri: src/stand_prod_billing_fn_checkout/
       Handler: lambda_function.lambda_handler
@@ -727,8 +751,8 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
-          STRIPE_SUCCESS_URL: https://playstand.app/home
-          STRIPE_CANCEL_URL: https://playstand.app/home
+          STRIPE_SUCCESS_URL: !Ref StripeSuccessUrl
+          STRIPE_CANCEL_URL: !Ref StripeCancelUrl
       Events:
         CheckoutPost:
           Type: HttpApi
@@ -744,7 +768,7 @@ Resources:
   StandProdUserFnUser:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-user-fn-user
+      FunctionName: !Sub "stand-${Environment}-user-fn-user"
       Description: Manages user accounts, authentication-related data, and user-level configuration and limits.
       CodeUri: src/stand_prod_user_fn_user/
       Handler: lambda_function.lambda_handler
@@ -768,7 +792,7 @@ Resources:
   StandProdUserFnMedia:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-user-fn-media
+      FunctionName: !Sub "stand-${Environment}-user-fn-media"
       Description: Manages per-user media library (logos and avatar videos) with S3-backed storage.
       CodeUri: src/stand_prod_user_fn_media/
       Handler: lambda_function.lambda_handler
@@ -812,7 +836,7 @@ Resources:
   StandProdMessagingInstagramSender:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-messaging-fn-instagram-sender
+      FunctionName: !Sub "stand-${Environment}-messaging-fn-instagram-sender"
       Description: Sends text messages, quick replies, and media to Instagram users via the Instagram Graph API.
       CodeUri: src/stand_prod_messaging_fn_instagram_sender/
       Handler: lambda_function.lambda_handler
@@ -827,7 +851,7 @@ Resources:
   StandProdInfocardsRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: stand-prod-infocards-role
+      RoleName: !Sub "stand-${Environment}-infocards-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -836,7 +860,7 @@ Resources:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: stand-prod-infocards-policy
+        - PolicyName: !Sub "stand-${Environment}-infocards-policy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -861,12 +885,12 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: !Sub "arn:aws:s3:::stand-prod-infocards-uploads-${AWS::AccountId}/*"
+                Resource: !Sub "arn:aws:s3:::stand-${Environment}-infocards-uploads-${AWS::AccountId}/*"
               - Sid: S3InfocardsPresign
                 Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: !Sub "arn:aws:s3:::stand-prod-infocards-uploads-${AWS::AccountId}/*"
+                Resource: !Sub "arn:aws:s3:::stand-${Environment}-infocards-uploads-${AWS::AccountId}/*"
               - Sid: BedrockInvoke
                 Effect: Allow
                 Action:
@@ -876,12 +900,12 @@ Resources:
                 Effect: Allow
                 Action:
                   - lambda:InvokeFunction
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-prod-quiz-fn-generate"
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-quiz-fn-generate"
 
   StandProdInfocardsFnGet:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-infocards-fn-get
+      FunctionName: !Sub "stand-${Environment}-infocards-fn-get"
       Description: Returns info cards for an INFOCARDS game (GET) and persists updated cards with media keys (PUT).
       CodeUri: src/stand_prod_infocards_fn_get/
       Handler: lambda_function.lambda_handler
@@ -908,7 +932,7 @@ Resources:
   StandProdInfocardsFnUploadUrl:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-infocards-fn-upload-url
+      FunctionName: !Sub "stand-${Environment}-infocards-fn-upload-url"
       Description: Generates S3 presigned PUT URLs for infocards content uploads.
       CodeUri: src/stand_prod_infocards_fn_upload_url/
       Handler: lambda_function.lambda_handler
@@ -930,7 +954,7 @@ Resources:
   StandProdInfocardsFnProcess:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-infocards-fn-process
+      FunctionName: !Sub "stand-${Environment}-infocards-fn-process"
       Description: Processes uploaded content with Bedrock AI to generate info cards (and optionally a quiz).
       CodeUri: src/stand_prod_infocards_fn_process/
       Handler: lambda_function.lambda_handler
@@ -944,7 +968,7 @@ Resources:
           INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
           BEDROCK_REGION: us-east-1
           BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
-          QUIZ_GENERATE_FUNCTION_NAME: stand-prod-quiz-fn-generate
+          QUIZ_GENERATE_FUNCTION_NAME: !Sub "stand-${Environment}-quiz-fn-generate"
       Events:
         InfocardsProcessPost:
           Type: HttpApi
@@ -956,7 +980,7 @@ Resources:
   StandProdQuizFnGenerate:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: stand-prod-quiz-fn-generate
+      FunctionName: !Sub "stand-${Environment}-quiz-fn-generate"
       Description: Generates quiz questions from a text prompt using Bedrock AI and saves them.
       CodeUri: src/stand_prod_quiz_fn_generate/
       Handler: lambda_function.lambda_handler
@@ -981,6 +1005,8 @@ Resources:
 # =========================
 
 Outputs:
+  Environment:
+    Value: !Ref Environment
   WebhooksApiUrl:
     Value: !Sub "https://${WebhooksApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
 
