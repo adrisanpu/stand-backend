@@ -132,18 +132,16 @@ Frontend/website: PRs to `dev` also use squash merge; `npm run build` runs on PR
 
 4. Workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml): `test` on PRs to `dev`/`main`; `deploy-dev` on push to `dev` only. Prod is never deployed from CI.
 
-### One-time: squash merge on `dev` (all 3 repos)
+### Squash merge (all 3 repos)
 
-Apply ruleset `dev-squash-merge` (requires [GitHub CLI](https://cli.github.com/)):
+**Private repos (Free):** branch rulesets that require squash on `dev` only need GitHub Pro. Use repo-level squash-only instead:
 
 ```powershell
-cd stand-backend
-.\scripts\apply-github-rulesets.ps1
+gh api repos/adrisanpu/stand-backend -X PATCH -f allow_squash_merge=true -f allow_merge_commit=false -f allow_rebase_merge=false
+# repeat for stand-frontend, stand-website
 ```
 
-Or per repo: Settings → Rules → Rulesets → import from [`docs/github-ruleset-dev-squash.json`](github-ruleset-dev-squash.json).
-
-Same JSON exists in `stand-frontend/docs/` and `stand-website/docs/`.
+**GitHub Pro:** optional ruleset from [`docs/github-ruleset-dev-squash.json`](github-ruleset-dev-squash.json) via `.\scripts\apply-github-rulesets.ps1` (squash enforced only on branch `dev`).
 
 ### SAM config note
 
