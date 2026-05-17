@@ -16,6 +16,11 @@ def _norm_char_id(x):
         return None
 
 
+def _profile_pic_url(player_item: dict) -> str:
+    pic = player_item.get("instagramProfilePicUrl") or ""
+    return pic.strip() if isinstance(pic, str) else ""
+
+
 def _pair_group_id_from_player(t: dict) -> str:
     """pairGroupId stored in Gameplayer; fallback to pairId for legacy data."""
     return str(t.get("pairGroupId") or t.get("pairId") or "").strip()
@@ -127,6 +132,7 @@ def validate_empareja2(ctx: dict):
                 "characterId": t1.get("characterId"),
                 "characterName": c1_name,
                 "characterImageUrl": presign(c1_name) if presign else None,
+                "profilePicUrl": _profile_pic_url(p1),
             },
             {
                 "playerId": pid2,
@@ -134,6 +140,7 @@ def validate_empareja2(ctx: dict):
                 "characterId": t2.get("characterId"),
                 "characterName": c2_name,
                 "characterImageUrl": presign(c2_name) if presign else None,
+                "profilePicUrl": _profile_pic_url(p2),
             },
         ]
     }

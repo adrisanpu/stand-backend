@@ -11,8 +11,8 @@ from validators.generic import validate_generic
 # Helpers to build a minimal ctx
 # ---------------------------------------------------------------------------
 
-def _player(pid, code, game_type="T1MER", validated=False, quiz_required=False, quiz_completed=False):
-    return {
+def _player(pid, code, game_type="T1MER", validated=False, quiz_required=False, quiz_completed=False, profile_pic_url=None):
+    item = {
         "playerId": pid,
         "validationCode": code,
         "instagramUsername": f"user{pid}",
@@ -25,6 +25,9 @@ def _player(pid, code, game_type="T1MER", validated=False, quiz_required=False, 
             }
         },
     }
+    if profile_pic_url is not None:
+        item["instagramProfilePicUrl"] = profile_pic_url
+    return item
 
 
 def _ctx(players, codes, game_type="T1MER"):
@@ -77,6 +80,7 @@ def test_t1mer_happy_path():
     assert result["valid"] is True
     assert result["playerId"] == 1
     assert result["username"] == "user1"
+    assert result["profilePicUrl"] == ""
     assert "T1mer" in result["message"]
 
 
@@ -146,7 +150,17 @@ def test_rulet4_happy_path():
     assert result["valid"] is True
     assert result["playerId"] == 1
     assert result["username"] == "user1"
+    assert result["profilePicUrl"] == ""
     assert "Rulet4" in result["message"]
+
+
+def test_rulet4_profile_pic_url_passed_through():
+    url = "https://example.com/pic.jpg"
+    p = _player(1, 5678, game_type="RULET4", profile_pic_url=url)
+    ctx = _ctx([p], ["5678"], game_type="RULET4")
+    result = validate_generic(ctx)
+    assert result["valid"] is True
+    assert result["profilePicUrl"] == url
 
 
 def test_rulet4_no_match():

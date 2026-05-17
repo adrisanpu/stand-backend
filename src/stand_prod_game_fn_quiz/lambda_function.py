@@ -13,7 +13,7 @@ from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, ge
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "stand_official").strip().lower().lstrip("@")
+RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 # ==================================
 
 dynamo_r = boto3.resource("dynamodb")

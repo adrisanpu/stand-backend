@@ -9,8 +9,8 @@ sys.path.insert(0, str(ROOT / "src" / "stand_prod_game_validate"))
 from validators.l3tras import validate_l3tras
 
 
-def _player(pid, code, letter, game_type="L3TRAS", quiz_required=False, quiz_completed=False):
-    return {
+def _player(pid, code, letter, game_type="L3TRAS", quiz_required=False, quiz_completed=False, instagram_profile_pic_url=None):
+    item = {
         "playerId": pid,
         "validationCode": code,
         "instagramUsername": f"user{pid}",
@@ -24,6 +24,9 @@ def _player(pid, code, letter, game_type="L3TRAS", quiz_required=False, quiz_com
             }
         },
     }
+    if instagram_profile_pic_url is not None:
+        item["instagramProfilePicUrl"] = instagram_profile_pic_url
+    return item
 
 
 def _ctx(players, codes, game_meta=None, game_type="L3TRAS"):
@@ -65,7 +68,17 @@ def test_l3tras_single_code_ok():
     assert r["valid"] is True
     assert len(r["players"]) == 1
     assert r["players"][0]["letter"] == "S"
+    assert r["players"][0].get("profilePicUrl") == ""
     assert r["results"][0]["letter"] == "S"
+
+
+def test_l3tras_profile_pic_url():
+    url = "https://cdn.example.com/p.jpg"
+    players = [_player(1, 1001, "S", instagram_profile_pic_url=url)]
+    ctx = _ctx(players, ["1001"])
+    r = validate_l3tras(ctx)
+    assert r["valid"] is True
+    assert r["players"][0]["profilePicUrl"] == url
 
 
 def test_l3tras_rejects_zero_or_many_codes():
