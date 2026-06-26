@@ -4,9 +4,9 @@ from datetime import datetime, timezone
 
 # Tipos que usan validación "un código". Etiqueta para el mensaje de éxito.
 GAME_LABELS = {
-    "T1MER": "T1mer",
-    "RULET4": "Rulet4",
-    "IMPOSTOR": "Impostor",
+    "T1MER": "T1MER",
+    "RULET4": "RULET4",
+    "IMPOSTOR": "IMPOSTOR",
 }
 
 SINGLE_CODE_TYPES = frozenset(GAME_LABELS)

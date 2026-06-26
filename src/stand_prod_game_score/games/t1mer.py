@@ -222,6 +222,7 @@ def get_ranking(game_id: str, game_type_upper: str, gp_table, limit: int, log_fn
         ranking.append({
             "playerId": pid,
             "username": it.get("instagramUsername", ""),
+            "profilePicUrl": (it.get("instagramProfilePicUrl") or "").strip(),
             "timer": timer_float,
             "score": score_float,
         })

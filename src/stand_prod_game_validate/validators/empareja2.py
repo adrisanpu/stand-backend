@@ -60,7 +60,7 @@ def validate_empareja2(ctx: dict):
             "valid": False,
             "gameId": game_id,
             "reason": "invalid_code_count",
-            "message": f"Empareja2 necesita exactamente 2 códigos (has enviado {len(codes)})."
+            "message": f"EMPAREJA2 necesita exactamente 2 códigos (has enviado {len(codes)})."
         }
 
     c1 = to_int(codes[0])

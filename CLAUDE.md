@@ -28,6 +28,7 @@ Prod details:
 Plan check: verify BOTH `plan` value AND `_parse_iso(activeUntil) > now`
 
 ## HOW
+- **Agent rules:** workspace [software-rule.md](../software-rule.md) + [infrastructure-rule.md](../infrastructure-rule.md) (SAM/IaC)
 ```python
 # Lambda handler pattern
 from stand_common.utils import log, _resp, _get_claims, _read_json_body, _json_sanitize

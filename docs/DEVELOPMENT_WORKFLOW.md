@@ -93,6 +93,7 @@ For a new game or API contract:
 
 ### Agents should
 
+- Follow workspace [software-rule.md](../../software-rule.md) (code) and [infrastructure-rule.md](../../infrastructure-rule.md) (AWS/SAM/infra) on every task — auto-loaded from `.cursor/rules/software-rule.mdc` and `.cursor/rules/infrastructure-rule.mdc`.
 - Read the sub-project `CLAUDE.md` before editing that repo.
 - Branch from `dev` (or `main` for stand-website until a `dev` branch exists).
 - Run local checks (`pytest`, `npm run build`) before suggesting a PR is ready.
