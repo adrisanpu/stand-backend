@@ -72,5 +72,5 @@ def test_send_raffle_follow_after_score_with_psid(monkeypatch):
     assert "sigue estas cuentas" in captured[0]["text"]
     assert captured[1]["psid"] == "psid123"
     assert captured[1]["template"] == "follow_accounts"
-    assert "account1" in captured[1]["handles"]
+    assert captured[1]["handles"] == ["account1"]
 

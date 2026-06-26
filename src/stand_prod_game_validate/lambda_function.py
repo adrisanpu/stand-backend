@@ -21,9 +21,6 @@ IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "")
 CHAR_BUCKET = os.environ.get("CHAR_BUCKET", "")            # e.g. "empareja2-characters"
 CHAR_URL_TTL = int(os.environ.get("CHAR_URL_TTL", "120"))  # seconds
 
-# Raffle follow notification (same as assign)
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
-
 dynamo_r = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
 s3 = boto3.client("s3")
@@ -211,20 +208,17 @@ def _requires_validation(meta: dict, game_type: str) -> bool:
     return bool(val)
 
 
-def _raffle_required_follows_with_stand_last(meta: dict) -> list:
-    """List of handles (no @) for raffle follow requirement, with Stand account last."""
+def _raffle_required_follows(meta: dict) -> list:
+    """List of handles (no @) for raffle follow requirement."""
     follows = (meta or {}).get("raffleRequiredFollows") or []
     if not isinstance(follows, list):
         follows = []
-    out = [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
-    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
-        out.append(RAFFLE_STAND_HANDLE)
-    return out
+    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
 
 
 def _send_raffle_follow_to_validated(game_id: str, result: dict, meta: dict) -> None:
     """If game has raffleRequiredFollows and requires validation, send follow notification to validated players."""
-    handles = _raffle_required_follows_with_stand_last(meta)
+    handles = _raffle_required_follows(meta)
     if not handles:
         return
     # Collect player IDs from result

@@ -23,9 +23,6 @@ IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
 INSTAGRAM_SECRET_NAME = os.environ.get("INSTAGRAM_SECRET_NAME", "").strip()
 # =================================
 
-# Instagram account that must be followed by default for raffles
-DEFAULT_RAFFLE_FOLLOW_ACCOUNT = "playstand_"
-
 # Load Instagram page token for User Profile API (is_user_follow_business)
 IG_PAGE_TOKEN = ""
 if INSTAGRAM_SECRET_NAME:
@@ -384,7 +381,7 @@ def lambda_handler(event, context):
                 "item": it,
             })
 
-        # raffleRequiredFollows: ensure it is always a list and always includes the default account
+        # raffleRequiredFollows: ensure it is always a list
         raw_raffle_required_follows = game.get("raffleRequiredFollows")
         if isinstance(raw_raffle_required_follows, list):
             raffle_required_follows = list(raw_raffle_required_follows)
@@ -392,9 +389,6 @@ def lambda_handler(event, context):
             raffle_required_follows = [str(raw_raffle_required_follows)]
         else:
             raffle_required_follows = []
-
-        if DEFAULT_RAFFLE_FOLLOW_ACCOUNT and DEFAULT_RAFFLE_FOLLOW_ACCOUNT not in raffle_required_follows:
-            raffle_required_follows.insert(0, DEFAULT_RAFFLE_FOLLOW_ACCOUNT)
 
         # 3) randomly select winners with post-selection eligibility checks
         def _is_candidate_eligible(candidate: dict) -> bool:

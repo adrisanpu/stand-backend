@@ -15,8 +15,6 @@ GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
 QUIZ_QUEUE_URL = os.environ.get("QUIZ_QUEUE_URL", "")
-# Stand account handle (shown last in follow list); default matches frontend INSTAGRAM_HANDLE
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 
 
 # Optional GSI
@@ -54,17 +52,6 @@ def _send_single_dm(psid: str, text: str):
     if not psid:
         return
     _send_bulk_messages([{"psid": psid, "text": text}])
-
-
-def _raffle_required_follows_with_stand_last(meta: dict) -> list:
-    """List of handles (no @) for raffle follow requirement, with Stand account last."""
-    follows = meta.get("raffleRequiredFollows") or []
-    if not isinstance(follows, list):
-        follows = []
-    out = [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
-    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
-        out.append(RAFFLE_STAND_HANDLE)
-    return out
 
 
 def _get_game_meta(game_id: str) -> dict | None:

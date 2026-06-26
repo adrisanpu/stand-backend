@@ -13,7 +13,6 @@ from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, ge
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 # ==================================
 
 dynamo_r = boto3.resource("dynamodb")
@@ -78,15 +77,12 @@ def _send_dm(psid: str, text: str) -> bool:
     return True
 
 
-def _raffle_required_follows_with_stand_last(meta: dict) -> list:
-    """List of handles (no @) for raffle follow requirement, with Stand account last."""
+def _raffle_required_follows(meta: dict) -> list:
+    """List of handles (no @) for raffle follow requirement."""
     follows = meta.get("raffleRequiredFollows") or []
     if not isinstance(follows, list):
         follows = []
-    out = [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
-    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
-        out.append(RAFFLE_STAND_HANDLE)
-    return out
+    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
 
 
 def _requires_validation(meta: dict, game_type: str) -> bool:
@@ -103,8 +99,8 @@ def _requires_validation(meta: dict, game_type: str) -> bool:
 
 
 def _send_raffle_follow_requirement(psid: str, meta: dict):
-    """If game has raffleRequiredFollows, send intro text + Generic Template with accounts (Stand last)."""
-    handles = _raffle_required_follows_with_stand_last(meta)
+    """If game has raffleRequiredFollows, send intro text + Generic Template with accounts."""
+    handles = _raffle_required_follows(meta)
     if not handles:
         return
     intro = "⚠️ Para participar en el sorteo, sigue estas cuentas:"

@@ -13,7 +13,6 @@ import games.t1mer as t1mer
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "")
-RAFFLE_STAND_HANDLE = (os.environ.get("RAFFLE_STAND_HANDLE") or "playstand_").strip().lower().lstrip("@")
 # ==============
 
 dynamo_r = boto3.resource("dynamodb")
@@ -55,11 +54,8 @@ def _get_game_meta(game_id: str):
 
 # ===== Raffle follow notification (T1MER) =====
 
-def _raffle_required_follows_with_stand_last(meta: dict) -> list[str]:
-    """
-    Devuelve la lista de cuentas a seguir para el sorteo (sin @), garantizando
-    que la cuenta de Stand vaya al final.
-    """
+def _raffle_required_follows(meta: dict) -> list[str]:
+    """Devuelve la lista de cuentas a seguir para el sorteo (sin @)."""
     follows = (meta or {}).get("raffleRequiredFollows") or []
     if not isinstance(follows, list):
         follows = []
@@ -70,8 +66,6 @@ def _raffle_required_follows_with_stand_last(meta: dict) -> list[str]:
         s = str(h).strip().lower().lstrip("@")
         if s:
             out.append(s)
-    if RAFFLE_STAND_HANDLE and RAFFLE_STAND_HANDLE not in out:
-        out.append(RAFFLE_STAND_HANDLE)
     return out
 
 
@@ -96,7 +90,7 @@ def _send_raffle_follow_after_score(game_id: str, player_id: int, meta: dict) ->
     En T1MER, después de guardar el score, avisamos al jugador de las
     condiciones del sorteo (cuentas a seguir).
     """
-    handles = _raffle_required_follows_with_stand_last(meta)
+    handles = _raffle_required_follows(meta)
     if not handles:
         return
 

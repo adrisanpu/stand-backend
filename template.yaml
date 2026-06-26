@@ -611,7 +611,6 @@ Resources:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
           QUIZ_LAMBDA_NAME: !Ref StandProdGameFnQuiz
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
-          RAFFLE_STAND_HANDLE: stand_official
       Events:
         ValidatePost:
           Type: HttpApi
@@ -637,7 +636,6 @@ Resources:
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          RAFFLE_STAND_HANDLE: stand_official
       Events:
         ScoreGet:
           Type: HttpApi
