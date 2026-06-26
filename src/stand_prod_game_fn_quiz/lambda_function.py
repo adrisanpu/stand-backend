@@ -85,6 +85,16 @@ def _raffle_required_follows(meta: dict) -> list:
     return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
 
 
+def _raffle_follow_messages(psid: str, meta: dict) -> list:
+    handles = _raffle_required_follows(meta)
+    if not handles or not psid:
+        return []
+    return [
+        {"psid": psid, "text": "⚠️ Para participar en el sorteo, sigue estas cuentas:"},
+        {"psid": psid, "template": "follow_accounts", "handles": handles},
+    ]
+
+
 def _requires_validation(meta: dict, game_type: str) -> bool:
     """True if game requires validation code; False for no-validation games (e.g. INFOCARDS)."""
     if "requiresValidation" in (meta or {}):
@@ -100,14 +110,15 @@ def _requires_validation(meta: dict, game_type: str) -> bool:
 
 def _send_raffle_follow_requirement(psid: str, meta: dict):
     """If game has raffleRequiredFollows, send intro text + Generic Template with accounts."""
-    handles = _raffle_required_follows(meta)
-    if not handles:
-        return
-    intro = "⚠️ Para participar en el sorteo, sigue estas cuentas:"
-    _invoke_instagram_sender([
-        {"psid": psid, "text": intro},
-        {"psid": psid, "template": "follow_accounts", "handles": handles},
-    ])
+    msgs = _raffle_follow_messages(psid, meta)
+    if msgs:
+        _invoke_instagram_sender(msgs)
+
+
+def _send_validation_code_then_raffle(psid: str, code, meta: dict) -> None:
+    messages = [{"psid": psid, "text": f"🎟️ Tu código es: {code}"}]
+    messages.extend(_raffle_follow_messages(psid, meta))
+    _invoke_instagram_sender(messages)
 
 
 def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> bool:
@@ -615,11 +626,11 @@ def lambda_handler(event, context):
             else:
                 code = player.get("validationCode")
                 if code:
-                    _send_dm(psid, f"🎟️ Tu código es: {code}")
+                    _send_validation_code_then_raffle(psid, code, meta)
                 else:
                     _send_dm(psid, "He tenido un problema generando tu código. Escribe 'AYUDA' y te lo soluciono.")
 
-            # Only send follow notification when game does NOT require validation (e.g. INFOCARDS)
+            # INFOCARDS and similar: follow after quizCompletedMessage (no validation code)
             if not requires_validation:
                 _send_raffle_follow_requirement(psid, meta)
             return {"ok": True, "completed": True, "gameId": game_id, "playerId": pid}

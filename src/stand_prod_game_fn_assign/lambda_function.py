@@ -54,6 +54,30 @@ def _send_single_dm(psid: str, text: str):
     _send_bulk_messages([{"psid": psid, "text": text}])
 
 
+def _raffle_required_follows(meta: dict) -> list[str]:
+    """List of handles (no @) for raffle follow requirement."""
+    follows = (meta or {}).get("raffleRequiredFollows") or []
+    if not isinstance(follows, list):
+        follows = []
+    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+
+
+def _raffle_follow_messages(psid: str, meta: dict) -> list[dict]:
+    handles = _raffle_required_follows(meta)
+    if not handles or not psid:
+        return []
+    return [
+        {"psid": psid, "text": "⚠️ Para participar en el sorteo, sigue estas cuentas:"},
+        {"psid": psid, "template": "follow_accounts", "handles": handles},
+    ]
+
+
+def _send_code_then_raffle(psid: str, code_text: str, meta: dict) -> None:
+    messages = [{"psid": psid, "text": code_text}]
+    messages.extend(_raffle_follow_messages(psid, meta))
+    _send_bulk_messages(messages)
+
+
 def _get_game_meta(game_id: str) -> dict | None:
     resp = games_table.get_item(Key={"gameId": game_id})
     return resp.get("Item")
@@ -305,7 +329,7 @@ def lambda_handler(event, context):
                         letter = None
                         if game_type == "L3TRAS":
                             letter = (((existing.get("type") or {}).get("L3TRAS") or {}).get("letter") or None)
-                        _send_single_dm(psid, _code_tail(code, game_type, letter=letter))
+                        _send_code_then_raffle(psid, _code_tail(code, game_type, letter=letter), meta)
                 else:
                     _send_single_dm(psid, _quiz_completed_message(meta, game_type))
             log("assign_already_joined", {"gameId": game_id, "psid": psid, "playerId": pid})
@@ -390,7 +414,11 @@ def lambda_handler(event, context):
                     time.sleep(2)
                     tail = EMPAREJA2_QUIZ_NOTICE if quiz_enabled else _code_tail(base_item["validationCode"], game_type)
                     if welcome_header:
-                        _send_single_dm(psid, welcome_header + "\n\n" + tail)
+                        msg = welcome_header + "\n\n" + tail
+                        if quiz_enabled:
+                            _send_single_dm(psid, msg)
+                        else:
+                            _send_code_then_raffle(psid, msg, meta)
                     if quiz_enabled:
                         _enqueue_quiz_start(game_id, psid)
                 else:
@@ -406,7 +434,11 @@ def lambda_handler(event, context):
                             letter = None
                             if game_type == "L3TRAS":
                                 letter = (((base_item.get("type") or {}).get("L3TRAS") or {}).get("letter") or None)
-                            _send_single_dm(psid, _code_tail(base_item["validationCode"], game_type, letter=letter))
+                            _send_code_then_raffle(
+                                psid,
+                                _code_tail(base_item["validationCode"], game_type, letter=letter),
+                                meta,
+                            )
                         else:
                             _send_single_dm(psid, _quiz_completed_message(meta, game_type))
                 log("assign_ok", {
