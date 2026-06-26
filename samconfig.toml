@@ -2,6 +2,7 @@ version = 0.1
 
 [prod.deploy.parameters]
 stack_name = "stand-backend-prod"
+profile = "stand-deploy-cli"
 resolve_s3 = true
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 confirm_changeset = true
@@ -11,9 +12,10 @@ parameter_overrides = "Environment=prod"
 
 [dev.deploy.parameters]
 stack_name = "stand-backend-dev"
+profile = "stand-deploy-cli"
 resolve_s3 = true
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-confirm_changeset = true
+confirm_changeset = false
 fail_on_empty_changeset = false
 region = "us-east-1"
-parameter_overrides = "Environment=dev CognitoAppClientId=7634rvppo09l7s2qg5qikk3rlu StripeSuccessUrl=https://dev.playstand.app/home StripeCancelUrl=https://dev.playstand.app/home"
+parameter_overrides = "Environment=dev CognitoAppClientId=5qh9cbsgtmriggl76740o0f5qa StripeSuccessUrl=https://dev.playstand.app/home StripeCancelUrl=https://dev.playstand.app/home"

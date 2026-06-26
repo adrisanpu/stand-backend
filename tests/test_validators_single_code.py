@@ -81,7 +81,7 @@ def test_t1mer_happy_path():
     assert result["playerId"] == 1
     assert result["username"] == "user1"
     assert result["profilePicUrl"] == ""
-    assert "T1mer" in result["message"]
+    assert "T1MER" in result["message"]
 
 
 def test_t1mer_invalid_code_format():
@@ -151,7 +151,7 @@ def test_rulet4_happy_path():
     assert result["playerId"] == 1
     assert result["username"] == "user1"
     assert result["profilePicUrl"] == ""
-    assert "Rulet4" in result["message"]
+    assert "RULET4" in result["message"]
 
 
 def test_rulet4_profile_pic_url_passed_through():

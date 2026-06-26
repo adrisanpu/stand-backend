@@ -9,6 +9,8 @@ Template parametrized by `Environment` (`prod` | `dev`). All business logic live
 
 **Deploy:** `samconfig.toml` — prod uses defaults; dev needs `CognitoAppClientId` in `parameter_overrides`. See `docs/DEV_ENVIRONMENT.md`.
 
+**CI / workflow:** PRs → `pytest`; push to `dev` → auto `sam deploy --config-env dev`; prod **manual**. Squash-only merge. Agent + human process: [docs/DEVELOPMENT_WORKFLOW.md](docs/DEVELOPMENT_WORKFLOW.md).
+
 **DynamoDB Tables (4 per env):** `stand-{prod|dev}-game-table`, `stand-{prod|dev}-gameplayer-table`, `stand-{prod|dev}-user-table`, `stand-{prod|dev}-catalog-table`
 
 Prod details:
@@ -26,6 +28,7 @@ Prod details:
 Plan check: verify BOTH `plan` value AND `_parse_iso(activeUntil) > now`
 
 ## HOW
+- **Agent rules:** workspace [software-rule.md](../software-rule.md) + [infrastructure-rule.md](../infrastructure-rule.md) (SAM/IaC)
 ```python
 # Lambda handler pattern
 from stand_common.utils import log, _resp, _get_claims, _read_json_body, _json_sanitize

@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: GitHub Actions OIDC role for SAM deploy to stand-backend-dev (push to dev branch only).
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: adrisanpu
+  GitHubRepo:
+    Type: String
+    Default: stand-backend
+  CreateOidcProvider:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set true only if token.actions.githubusercontent.com OIDC provider does not exist yet
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759f075b3013ea13f80c781ba41
+
+  GitHubActionsDeployDevRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: stand-github-actions-deploy-dev
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/dev
+      Policies:
+        - PolicyName: SamDeployDevStack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - s3:*
+                  - lambda:*
+                  - apigateway:*
+                  - dynamodb:*
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - logs:*
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - events:*
+                  - sqs:*
+                  - sns:*
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: "*"
+
+Outputs:
+  RoleArn:
+    Description: Add as GitHub repo secret AWS_ROLE_ARN_DEV in adrisanpu/stand-backend
+    Value: !GetAtt GitHubActionsDeployDevRole.Arn
+    Export:
+      Name: stand-github-actions-deploy-dev-arn

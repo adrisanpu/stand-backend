@@ -6,6 +6,8 @@ alwaysApply: false
 
 # SAM Template Rules
 
+Follow workspace [infrastructure-rule.md](../../infrastructure-rule.md) for all IaC changes.
+
 ## Environments
 - Parameter `Environment`: `prod` | `dev` (default `prod`)
 - Physical names: `!Sub "stand-${Environment}-..."` (tables, Lambdas, APIs, roles, buckets)

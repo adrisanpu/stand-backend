@@ -170,3 +170,22 @@ def set_game_type_blob(table, game_id: str, game_type_upper: str, payload: dict,
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
     )
+
+
+GAME_DISPLAY_NAMES = {
+    "T1MER": "T1MER",
+    "RULET4": "RULET4",
+    "L3TRAS": "L3TRAS",
+    "EMPAREJA2": "EMPAREJA2",
+    "CUPIDO": "CUPIDO",
+    "SEMAFORO": "SEMAFORO",
+    "INFOCARDS": "INFOCARDS",
+    "IMPOSTOR": "IMPOSTOR",
+}
+
+
+def game_display_name(game_type: str) -> str:
+    key = (game_type or "").upper()
+    if not key:
+        return "JUEGO"
+    return GAME_DISPLAY_NAMES.get(key, key)

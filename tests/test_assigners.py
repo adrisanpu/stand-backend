@@ -48,7 +48,7 @@ class TestAssignGenericT1mer:
         ctx = _ctx("T1MER", username_at="@jugador")
         _, welcome_header, _ = assign_generic(ctx)
         assert "@jugador" in welcome_header
-        assert "T1mer" in welcome_header
+        assert "T1MER" in welcome_header
 
 
 class TestAssignGenericRulet4:
@@ -65,7 +65,7 @@ class TestAssignGenericRulet4:
         ctx = _ctx("RULET4", username_at="@ruleta")
         _, welcome_header, _ = assign_generic(ctx)
         assert "@ruleta" in welcome_header
-        assert "Rulet4" in welcome_header
+        assert "RULET4" in welcome_header
 
 
 class TestAssignGenericSemaforo:
@@ -82,7 +82,7 @@ class TestAssignGenericSemaforo:
         ctx = _ctx("SEMAFORO", username_at="@semaforo")
         _, welcome_header, _ = assign_generic(ctx)
         assert "@semaforo" in welcome_header
-        assert "SEMÁFORO" in welcome_header
+        assert "SEMAFORO" in welcome_header
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ class TestAssignL3tras:
         patch, welcome, _ = assign_l3tras(ctx)
         assert patch["type"]["L3TRAS"]["letter"] == "A"
         assert patch["type"]["L3TRAS"]["raffleEligible"] is True
-        assert "L3tras" in welcome
+        assert "L3TRAS" in welcome
 
     def test_letter_wraps(self):
         ctx = _ctx("L3TRAS", player_id=3)

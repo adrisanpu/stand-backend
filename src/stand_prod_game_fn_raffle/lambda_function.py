@@ -13,7 +13,7 @@ from collections import defaultdict
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob, game_display_name
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -226,7 +226,7 @@ def _save_raffle_winners_to_game(game_id: str, winners: list[dict], only_validat
 
 def _query_all_players(game_id: str):
     """
-    Query por partición (gameId). Usado para broadcast a todos los jugadores.
+    Query por partición (gameId). Usado para selección de ganadores.
     """
     items = []
     last = None
@@ -316,17 +316,14 @@ def _mark_winner(game_id: str, player_id: int, game_type_upper: str, win_ts: str
 
 # ----------------- business logic -----------------
 
-def _build_messages(game_type_upper: str, winner_usernames: list[str]):
-    # Mensaje único para todos los jugadores con lista de ganadores
-    label = game_type_upper.title() if game_type_upper else "juego"
-    if winner_usernames:
-        winners_list = "\n".join(winner_usernames)
-        msg = (
-            f"🥁 Sorteo de {label}\n"
-            f"🎉 Personas ganadoras: {winners_list}\n"
-            "Pasa por el stand para recoger el premio."
-        )
-    return msg
+def _build_winner_message(game_type_upper: str, username: str) -> str:
+    label = game_display_name(game_type_upper)
+    name = username or "ganador/a"
+    return (
+        f"🥁 Sorteo de {label}\n"
+        f"🎉 ¡Felicidades, {name}! Has ganado el sorteo.\n"
+        "Pasa por el stand para recoger el premio."
+    )
 
 
 def lambda_handler(event, context):
@@ -353,23 +350,9 @@ def lambda_handler(event, context):
         if not game_type:
             return _resp(500, {"ok": False, "error": "MissingGameType"})
 
-        # 1) all players → base set for selección y broadcast
+        # 1) all players → base set for selección
         all_items = _query_all_players(game_id)
 
-        # everyone notifiable (para broadcast)
-        notifiable = []
-        for it in all_items:
-            pid = _as_int(it.get("playerId"))
-            if pid is None or pid <= 0:
-                continue
-            if not _has_psid(it):
-                continue
-            notifiable.append({
-                "playerId": pid,
-                "instagramPSID": it.get("instagramPSID"),
-                "instagramUsername": it.get("instagramUsername"),
-                "item": it,
-            })
         quiz_configured = bool(game.get("quizOrder"))
         use_validation_filter = _requires_validation(game, game_type)
 
@@ -463,13 +446,14 @@ def lambda_handler(event, context):
         except Exception as e:
             log("raffle_save_to_game_error", {"error": repr(e), "gameId": game_id})
 
-        # 4) construir mensaje único y enviar
-        broadcast_msg = _build_messages(game_type.upper(), winner_usernames)
-
+        # 4) enviar DM solo a ganadores
         per_psid_msgs = defaultdict(list)
-        for p in notifiable:
-            psid = p["instagramPSID"]
-            per_psid_msgs[psid].append(broadcast_msg)
+        for w in winners:
+            psid = w.get("instagramPSID")
+            if not psid or psid == "#":
+                continue
+            username = w.get("instagramUsername") or f"Jugador {w['playerId']}"
+            per_psid_msgs[psid].append(_build_winner_message(game_type.upper(), username))
 
         # 5) persistimos win individual por jugador
         win_ts = _iso_now()
@@ -499,7 +483,7 @@ def lambda_handler(event, context):
             "requestedWinners": n_winners,
             "selectedWinners": k,
             "winners": winner_usernames,
-            "notifiedPlayers": len(notifiable),
+            "notifiedPlayers": len(messages),
             "candidatePlayers": candidates_count,
             "raffleRequiredFollows": raffle_required_follows if isinstance(raffle_required_follows, list) else [],
         })

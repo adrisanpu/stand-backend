@@ -10,11 +10,11 @@ _COMMON_TYPE_FIELDS = {
 # Plantillas de bienvenida por gameType. Claves en mayúsculas. Usan {username_at} y opcionalmente {player_id}.
 # Si no hay plantilla, se usa el mensaje por defecto con player_id.
 WELCOME_TEMPLATES = {
-    "T1MER": "⏱️ ¡Bienvenid@ a T1mer, {username_at}!\n\n",
-    "RULET4": "🎡 ¡Bienvenid@ a Rulet4, {username_at}!\n\n",
-    "SEMAFORO": "🚦 ¡Bienvenid@ a SEMÁFORO, {username_at}!\n\n",
-    "INFOCARDS": "📇 ¡Bienvenid@ a Infocards, {username_at}!\n\n",
-    "L3TRAS": "🔤 ¡Bienvenid@ a L3tras, {username_at}!\n\n",
+    "T1MER": "⏱️ ¡Bienvenid@ a T1MER, {username_at}!\n\n",
+    "RULET4": "🎡 ¡Bienvenid@ a RULET4, {username_at}!\n\n",
+    "SEMAFORO": "🚦 ¡Bienvenid@ a SEMAFORO, {username_at}!\n\n",
+    "INFOCARDS": "📇 ¡Bienvenid@ a INFOCARDS, {username_at}!\n\n",
+    "L3TRAS": "🔤 ¡Bienvenid@ a L3TRAS, {username_at}!\n\n",
 }
 
 
