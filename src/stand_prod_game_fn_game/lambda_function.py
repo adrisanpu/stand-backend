@@ -18,6 +18,7 @@ from stand_common.utils import (
     set_game_type_blob,
     JOIN_CODE_ALPHABET,
     JOIN_CODE_LENGTH,
+    default_participant_fields,
 )
 
 # ========= ENV VARS =========
@@ -65,13 +66,16 @@ def _new_join_code(length: int = JOIN_CODE_LENGTH) -> str:
 
 def _public_game_shape(item: dict) -> dict:
     # Safe shape for clients/players
-    return {
+    shape = {
         "gameId": item.get("gameId"),
         "gameName": item.get("gameName"),
         "gameType": item.get("gameType"),
         "createdAt": item.get("createdAt"),
         "maxPlayers": item.get("maxPlayers"),
+        "joinChannel": item.get("joinChannel"),
+        "participantFields": item.get("participantFields"),
     }
+    return {k: v for k, v in shape.items() if v is not None}
 
 def _quiz_enabled_from_game(game_item: dict) -> bool:
     order = game_item.get("quizOrder") or []
@@ -463,6 +467,10 @@ def _handle_post(event):
         if quiz_order:
             item["quizOrder"] = quiz_order
             item["quizQuestions"] = quiz_questions
+
+        if game_type == "EMPAREJA2":
+            item["joinChannel"] = (body.get("joinChannel") or "web").strip().lower()
+            item["participantFields"] = body.get("participantFields") or default_participant_fields(game_type)
         
         try:
             games_table.put_item(
@@ -517,10 +525,21 @@ def _handle_put(event):
     prize_update = settings.get("prizeDelivered")
     l3tras_settings = settings.get("l3tras")
     impostor_settings = settings.get("impostor")
+    participant_fields = body.get("participantFields")
+    join_channel = body.get("joinChannel")
 
     # At least one update
-    if is_active is None and not empareja2_settings and not raffle_settings and not prize_update and not l3tras_settings and not impostor_settings:
-        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', 'settings.impostor', or 'settings.prizeDelivered'."})
+    if (
+        is_active is None
+        and not empareja2_settings
+        and not raffle_settings
+        and not prize_update
+        and not l3tras_settings
+        and not impostor_settings
+        and participant_fields is None
+        and join_channel is None
+    ):
+        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', 'settings.impostor', 'settings.prizeDelivered', 'participantFields', or 'joinChannel'."})
 
     now = _iso_now()
 
@@ -535,6 +554,39 @@ def _handle_put(event):
         return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+
+    if participant_fields is not None:
+        if not isinstance(participant_fields, dict):
+            return _resp(400, {"error": "participantFields must be an object."})
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET participantFields = :pf, updatedAt = :u",
+                ExpressionAttributeValues={":pf": participant_fields, ":u": now, ":owner": owner_user_id},
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update participantFields failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if join_channel is not None:
+        jc = str(join_channel).strip().lower()
+        if jc not in ("web", "instagram"):
+            return _resp(400, {"error": "joinChannel must be 'web' or 'instagram'."})
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET joinChannel = :jc, updatedAt = :u",
+                ExpressionAttributeValues={":jc": jc, ":u": now, ":owner": owner_user_id},
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update joinChannel failed", {"error": str(e)})
+            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
     if isinstance(is_active, bool):
         try:

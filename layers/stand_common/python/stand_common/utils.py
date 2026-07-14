@@ -189,3 +189,65 @@ def game_display_name(game_type: str) -> str:
     if not key:
         return "JUEGO"
     return GAME_DISPLAY_NAMES.get(key, key)
+
+
+# ---------- Participant tokens (web join) ----------
+
+import re
+import hmac
+import hashlib
+import time
+import base64
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email(s: str) -> bool:
+    return bool(s and _EMAIL_RE.match(s.strip()))
+
+
+def normalize_email(s: str) -> str:
+    return s.strip().lower()
+
+
+def mask_email(email: str) -> str:
+    e = normalize_email(email)
+    if "@" not in e:
+        return "***"
+    local, domain = e.split("@", 1)
+    show = "*" if len(local) <= 1 else local[0] + "***"
+    return f"{show}@{domain}"
+
+
+def default_participant_fields(game_type: str) -> dict:
+    if (game_type or "").upper() == "EMPAREJA2":
+        return {"email": {"required": True}, "instagram": {"required": False}}
+    return {"email": {"required": False}, "instagram": {"required": True}}
+
+
+def issue_player_token(game_id: str, player_id: int, secret: str, ttl_seconds: int = 43200) -> str:
+    payload = {"gid": game_id, "pid": int(player_id), "exp": int(time.time()) + ttl_seconds}
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}"
+
+
+def verify_player_token(token: str, secret: str) -> dict | None:
+    if not token or not secret or "." not in token:
+        return None
+    body, sig = token.rsplit(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected):
+        return None
+    pad = "=" * (-len(body) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body + pad).decode("utf-8"))
+    except Exception:
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    gid = (payload.get("gid") or "").strip()
+    pid = payload.get("pid")
+    if not gid or pid is None:
+        return None
+    return {"gameId": gid, "playerId": int(pid)}

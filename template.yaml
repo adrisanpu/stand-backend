@@ -31,6 +31,12 @@ Parameters:
     Default: arn:aws:lambda:us-east-1:781283585341:layer:stripe-layer:5
     Description: ARN of the Stripe Lambda layer (created manually in AWS)
 
+  PlayerTokenSecret:
+    Type: String
+    Default: stand-dev-player-token-v1
+    NoEcho: true
+    Description: HMAC secret for participant web session tokens
+
 Globals:
   Function:
     Runtime: python3.13
@@ -48,6 +54,7 @@ Globals:
         CATALOG_TABLE: !Ref StandProdCatalogTable
         INSTAGRAM_SECRET_NAME: !Sub "stand/${Environment}/instagram"
         STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
+        PLAYER_TOKEN_SECRET: !Ref PlayerTokenSecret
 
 
 Resources:
@@ -618,6 +625,56 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/validate
             Method: POST
+
+  StandProdGameFnPublic:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stand-${Environment}-game-fn-public"
+      Description: Public participant APIs (join, validate, display) without Cognito auth.
+      CodeUri: src/stand_prod_game_fn_public/
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt StandProdGameRole.Arn
+      Layers:
+        - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          ASSIGN_LAMBDA: !Ref StandProdGameFnAssign
+          VALIDATE_LAMBDA: !Ref StandProdGameValidate
+          CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
+          CHAR_URL_TTL: "120"
+      Events:
+        PublicGameGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/game
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        PublicJoinPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/join
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicValidatePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/validate
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicPlayerGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/player
+            Method: GET
+            Auth:
+              Authorizer: NONE
 
 # =========================
 # GAME FEATURES

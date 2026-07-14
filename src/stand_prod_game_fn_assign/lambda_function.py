@@ -8,13 +8,14 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _iso_now, get_game_type_blob
+from stand_common.utils import log, _json_sanitize, _iso_now, get_game_type_blob, is_valid_email, normalize_email, issue_player_token, default_participant_fields
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
 QUIZ_QUEUE_URL = os.environ.get("QUIZ_QUEUE_URL", "")
+PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
 
 
 # Optional GSI
@@ -268,7 +269,195 @@ ASSIGNERS = {
     "L3TRAS": assign_l3tras,
 }
 
+
+def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
+    email_norm = normalize_email(email)
+    try:
+        kwargs = {
+            "KeyConditionExpression": Key("gameId").eq(game_id),
+            "ProjectionExpression": "gameId, playerId, email, instagramUsername, instagramPSID, joinedAt, validated, validationCode, #type",
+            "ExpressionAttributeNames": {"#type": "type"},
+        }
+        while True:
+            page = gp_table.query(**kwargs)
+            for it in page.get("Items") or []:
+                if normalize_email(it.get("email") or "") == email_norm:
+                    return it
+            lek = page.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
+    except ClientError as e:
+        log("assign_email_query_failed", {"error": str(e), "gameId": game_id})
+    return None
+
+
+def _participant_fields(meta: dict) -> dict:
+    pf = meta.get("participantFields")
+    if isinstance(pf, dict) and pf:
+        return pf
+    return default_participant_fields(meta.get("gameType") or "")
+
+
+def _field_required(pf: dict, name: str) -> bool:
+    return bool((pf.get(name) or {}).get("required", False))
+
+
+def _normalize_instagram_handle(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = str(raw).strip().lstrip("@")
+    return s or None
+
+
+def _empareja2_web_assignment(player: dict) -> dict:
+    from assigners.empareja2 import _character_image_url
+    blob = (player.get("type") or {}).get("EMPAREJA2") or {}
+    cname = blob.get("characterName")
+    code = player.get("validationCode")
+    return {
+        "playerId": player.get("playerId"),
+        "characterId": blob.get("characterId"),
+        "characterName": cname,
+        "partnerCharacterName": blob.get("partnerCharacterName"),
+        "characterImageUrl": _character_image_url(cname) if cname else None,
+        "validationCode": int(code) if isinstance(code, Decimal) else code,
+        "validated": bool(player.get("validated")),
+    }
+
+
+def _web_player_token(player: dict, game_id: str) -> str:
+    pid = player.get("playerId")
+    return issue_player_token(game_id, int(pid) if not isinstance(pid, Decimal) else int(pid), PLAYER_TOKEN_SECRET)
+
+
+def _handle_web_assign(event: dict) -> dict:
+    game_id = (event or {}).get("game_id", "").strip()
+    email_raw = (event or {}).get("email", "")
+    instagram_raw = (event or {}).get("instagram_username")
+    email = normalize_email(email_raw) if email_raw else ""
+
+    if not game_id:
+        return {"ok": False, "reason": "missing_game_id"}
+    if not email:
+        return {"ok": False, "reason": "missing_email"}
+
+    meta = _get_game_meta(game_id)
+    if not meta:
+        return {"ok": False, "reason": "game_not_found"}
+    if not meta.get("isActive", True):
+        return {"ok": False, "reason": "game_inactive"}
+
+    game_type = (meta.get("gameType") or "UNKNOWN").upper()
+    if game_type != "EMPAREJA2":
+        return {"ok": False, "reason": "unsupported_game_type", "gameType": game_type}
+
+    pf = _participant_fields(meta)
+    if _field_required(pf, "email") and not is_valid_email(email):
+        return {"ok": False, "reason": "invalid_email"}
+    ig_handle = _normalize_instagram_handle(instagram_raw)
+    if _field_required(pf, "instagram") and not ig_handle:
+        return {"ok": False, "reason": "missing_instagram"}
+
+    existing = _find_existing_player_by_email(game_id, email)
+    if existing:
+        return _json_sanitize({
+            "ok": True,
+            "created_new": False,
+            "already_joined": True,
+            "gameId": game_id,
+            "gameType": game_type,
+            "playerToken": _web_player_token(existing, game_id),
+            "assignment": _empareja2_web_assignment(existing),
+        })
+
+    max_players_raw = meta.get("maxPlayers") or 9999
+    max_players = int(max_players_raw) if not isinstance(max_players_raw, Decimal) else int(max_players_raw)
+    now = _iso_now()
+    try:
+        _ensure_game_counters(game_id)
+    except Exception as e:
+        log("assign_ensure_counters_failed", {"error": repr(e), "gameId": game_id})
+
+    if not _reserve_player_slot(game_id, max_players, now):
+        return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
+
+    display_name = f"@{ig_handle}" if ig_handle else email.split("@", 1)[0]
+    for _ in range(6):
+        new_pid = int(_get_last_player_id(game_id)) + 1
+        base_item = {
+            "gameId": game_id,
+            "playerId": new_pid,
+            "email": email,
+            "joinSource": "web",
+            "joinedAt": now,
+            "validated": False,
+            "validationCode": _code4(),
+        }
+        if ig_handle:
+            base_item["instagramUsername"] = f"@{ig_handle}"
+
+        assigner = ASSIGNERS.get(game_type, assign_generic)
+        patch, _, _ = assigner({
+            "gameId": game_id,
+            "playerId": new_pid,
+            "psid": None,
+            "username_at": display_name,
+            "display_name": display_name,
+            "gameType": game_type,
+            "gameMeta": meta,
+            "now": now,
+            "dynamo_r": dynamo_r,
+            "lambda_client": lambda_client,
+            "log_fn": log,
+            "validationCode": base_item["validationCode"],
+        })
+        if patch:
+            base_item.update(patch)
+        t = base_item.get("type") or {}
+        for blob in t.values():
+            if isinstance(blob, dict):
+                blob["raffleEligible"] = False
+
+        try:
+            _put_player(base_item)
+            log("assign_web_ok", {"gameId": game_id, "playerId": new_pid})
+            return _json_sanitize({
+                "ok": True,
+                "created_new": True,
+                "gameId": game_id,
+                "gameType": game_type,
+                "playerToken": _web_player_token(base_item, game_id),
+                "assignment": _empareja2_web_assignment(base_item),
+            })
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                continue
+            try:
+                _rollback_player_slot(game_id, now)
+            except Exception as re:
+                log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
+            return {"ok": False, "reason": "put_failed", "detail": str(e)}
+
+    try:
+        _rollback_player_slot(game_id, now)
+    except Exception as re:
+        log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
+    return {"ok": False, "reason": "race_condition_retry_exhausted"}
+
+
 def lambda_handler(event, context):
+    try:
+        source = ((event or {}).get("source") or "instagram").strip().lower()
+        if source == "web":
+            return _handle_web_assign(event)
+        return _handle_instagram_assign(event)
+    except Exception as e:
+        log("assign_internal_error", {"error": repr(e)})
+        return {"ok": False, "reason": "internal_error", "detail": repr(e)}
+
+
+def _handle_instagram_assign(event: dict) -> dict:
     """
     Expects dispatcher event:
     {
