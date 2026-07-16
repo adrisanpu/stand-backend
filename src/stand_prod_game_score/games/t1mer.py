@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 
 def _iso_now() -> str:
@@ -109,19 +110,39 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
     if not item:
         return {"ok": False, "error": "player_not_found", "message": "No existe ningún jugador con ese playerId."}
 
+    existing_blob = _get_type_blob(item, gk)
+    if existing_blob.get("score") is not None:
+        return {
+            "ok": False,
+            "error": "already_scored",
+            "message": "Este jugador ya tiene una puntuación. Solo se permite un intento.",
+            "playerId": player_id,
+        }
+
     # 2) escribir score/timer (type map pre-initialized by assigner on join)
     now = _iso_now()
 
-    gp_table.update_item(
-        Key={"gameId": game_id, "playerId": int(player_id)},
-        UpdateExpression="SET #type.#g.timer = :t, #type.#g.score = :s, #type.#g.scoreUpdatedAt = :ts",
-        ExpressionAttributeNames={"#type": "type", "#g": gk},
-        ExpressionAttributeValues={
-            ":t": Decimal(str(timer_float)),
-            ":s": Decimal(int(score_int)),
-            ":ts": now,
-        },
-    )
+    try:
+        gp_table.update_item(
+            Key={"gameId": game_id, "playerId": int(player_id)},
+            UpdateExpression="SET #type.#g.timer = :t, #type.#g.score = :s, #type.#g.scoreUpdatedAt = :ts",
+            ConditionExpression="attribute_not_exists(#type.#g.score)",
+            ExpressionAttributeNames={"#type": "type", "#g": gk},
+            ExpressionAttributeValues={
+                ":t": Decimal(str(timer_float)),
+                ":s": Decimal(int(score_int)),
+                ":ts": now,
+            },
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return {
+                "ok": False,
+                "error": "already_scored",
+                "message": "Este jugador ya tiene una puntuación. Solo se permite un intento.",
+                "playerId": player_id,
+            }
+        raise
 
     # 3) compute rank (full ranking, then find this player's 1-based position)
     items = []

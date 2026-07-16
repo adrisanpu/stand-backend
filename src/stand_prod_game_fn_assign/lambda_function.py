@@ -335,12 +335,22 @@ def _t1mer_web_assignment(player: dict) -> dict:
     if not display:
         email = (player.get("email") or "").strip()
         display = email.split("@", 1)[0] if email else f"Jugador {player.get('playerId', '')}"
-    return {
+    blob = (player.get("type") or {}).get("T1MER") or {}
+    score_raw = blob.get("score")
+    timer_raw = blob.get("timer")
+    pic = (player.get("instagramProfilePicUrl") or "").strip() or None
+    out = {
         "playerId": player.get("playerId"),
         "displayName": display,
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
+        "profilePicUrl": pic,
     }
+    if score_raw is not None:
+        out["score"] = int(score_raw) if not isinstance(score_raw, Decimal) else int(score_raw)
+    if timer_raw is not None:
+        out["timer"] = float(timer_raw) if not isinstance(timer_raw, Decimal) else float(timer_raw)
+    return out
 
 
 def _web_assignment(game_type: str, player: dict) -> dict:
