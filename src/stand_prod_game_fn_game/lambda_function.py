@@ -47,6 +47,9 @@ def _get_query_params(event):
     return event.get("queryStringParameters") or {}
 
 def _is_user_pro(user_item: dict) -> bool:
+    # ponytail: dev stack skips billing limits so QA can create multiple games without Stripe
+    if os.environ.get("STAGE") == "dev":
+        return True
     if not user_item:
         return False
     plan = (user_item.get("plan") or "FREE").upper().strip()
