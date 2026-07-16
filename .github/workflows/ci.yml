@@ -49,4 +49,6 @@ jobs:
       - name: Build and deploy dev stack
         run: |
           sam build
+          # samconfig profile is for local CLI; Actions uses OIDC env credentials
+          sed -i '/^profile = /d' samconfig.toml
           sam deploy --config-env dev
