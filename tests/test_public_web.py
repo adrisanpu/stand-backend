@@ -89,6 +89,12 @@ def test_default_participant_fields_empareja2():
     assert pf["instagram"]["required"] is False
 
 
+def test_default_participant_fields_t1mer():
+    pf = default_participant_fields("T1MER")
+    assert pf["email"]["required"] is True
+    assert pf["instagram"]["required"] is False
+
+
 def test_web_assign_requires_email():
     out = assign_mod._handle_web_assign({"source": "web", "game_id": "ABC123", "email": ""})
     assert out["ok"] is False
@@ -137,6 +143,35 @@ def test_web_assign_creates_player(mock_meta, mock_assigners, *_mocks):
     assert out["assignment"]["characterName"] == "Alice"
 
 
+@patch.object(assign_mod, "_find_existing_player_by_email", return_value=None)
+@patch.object(assign_mod, "_put_player")
+@patch.object(assign_mod, "_reserve_player_slot", return_value=True)
+@patch.object(assign_mod, "_ensure_game_counters")
+@patch.object(assign_mod, "_get_last_player_id", return_value=0)
+@patch.object(assign_mod, "ASSIGNERS")
+@patch.object(assign_mod, "_get_game_meta")
+def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
+    mock_meta.return_value = {
+        "gameId": "TMR001",
+        "gameType": "T1MER",
+        "isActive": True,
+        "maxPlayers": 50,
+        "participantFields": default_participant_fields("T1MER"),
+    }
+    mock_assigners.get.return_value = MagicMock(return_value=({"type": {"T1MER": {}}}, "", []))
+
+    out = assign_mod._handle_web_assign({
+        "source": "web",
+        "game_id": "TMR001",
+        "email": "timer@example.com",
+    })
+    assert out["ok"] is True
+    assert out["gameType"] == "T1MER"
+    assert out["playerToken"]
+    assert out["assignment"]["displayName"] == "timer"
+    assert "playerId" in out["assignment"]
+
+
 @patch.object(assign_mod, "_empareja2_web_assignment", return_value={"characterName": "X", "validationCode": 1234, "validated": False})
 @patch.object(assign_mod, "_find_existing_player_by_email")
 @patch.object(assign_mod, "_get_game_meta")
@@ -169,6 +204,52 @@ def _redeem_event(prize_token: str) -> dict:
         "rawPath": "/v1/public/redeem",
         "body": json.dumps({"prizeToken": prize_token}),
     }
+
+
+def _score_event(body: dict) -> dict:
+    return {
+        "requestContext": {"http": {"method": "POST"}},
+        "rawPath": "/v1/public/score",
+        "body": json.dumps(body),
+    }
+
+
+def test_public_score_rejects_bad_token():
+    resp = public_mod._handle_score(_score_event({
+        "gameId": "ABCDEF",
+        "playerToken": "not-a-token",
+        "timer": "10.1",
+        "score": 100,
+    }))
+    assert resp["statusCode"] == 403
+    assert json.loads(resp["body"])["error"] == "InvalidPlayerToken"
+
+
+def test_public_score_happy():
+    mock_games = MagicMock()
+    mock_gp = MagicMock()
+    mock_games.get_item.return_value = {
+        "Item": {"gameId": "ABCDEF", "gameType": "T1MER", "isActive": True}
+    }
+    mock_gp.get_item.return_value = {
+        "Item": {"gameId": "ABCDEF", "playerId": 2, "email": "a@b.com"}
+    }
+    token = issue_player_token("ABCDEF", 2, SECRET)
+    public_mod.SCORE_LAMBDA = "score-fn"
+    with patch.object(public_mod, "games_table", mock_games), \
+         patch.object(public_mod, "gp_table", mock_gp), \
+         patch.object(public_mod, "_invoke_score_store", return_value={"ok": True, "rank": 1, "score": 100}) as mock_inv:
+        resp = public_mod._handle_score(_score_event({
+            "gameId": "ABCDEF",
+            "playerToken": token,
+            "timer": "10.100",
+            "score": 100,
+        }))
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["ok"] is True
+    assert body["rank"] == 1
+    mock_inv.assert_called_once_with("ABCDEF", 2, "10.100", 100)
 
 
 def test_redeem_validation_happy():

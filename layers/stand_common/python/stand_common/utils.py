@@ -220,7 +220,7 @@ def mask_email(email: str) -> str:
 
 
 def default_participant_fields(game_type: str) -> dict:
-    if (game_type or "").upper() == "EMPAREJA2":
+    if (game_type or "").upper() in ("EMPAREJA2", "T1MER"):
         return {"email": {"required": True}, "instagram": {"required": False}}
     return {"email": {"required": False}, "instagram": {"required": True}}
 

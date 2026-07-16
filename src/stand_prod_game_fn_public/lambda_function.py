@@ -24,6 +24,7 @@ GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 ASSIGN_LAMBDA = os.environ.get("ASSIGN_LAMBDA", "")
 VALIDATE_LAMBDA = os.environ.get("VALIDATE_LAMBDA", "")
+SCORE_LAMBDA = os.environ.get("SCORE_LAMBDA", "")
 PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
 
 dynamo_r = boto3.resource("dynamodb")
@@ -65,6 +66,55 @@ def _get_game(game_id: str) -> dict | None:
     return resp.get("Item")
 
 
+def _as_float(x) -> float | None:
+    if isinstance(x, Decimal):
+        return float(x)
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def _t1mer_ranking(game_id: str, limit: int = 10) -> list[dict]:
+    """Inline ranking for public display (same rules as games.t1mer.get_ranking)."""
+    if limit <= 0:
+        limit = 10
+    if limit > 100:
+        limit = 100
+    items = []
+    last = None
+    while True:
+        kwargs = {"KeyConditionExpression": Key("gameId").eq(game_id)}
+        if last:
+            kwargs["ExclusiveStartKey"] = last
+        resp = gp_table.query(**kwargs)
+        items.extend(resp.get("Items") or [])
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            break
+    ranking = []
+    for it in items:
+        pid = _as_int(it.get("playerId"))
+        if pid <= 0:
+            continue
+        tb = (it.get("type") or {}).get("T1MER") or {}
+        score_f = _as_float(tb.get("score"))
+        timer_f = _as_float(tb.get("timer"))
+        if score_f is None or timer_f is None:
+            continue
+        ranking.append({
+            "playerId": pid,
+            "username": it.get("instagramUsername") or _player_display_label(it),
+            "timer": timer_f,
+            "score": score_f,
+        })
+    ranking.sort(key=lambda x: x["score"])
+    ranking = ranking[:limit]
+    for idx, entry in enumerate(ranking, start=1):
+        entry["rank"] = idx
+    return ranking
+
+
 def _handle_get_game(event):
     params = event.get("queryStringParameters") or {}
     game_id = (params.get("gameId") or "").strip()
@@ -77,12 +127,13 @@ def _handle_get_game(event):
     if not item.get("isActive", True):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
-    pf = item.get("participantFields") or default_participant_fields(item.get("gameType") or "")
+    game_type = (item.get("gameType") or "").upper()
+    pf = item.get("participantFields") or default_participant_fields(game_type)
     recent = item.get("recentPairs") or []
     if not isinstance(recent, list):
         recent = []
 
-    return _resp(200, _json_sanitize({
+    payload = {
         "ok": True,
         "gameId": game_id,
         "gameName": item.get("gameName"),
@@ -94,7 +145,11 @@ def _handle_get_game(event):
         "validatedCount": _as_int(item.get("validatedCount")),
         "recentPairs": recent[-10:],
         "joinUrl": f"/play/{game_id}",
-    }))
+    }
+    if game_type == "T1MER":
+        payload["ranking"] = _t1mer_ranking(game_id, 10)
+
+    return _resp(200, _json_sanitize(payload))
 
 
 def _invoke_assign_web(game_id: str, email: str, instagram_username: str | None) -> dict:
@@ -309,6 +364,84 @@ def _set_prize_delivered(game_id: str, player_id: int, game_type: str, attr: str
     )
 
 
+def _t1mer_assignment_from_player(player: dict) -> dict:
+    code = player.get("validationCode")
+    return {
+        "playerId": player.get("playerId"),
+        "displayName": _player_display_label(player),
+        "validationCode": int(code) if isinstance(code, Decimal) else code,
+        "validated": bool(player.get("validated")),
+    }
+
+
+def _invoke_score_store(game_id: str, player_id: int, timer, score) -> dict:
+    event = {
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({
+            "gameId": game_id,
+            "playerId": player_id,
+            "timer": timer,
+            "score": score,
+        }, ensure_ascii=False),
+    }
+    resp = lambda_client.invoke(
+        FunctionName=SCORE_LAMBDA,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event, ensure_ascii=False).encode("utf-8"),
+    )
+    raw = resp.get("Payload").read().decode("utf-8")
+    outer = json.loads(raw) if raw else {}
+    body = outer.get("body")
+    if isinstance(body, str):
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"ok": False, "error": "BadScoreResponse"}
+    return outer if isinstance(outer, dict) else {"ok": False, "error": "BadScoreResponse"}
+
+
+def _handle_score(event):
+    body = _read_json_body(event)
+    if body is None:
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+
+    game_id = (body.get("gameId") or "").strip()
+    player_token = (body.get("playerToken") or "").strip()
+    timer = body.get("timer")
+    score = body.get("score")
+
+    if not game_id or not is_valid_join_code(game_id):
+        return _resp(400, {"ok": False, "error": "InvalidGameId"})
+    if not player_token:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    if timer is None or score is None:
+        return _resp(400, {"ok": False, "error": "MissingFields"})
+
+    claims = verify_player_token(player_token, PLAYER_TOKEN_SECRET)
+    if not claims or claims.get("gameId") != game_id:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+
+    if not SCORE_LAMBDA:
+        return _resp(500, {"ok": False, "error": "ScoreNotConfigured"})
+
+    meta = _get_game(game_id)
+    if not meta:
+        return _resp(404, {"ok": False, "error": "GameNotFound"})
+    if not meta.get("isActive", True):
+        return _resp(403, {"ok": False, "error": "GameInactive"})
+    game_type = (meta.get("gameType") or "").upper()
+    if game_type != "T1MER":
+        return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
+
+    player = _get_player(game_id, claims["playerId"])
+    if not player:
+        return _resp(403, {"ok": False, "error": "PlayerNotFound"})
+
+    result = _invoke_score_store(game_id, claims["playerId"], timer, score)
+    status = 200 if result.get("ok") else 400
+    return _resp(status, _json_sanitize(result))
+
+
 def _handle_get_player(event):
     params = event.get("queryStringParameters") or {}
     token = (params.get("playerToken") or "").strip()
@@ -326,12 +459,15 @@ def _handle_get_player(event):
 
     meta = _get_game(claims["gameId"]) or {}
     game_type = (meta.get("gameType") or "").upper()
-    assignment = _empareja2_assignment_from_player(player) if game_type == "EMPAREJA2" else None
-    prizes = (
-        _empareja2_prizes(player, claims["gameId"], claims["playerId"])
-        if game_type == "EMPAREJA2"
-        else []
-    )
+    if game_type == "EMPAREJA2":
+        assignment = _empareja2_assignment_from_player(player)
+        prizes = _empareja2_prizes(player, claims["gameId"], claims["playerId"])
+    elif game_type == "T1MER":
+        assignment = _t1mer_assignment_from_player(player)
+        prizes = []
+    else:
+        assignment = None
+        prizes = []
 
     return _resp(200, _json_sanitize({
         "ok": True,
@@ -421,6 +557,8 @@ def lambda_handler(event, context):
             return _handle_get_player(event)
         if path.endswith("/redeem") and method == "POST":
             return _handle_redeem(event)
+        if path.endswith("/score") and method == "POST":
+            return _handle_score(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
     except Exception as e:
