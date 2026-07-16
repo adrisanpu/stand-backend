@@ -310,6 +310,9 @@ def _normalize_instagram_handle(raw: str | None) -> str | None:
     return s or None
 
 
+WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER"})
+
+
 def _empareja2_web_assignment(player: dict) -> dict:
     from assigners.empareja2 import _character_image_url
     blob = (player.get("type") or {}).get("EMPAREJA2") or {}
@@ -324,6 +327,26 @@ def _empareja2_web_assignment(player: dict) -> dict:
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
     }
+
+
+def _t1mer_web_assignment(player: dict) -> dict:
+    code = player.get("validationCode")
+    display = (player.get("instagramUsername") or "").strip()
+    if not display:
+        email = (player.get("email") or "").strip()
+        display = email.split("@", 1)[0] if email else f"Jugador {player.get('playerId', '')}"
+    return {
+        "playerId": player.get("playerId"),
+        "displayName": display,
+        "validationCode": int(code) if isinstance(code, Decimal) else code,
+        "validated": bool(player.get("validated")),
+    }
+
+
+def _web_assignment(game_type: str, player: dict) -> dict:
+    if game_type == "EMPAREJA2":
+        return _empareja2_web_assignment(player)
+    return _t1mer_web_assignment(player)
 
 
 def _web_player_token(player: dict, game_id: str) -> str:
@@ -349,7 +372,7 @@ def _handle_web_assign(event: dict) -> dict:
         return {"ok": False, "reason": "game_inactive"}
 
     game_type = (meta.get("gameType") or "UNKNOWN").upper()
-    if game_type != "EMPAREJA2":
+    if game_type not in WEB_ASSIGN_GAME_TYPES:
         return {"ok": False, "reason": "unsupported_game_type", "gameType": game_type}
 
     pf = _participant_fields(meta)
@@ -368,7 +391,7 @@ def _handle_web_assign(event: dict) -> dict:
             "gameId": game_id,
             "gameType": game_type,
             "playerToken": _web_player_token(existing, game_id),
-            "assignment": _empareja2_web_assignment(existing),
+            "assignment": _web_assignment(game_type, existing),
         })
 
     max_players_raw = meta.get("maxPlayers") or 9999
@@ -421,14 +444,14 @@ def _handle_web_assign(event: dict) -> dict:
 
         try:
             _put_player(base_item)
-            log("assign_web_ok", {"gameId": game_id, "playerId": new_pid})
+            log("assign_web_ok", {"gameId": game_id, "playerId": new_pid, "gameType": game_type})
             return _json_sanitize({
                 "ok": True,
                 "created_new": True,
                 "gameId": game_id,
                 "gameType": game_type,
                 "playerToken": _web_player_token(base_item, game_id),
-                "assignment": _empareja2_web_assignment(base_item),
+                "assignment": _web_assignment(game_type, base_item),
             })
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":

@@ -640,6 +640,7 @@ Resources:
         Variables:
           ASSIGN_LAMBDA: !Ref StandProdGameFnAssign
           VALIDATE_LAMBDA: !Ref StandProdGameValidate
+          SCORE_LAMBDA: !Ref StandProdGameScore
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
           CHAR_URL_TTL: "120"
       Events:
@@ -680,6 +681,14 @@ Resources:
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/public/redeem
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicScorePost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/score
             Method: POST
             Auth:
               Authorizer: NONE

@@ -471,7 +471,7 @@ def _handle_post(event):
             item["quizOrder"] = quiz_order
             item["quizQuestions"] = quiz_questions
 
-        if game_type == "EMPAREJA2":
+        if game_type in ("EMPAREJA2", "T1MER"):
             item["joinChannel"] = (body.get("joinChannel") or "web").strip().lower()
             item["participantFields"] = body.get("participantFields") or default_participant_fields(game_type)
         
