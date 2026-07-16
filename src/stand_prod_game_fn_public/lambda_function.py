@@ -13,6 +13,8 @@ from stand_common.utils import (
     _get_http_method,
     _iso_now,
     verify_player_token,
+    issue_prize_token,
+    verify_prize_token,
     mask_email,
     default_participant_fields,
     is_valid_join_code,
@@ -265,6 +267,48 @@ def _empareja2_assignment_from_player(player: dict) -> dict | None:
     }
 
 
+def _empareja2_prizes(player: dict, game_id: str, player_id: int) -> list[dict]:
+    """Build prize claim entries for EMPAREJA2 (validation and/or raffle)."""
+    blob = (player.get("type") or {}).get("EMPAREJA2") or {}
+    prizes = []
+    if player.get("validated"):
+        prizes.append({
+            "kind": "validation",
+            "token": issue_prize_token(game_id, player_id, "v", PLAYER_TOKEN_SECRET),
+            "delivered": bool(blob.get("validationPrizeDelivered")),
+        })
+    if blob.get("raffleWin"):
+        prizes.append({
+            "kind": "raffle",
+            "token": issue_prize_token(game_id, player_id, "r", PLAYER_TOKEN_SECRET),
+            "delivered": bool(blob.get("prizeDelivered")),
+        })
+    return prizes
+
+
+def _set_prize_delivered(game_id: str, player_id: int, game_type: str, attr: str) -> None:
+    """Ensure type.<gameType>.<attr> = true (three-step Dynamo path like game PUT)."""
+    key = {"gameId": game_id, "playerId": int(player_id)}
+    gp_table.update_item(
+        Key=key,
+        UpdateExpression="SET #type = if_not_exists(#type, :tinit)",
+        ExpressionAttributeNames={"#type": "type"},
+        ExpressionAttributeValues={":tinit": {}},
+    )
+    gp_table.update_item(
+        Key=key,
+        UpdateExpression="SET #type.#g = if_not_exists(#type.#g, :ginit)",
+        ExpressionAttributeNames={"#type": "type", "#g": game_type},
+        ExpressionAttributeValues={":ginit": {}},
+    )
+    gp_table.update_item(
+        Key=key,
+        UpdateExpression="SET #type.#g.#a = :d",
+        ExpressionAttributeNames={"#type": "type", "#g": game_type, "#a": attr},
+        ExpressionAttributeValues={":d": True},
+    )
+
+
 def _handle_get_player(event):
     params = event.get("queryStringParameters") or {}
     token = (params.get("playerToken") or "").strip()
@@ -283,6 +327,11 @@ def _handle_get_player(event):
     meta = _get_game(claims["gameId"]) or {}
     game_type = (meta.get("gameType") or "").upper()
     assignment = _empareja2_assignment_from_player(player) if game_type == "EMPAREJA2" else None
+    prizes = (
+        _empareja2_prizes(player, claims["gameId"], claims["playerId"])
+        if game_type == "EMPAREJA2"
+        else []
+    )
 
     return _resp(200, _json_sanitize({
         "ok": True,
@@ -290,6 +339,68 @@ def _handle_get_player(event):
         "gameType": game_type,
         "playerToken": token,
         "assignment": assignment,
+        "prizes": prizes,
+    }))
+
+
+def _handle_redeem(event):
+    body = _read_json_body(event)
+    if body is None:
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+
+    prize_token = (body.get("prizeToken") or "").strip()
+    claims = verify_prize_token(prize_token, PLAYER_TOKEN_SECRET)
+    if not claims:
+        return _resp(400, {"ok": False, "error": "InvalidPrizeToken"})
+
+    game_id = claims["gameId"]
+    player_id = claims["playerId"]
+    kind = claims["kind"]
+
+    meta = _get_game(game_id)
+    if not meta:
+        return _resp(404, {"ok": False, "error": "GameNotFound"})
+    if not meta.get("isActive", True):
+        return _resp(403, {"ok": False, "error": "GameInactive"})
+
+    game_type = (meta.get("gameType") or "").upper()
+    if game_type != "EMPAREJA2":
+        return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
+
+    player = _get_player(game_id, player_id)
+    if not player:
+        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+
+    blob = (player.get("type") or {}).get("EMPAREJA2") or {}
+
+    if kind == "v":
+        if not player.get("validated"):
+            return _resp(400, {"ok": False, "error": "NotEligible"})
+        if blob.get("validationPrizeDelivered"):
+            return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "validation"})
+        attr = "validationPrizeDelivered"
+        kind_out = "validation"
+    else:
+        if not blob.get("raffleWin"):
+            return _resp(400, {"ok": False, "error": "NotEligible"})
+        if blob.get("prizeDelivered"):
+            return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "raffle"})
+        attr = "prizeDelivered"
+        kind_out = "raffle"
+
+    try:
+        _set_prize_delivered(game_id, player_id, "EMPAREJA2", attr)
+    except ClientError as e:
+        log("public_redeem_failed", {"error": str(e), "gameId": game_id, "playerId": player_id})
+        return _resp(500, {"ok": False, "error": "UpdateFailed"})
+
+    return _resp(200, _json_sanitize({
+        "ok": True,
+        "gameId": game_id,
+        "playerId": player_id,
+        "kind": kind_out,
+        "delivered": True,
+        "label": _player_display_label(player),
     }))
 
 
@@ -308,6 +419,8 @@ def lambda_handler(event, context):
             return _handle_validate(event)
         if path.endswith("/player") and method == "GET":
             return _handle_get_player(event)
+        if path.endswith("/redeem") and method == "POST":
+            return _handle_redeem(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
     except Exception as e:

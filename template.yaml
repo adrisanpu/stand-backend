@@ -675,6 +675,14 @@ Resources:
             Method: GET
             Auth:
               Authorizer: NONE
+        PublicRedeemPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/redeem
+            Method: POST
+            Auth:
+              Authorizer: NONE
 
 # =========================
 # GAME FEATURES

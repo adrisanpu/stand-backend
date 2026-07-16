@@ -251,3 +251,47 @@ def verify_player_token(token: str, secret: str) -> dict | None:
     if not gid or pid is None:
         return None
     return {"gameId": gid, "playerId": int(pid)}
+
+
+# Prize kinds: "v" = validation, "r" = raffle
+PRIZE_KINDS = frozenset({"v", "r"})
+
+
+def issue_prize_token(
+    game_id: str, player_id: int, kind: str, secret: str, ttl_seconds: int = 604800
+) -> str:
+    """HMAC prize claim token. kind is 'v' (validation) or 'r' (raffle). Default TTL 7 days."""
+    k = (kind or "").strip().lower()
+    if k not in PRIZE_KINDS:
+        raise ValueError(f"invalid prize kind: {kind}")
+    payload = {
+        "gid": game_id,
+        "pid": int(player_id),
+        "k": k,
+        "exp": int(time.time()) + ttl_seconds,
+    }
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}"
+
+
+def verify_prize_token(token: str, secret: str) -> dict | None:
+    if not token or not secret or "." not in token:
+        return None
+    body, sig = token.rsplit(".", 1)
+    expected = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expected):
+        return None
+    pad = "=" * (-len(body) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body + pad).decode("utf-8"))
+    except Exception:
+        return None
+    if int(payload.get("exp") or 0) < int(time.time()):
+        return None
+    gid = (payload.get("gid") or "").strip()
+    pid = payload.get("pid")
+    k = (payload.get("k") or "").strip().lower()
+    if not gid or pid is None or k not in PRIZE_KINDS:
+        return None
+    return {"gameId": gid, "playerId": int(pid), "kind": k}
