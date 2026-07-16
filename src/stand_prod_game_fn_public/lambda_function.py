@@ -105,6 +105,7 @@ def _t1mer_ranking(game_id: str, limit: int = 10) -> list[dict]:
         ranking.append({
             "playerId": pid,
             "username": it.get("instagramUsername") or _player_display_label(it),
+            "profilePicUrl": (it.get("instagramProfilePicUrl") or "").strip() or None,
             "timer": timer_f,
             "score": score_f,
         })
@@ -366,12 +367,22 @@ def _set_prize_delivered(game_id: str, player_id: int, game_type: str, attr: str
 
 def _t1mer_assignment_from_player(player: dict) -> dict:
     code = player.get("validationCode")
-    return {
+    blob = (player.get("type") or {}).get("T1MER") or {}
+    score_raw = blob.get("score")
+    timer_raw = blob.get("timer")
+    pic = (player.get("instagramProfilePicUrl") or "").strip() or None
+    out = {
         "playerId": player.get("playerId"),
         "displayName": _player_display_label(player),
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
+        "profilePicUrl": pic,
     }
+    if score_raw is not None:
+        out["score"] = int(score_raw) if not isinstance(score_raw, Decimal) else int(score_raw)
+    if timer_raw is not None:
+        out["timer"] = float(timer_raw) if not isinstance(timer_raw, Decimal) else float(timer_raw)
+    return out
 
 
 def _invoke_score_store(game_id: str, player_id: int, timer, score) -> dict:
