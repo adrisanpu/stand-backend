@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import secrets
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -433,7 +434,7 @@ def _handle_post(event):
             return _resp(500, {"error": "GameNameCheckFailed", "detail": str(e)})
 
     now = _iso_now()
-    max_players = 25 if not is_pro else 9999
+    max_players = 25 if not is_pro else 9000
 
     # Generate unique join code (gameId) with retries
     game_id = None
@@ -449,6 +450,10 @@ def _handle_post(event):
             "gameName": game_name or None,
             "isActive": True,
             "maxPlayers": max_players,
+            "validationCodes": {},
+            "validationCodesInitialized": True,
+            "validationCodeCounter": 0,
+            "validationCodeOffset": secrets.randbelow(9000),
             "playersCount": 0,
             "validatedCount": 0,
             "raffleWinners": [],
@@ -470,7 +475,11 @@ def _handle_post(event):
                 ConditionExpression="attribute_not_exists(gameId)",
             )
             game_id = candidate
-            return _resp(201, {"message": "Game created successfully", "game": item})
+            public_item = {
+                key: value for key, value in item.items()
+                if key not in {"validationCodes", "validationCodesInitialized", "validationCodeCounter", "validationCodeOffset"}
+            }
+            return _resp(201, {"message": "Game created successfully", "game": public_item})
         except ClientError as e:
             code = e.response["Error"]["Code"]
             if code == "ConditionalCheckFailedException":
@@ -760,7 +769,11 @@ def _handle_put(event):
         attrs = resp.get("Item") or item
     except Exception:
         attrs = item
-    return _resp(200, {"message": "Game updated successfully", "game": attrs})
+    public_attrs = {
+        key: value for key, value in attrs.items()
+        if key not in {"validationCodes", "validationCodesInitialized", "validationCodeCounter", "validationCodeOffset"}
+    }
+    return _resp(200, {"message": "Game updated successfully", "game": public_attrs})
 
 # ---------------- DELETE ----------------
 

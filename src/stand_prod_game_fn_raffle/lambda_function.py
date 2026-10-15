@@ -13,7 +13,7 @@ from collections import defaultdict
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob, game_display_name
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob, game_display_name, _get_claims
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -339,6 +339,10 @@ def lambda_handler(event, context):
         game = _get_game(game_id)
         if not game:
             return _resp(404, {"ok": False, "error": "GameNotFound"})
+        if method != "INVOKE":
+            claims = _get_claims(event) if isinstance(event, dict) else {}
+            if not claims.get("sub") or claims["sub"] != game.get("ownerUserId"):
+                return _resp(403, {"ok": False, "error": "Forbidden"})
 
         if not game.get("isActive", True):
             return _resp(403, {"ok": False, "error": "GameInactive"})

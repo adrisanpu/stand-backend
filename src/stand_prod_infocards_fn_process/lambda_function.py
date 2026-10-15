@@ -43,12 +43,14 @@ def _extract_pdf_text(bucket: str, key: str) -> str:
     """Download a PDF from S3 and attempt basic text extraction."""
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
-        data = obj["Body"].read()
+        data = obj["Body"].read(20 * 1024 * 1024 + 1)
+        if len(data) > 20 * 1024 * 1024:
+            raise ValueError("PDF exceeds the 20 MB processing limit")
         # Attempt naive text extraction from PDF bytes (works for simple PDFs)
         text = data.decode("latin-1", errors="ignore")
         # Keep only printable ASCII-ish characters
         lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 3]
-        return "\n".join(lines[:300])  # cap to avoid huge prompts
+        return "\n".join(lines[:300])[:20000]
     except Exception as e:
         log("PDF extraction failed", {"key": key, "error": str(e)})
         return f"[No se pudo extraer el texto del PDF: {key}]"
@@ -168,6 +170,8 @@ def lambda_handler(event, context):
         game_id = (body.get("gameId") or "").strip()
         text = (body.get("text") or "").strip()
         file_keys = body.get("fileKeys") or []
+        if not isinstance(file_keys, list) or any(not isinstance(key, str) for key in file_keys):
+            return _resp(400, {"error": "fileKeys must be an array of strings."})
         generate_quiz = bool(body.get("generateQuiz", False))
 
         num_cards = 6
@@ -201,6 +205,10 @@ def lambda_handler(event, context):
 
         if not text and not file_keys:
             return _resp(400, {"error": "Provide at least 'text' or 'fileKeys'."})
+        if len(file_keys) > 20:
+            return _resp(400, {"error": "Too many files. Maximum 20 files per request."})
+        if any(not key.startswith(f"infocards/{game_id}/") for key in file_keys):
+            return _resp(400, {"error": "Each file key must belong to this game."})
 
         # Verify game ownership
         try:

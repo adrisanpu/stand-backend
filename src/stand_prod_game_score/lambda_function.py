@@ -4,7 +4,7 @@ import json
 import base64
 
 import boto3
-from stand_common.utils import log, _json_sanitize, _resp
+from stand_common.utils import log, _json_sanitize, _resp, _get_claims
 
 import games.t1mer as t1mer
 
@@ -60,6 +60,9 @@ def _handle_post(event):
     meta = _get_game_meta(game_id)
     if not meta:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
+    claims = _get_claims(event)
+    if not claims.get("sub") or claims["sub"] != meta.get("ownerUserId"):
+        return _resp(403, {"ok": False, "error": "Forbidden"})
     if not meta.get("isActive", True):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
@@ -105,6 +108,9 @@ def _handle_get(event):
     meta = _get_game_meta(game_id)
     if not meta:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
+    claims = _get_claims(event)
+    if not claims.get("sub") or claims["sub"] != meta.get("ownerUserId"):
+        return _resp(403, {"ok": False, "error": "Forbidden"})
 
     game_type = (meta.get("gameType") or "").upper()
     if not game_type:

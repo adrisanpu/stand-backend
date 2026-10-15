@@ -161,6 +161,12 @@ def _handle_put(event, owner_user_id):
             "videoKey": card.get("videoKey"),
             "order": card.get("order", 0),
         }
+        for media_key in (clean["imageKey"], clean["videoKey"]):
+            if media_key and (
+                not isinstance(media_key, str)
+                or not media_key.startswith(f"infocards/{game_id}/")
+            ):
+                return _resp(400, {"error": "Card media keys must belong to this game."})
         if card.get("imagePositionX") is not None:
             clean["imagePositionX"] = card["imagePositionX"]
         if card.get("imagePositionY") is not None:

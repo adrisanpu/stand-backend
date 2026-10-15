@@ -35,7 +35,6 @@ def validate_semaforo(ctx: dict):
             "gameId": game_id,
             "reason": "invalid_code_count",
             "message": f"SEMAFORO necesita exactamente 2 códigos (has enviado {len(codes)}).",
-            "game": meta,
         }
 
     c1 = to_int(codes[0])
@@ -47,7 +46,6 @@ def validate_semaforo(ctx: dict):
             "gameId": game_id,
             "reason": "invalid_code_format",
             "message": "Códigos inválidos.",
-            "game": meta,
         }
 
     if c1 == c2:
@@ -56,7 +54,6 @@ def validate_semaforo(ctx: dict):
             "gameId": game_id,
             "reason": "same_code",
             "message": "No puedes validar contigo mismo 😉",
-            "game": meta,
         }
 
     # ---- find players ----
@@ -72,7 +69,6 @@ def validate_semaforo(ctx: dict):
             "reason": "code_not_found",
             "message": "Uno (o los dos) códigos no existe en esta partida.",
             "found": {"code_1": bool(p1), "code_2": bool(p2)},
-            "game": meta,
         }
 
     # ---- already validated ----
@@ -82,8 +78,6 @@ def validate_semaforo(ctx: dict):
             "gameId": game_id,
             "reason": "already_validated",
             "message": "Alguno de los dos códigos ya fue validado.",
-            "game": meta,
-            "players": [p1, p2],
         }
 
     # ---- quiz gate: if game has quiz => both must have completed ----
@@ -97,9 +91,7 @@ def validate_semaforo(ctx: dict):
                 "gameId": game_id,
                 "reason": "quiz_not_completed",
                 "message": "Alguno aún no ha completado el quiz.",
-                "game": meta,
                 "quiz": {"p1Completed": done1, "p2Completed": done2},
-                "players": [p1, p2],
             }
 
     # ---- set validated ----
@@ -112,8 +104,6 @@ def validate_semaforo(ctx: dict):
             "gameId": game_id,
             "reason": "bad_playerId",
             "message": "playerId inválido en uno de los registros.",
-            "game": meta,
-            "players": [p1, p2],
         }
 
     changed1 = set_validated(game_id, pid1)
@@ -126,12 +116,44 @@ def validate_semaforo(ctx: dict):
         except Exception as e:
             ctx["log"]("validatedCount_update_failed", {"error": repr(e), "gameId": game_id})
 
-    # devuelve los records completos + game meta completo
+    safe_questions = {}
+    for question_id, question in (meta.get("quizQuestions") or {}).items():
+        safe_questions[question_id] = {
+            "text": question.get("text"),
+            "options": [
+                {"title": option.get("title"), "payload": option.get("payload")}
+                for option in question.get("options") or []
+            ],
+        }
+
     return {
         "valid": True,
         "gameId": game_id,
         "reason": "ok",
         "message": "✅ Validación correcta.",
-        "game": meta,
-        "players": [p1, p2],
+        "game": {
+            "gameId": meta.get("gameId"),
+            "quizOrder": meta.get("quizOrder") or [],
+            "quizQuestions": safe_questions,
+        },
+        "players": [
+            {
+                "playerId": pid1,
+                "instagramUsername": p1.get("instagramUsername", ""),
+                "type": {
+                    "SEMAFORO": {
+                        "quizAnswers": (((p1.get("type") or {}).get("SEMAFORO") or {}).get("quizAnswers") or {}),
+                    },
+                },
+            },
+            {
+                "playerId": pid2,
+                "instagramUsername": p2.get("instagramUsername", ""),
+                "type": {
+                    "SEMAFORO": {
+                        "quizAnswers": (((p2.get("type") or {}).get("SEMAFORO") or {}).get("quizAnswers") or {}),
+                    },
+                },
+            },
+        ],
     }

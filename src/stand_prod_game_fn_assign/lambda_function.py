@@ -1,13 +1,13 @@
 import os
 import json
-import random
+import secrets
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
 from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 from stand_common.utils import log, _json_sanitize, _iso_now, get_game_type_blob
 
 # ========= ENV VARS =========
@@ -28,8 +28,100 @@ sqs_client = boto3.client("sqs")
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
 
-def _code4() -> int:
-    return random.randint(1000, 9999)
+class ValidationCodeExhausted(Exception):
+    pass
+
+
+def _ensure_validation_code_registry(game_id: str) -> int:
+    game = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+    if not game:
+        raise ValueError("Game not found while allocating validation code")
+    if game.get("validationCodesInitialized"):
+        return int(game.get("validationCodeOffset", 0))
+
+    used_codes = {}
+    last = None
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("gameId").eq(game_id),
+            "ProjectionExpression": "gameId, playerId, validationCode",
+        }
+        if last:
+            kwargs["ExclusiveStartKey"] = last
+        response = gp_table.query(**kwargs)
+        for player in response.get("Items") or []:
+            code = player.get("validationCode")
+            if code is not None:
+                used_codes[str(int(code))] = True
+        last = response.get("LastEvaluatedKey")
+        if not last:
+            break
+
+    try:
+        games_table.update_item(
+            Key={"gameId": game_id},
+            UpdateExpression=(
+                "SET validationCodes = :codes, validationCodesInitialized = :ready, "
+                "validationCodeCounter = if_not_exists(validationCodeCounter, :zero), "
+                "validationCodeOffset = if_not_exists(validationCodeOffset, :offset)"
+            ),
+            ExpressionAttributeValues={
+                ":codes": used_codes,
+                ":ready": True,
+                ":zero": 0,
+                ":offset": secrets.randbelow(9000),
+            },
+            ConditionExpression="attribute_not_exists(validationCodesInitialized)",
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
+    initialized = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item") or {}
+    if not initialized.get("validationCodesInitialized"):
+        raise RuntimeError("Validation code registry initialization failed")
+    return int(initialized.get("validationCodeOffset", 0))
+
+
+def _code4(game_id: str) -> int:
+    offset = _ensure_validation_code_registry(game_id)
+    for _ in range(9000):
+        try:
+            response = games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET validationCodeCounter = validationCodeCounter + :one",
+                ExpressionAttributeValues={":one": 1, ":max": 9000},
+                ConditionExpression="attribute_exists(gameId) AND validationCodeCounter < :max",
+                ReturnValues="UPDATED_NEW",
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise ValidationCodeExhausted from e
+            raise
+
+        counter = int(response["Attributes"]["validationCodeCounter"])
+        candidate = 1000 + ((offset + counter - 1) % 9000)
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET #codes.#code = :used",
+                ExpressionAttributeNames={"#codes": "validationCodes", "#code": str(candidate)},
+                ExpressionAttributeValues={":used": True},
+                ConditionExpression="attribute_exists(gameId) AND attribute_not_exists(#codes.#code)",
+            )
+            return candidate
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+    raise ValidationCodeExhausted
+
+
+def _release_validation_code(game_id: str, code: int) -> None:
+    games_table.update_item(
+        Key={"gameId": game_id},
+        UpdateExpression="REMOVE #codes.#code",
+        ExpressionAttributeNames={"#codes": "validationCodes", "#code": str(code)},
+        ConditionExpression="attribute_exists(#codes.#code)",
+    )
 
 def _send_bulk_messages(messages):
     """
@@ -374,7 +466,6 @@ def lambda_handler(event, context):
                 "instagramUsername": username_at,
                 "joinedAt": now,
                 "validated": False,
-                "validationCode": _code4(),
             }
             if profile_pic_url:
                 base_item["instagramProfilePicUrl"] = profile_pic_url
@@ -391,7 +482,6 @@ def lambda_handler(event, context):
                 "dynamo_r": dynamo_r,
                 "lambda_client": lambda_client,
                 "log_fn": log,
-                "validationCode": base_item["validationCode"],
             }
 
             # assigner contract: (patch, welcome_header, extra_messages)
@@ -401,6 +491,13 @@ def lambda_handler(event, context):
             if patch:
                 for k, v in patch.items():
                     base_item[k] = v
+
+            try:
+                base_item["validationCode"] = _code4(game_id)
+            except ValidationCodeExhausted:
+                _rollback_player_slot(game_id, now)
+                _send_single_dm(psid, "Este juego ha alcanzado el límite de códigos de validación.")
+                return {"ok": False, "reason": "validation_code_limit_reached"}
 
             try:
                 _put_player(base_item)
@@ -463,7 +560,7 @@ def lambda_handler(event, context):
 
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                    # race on playerId -> retry (NO rollback, already reserved slot)
+                    _release_validation_code(game_id, base_item["validationCode"])
                     continue
 
                 # rollback reserva (best-effort)

@@ -223,10 +223,20 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:Query
                   - dynamodb:ConditionCheckItem
+                  - dynamodb:TransactWriteItems
                 Resource:
                   - !Sub
                     - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                     - TableName: !Ref StandProdUserTable
+              - Sid: StripeEventIdempotency
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:TransactWriteItems
+                Resource: !Sub
+                  - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
+                  - TableName: !Ref StandProdStripeEventsTable
               - Sid: SecretsManager
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -298,6 +308,21 @@ Resources:
       KeySchema:
         - AttributeName: userId
           KeyType: HASH
+
+  StandProdStripeEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "stand-${Environment}-stripe-event-table"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
 
   StandProdGameTable:
     Type: AWS::DynamoDB::Table
@@ -415,7 +440,7 @@ Resources:
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
-            AllowedMethods: [PUT, GET]
+            AllowedMethods: [POST, PUT, GET]
             AllowedOrigins: ["*"]
             MaxAge: 3600
 
@@ -426,7 +451,7 @@ Resources:
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
-            AllowedMethods: [PUT, GET, DELETE]
+            AllowedMethods: [POST, PUT, GET, DELETE]
             AllowedOrigins: ["*"]
             MaxAge: 3600
 
@@ -525,6 +550,9 @@ Resources:
       Layers:
         - !Ref StripeLayerArn
         - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          STRIPE_EVENTS_TABLE: !Ref StandProdStripeEventsTable
       Events:
         StripePost:
           Type: HttpApi
@@ -681,6 +709,8 @@ Resources:
           Properties:
             Queue: !GetAtt StandProdQuizQueue.Arn
             BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
   StandProdGameFnRaffle:
     Type: AWS::Serverless::Function
@@ -1010,4 +1040,3 @@ Outputs:
 
   GameApiUrl:
     Value: !Sub "https://${GameApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
-

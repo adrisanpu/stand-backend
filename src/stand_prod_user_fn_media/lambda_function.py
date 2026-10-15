@@ -25,6 +25,7 @@ DEFAULT_STAND_AVATAR_LOSE_KEY = os.environ.get("DEFAULT_STAND_AVATAR_LOSE_KEY", 
 MAX_FILES_PER_REQUEST = 10
 MAX_LOGO_SIZE = 5 * 1024 * 1024
 MAX_AVATAR_SIZE = 30 * 1024 * 1024
+MAX_FILE_SIZE = MAX_AVATAR_SIZE
 PRESIGNED_TTL = 3600
 
 LOGO_ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/svg+xml"}
@@ -57,7 +58,7 @@ def _ensure_media_shape(item: dict | None) -> dict:
 
 
 def _load_user_with_media(table, user_id: str) -> tuple[dict, dict]:
-    item = table.get_item(Key={"userId": user_id}).get("Item")
+    item = table.get_item(Key={"userId": user_id}, ConsistentRead=True).get("Item")
     if not item:
         now = _iso_now()
         item = {
@@ -67,7 +68,14 @@ def _load_user_with_media(table, user_id: str) -> tuple[dict, dict]:
             "updatedAt": now,
             "media": _empty_media(),
         }
-        table.put_item(Item=item)
+        try:
+            table.put_item(Item=item, ConditionExpression="attribute_not_exists(userId)")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+            item = table.get_item(Key={"userId": user_id}).get("Item")
+            if not item:
+                raise RuntimeError("User record disappeared after concurrent creation")
     media = _ensure_media_shape(item)
     return item, media
 
@@ -129,10 +137,14 @@ def _handle_upload_url(event, user_id: str):
 
     upload_urls = []
     for file_info in files:
+        if not isinstance(file_info, dict):
+            return _resp(400, {"error": "Each file entry must be an object."})
         kind = (file_info.get("kind") or "").strip().lower()
         file_name = _sanitize_file_name(file_info.get("fileName") or "")
         content_type = (file_info.get("contentType") or "").strip().lower()
-        size_bytes = int(file_info.get("sizeBytes") or 0)
+        size_bytes = file_info.get("sizeBytes")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or not 1 <= size_bytes <= MAX_FILE_SIZE:
+            return _resp(400, {"error": f"sizeBytes must be between 1 and {MAX_FILE_SIZE}."})
         display_name = _sanitize_file_name(file_info.get("name") or file_name.rsplit(".", 1)[0])
 
         if kind not in {"logo", "avatar"}:
@@ -146,6 +158,7 @@ def _handle_upload_url(event, user_id: str):
                 return _resp(400, {"error": "Unsupported logo content type.", "allowedTypes": sorted(LOGO_ALLOWED_TYPES)})
             if size_bytes > MAX_LOGO_SIZE:
                 return _resp(400, {"error": "Logo file too large (max 5MB)."})
+            max_size = MAX_LOGO_SIZE
             ext = _guess_extension(content_type)
             key = f"users/{user_id}/logos/{uuid.uuid4()}-{display_name}.{ext}"
         else:
@@ -153,15 +166,21 @@ def _handle_upload_url(event, user_id: str):
                 return _resp(400, {"error": "Unsupported avatar content type.", "allowedTypes": sorted(AVATAR_ALLOWED_TYPES)})
             if size_bytes > MAX_AVATAR_SIZE:
                 return _resp(400, {"error": "Avatar file too large (max 30MB)."})
+            max_size = MAX_AVATAR_SIZE
             state = _normalize_state(file_info.get("state"))
             ext = _guess_extension(content_type)
             key = f"users/{user_id}/avatars/{display_name}__{state}__{uuid.uuid4()}.{ext}"
 
         media_id = str(uuid.uuid4())
         try:
-            put_url = s3.generate_presigned_url(
-                "put_object",
-                Params={"Bucket": USER_MEDIA_BUCKET, "Key": key, "ContentType": content_type},
+            upload = s3.generate_presigned_post(
+                Bucket=USER_MEDIA_BUCKET,
+                Key=key,
+                Fields={"Content-Type": content_type},
+                Conditions=[
+                    {"Content-Type": content_type},
+                    ["content-length-range", 1, max_size],
+                ],
                 ExpiresIn=PRESIGNED_TTL,
             )
         except ClientError as e:
@@ -174,7 +193,8 @@ def _handle_upload_url(event, user_id: str):
                 "kind": kind,
                 "state": state,
                 "key": key,
-                "url": put_url,
+                "url": upload["url"],
+                "fields": upload["fields"],
                 "expiresIn": PRESIGNED_TTL,
                 "meta": {
                     "id": media_id,
@@ -216,6 +236,9 @@ def _handle_register(event, table, user_id: str):
         }
         if not media_item["id"] or not media_item["key"]:
             return _resp(400, {"error": "Each item must include id and key."})
+        expected_prefix = f"users/{user_id}/{'logos' if kind == 'logo' else 'avatars'}/"
+        if not media_item["key"].startswith(expected_prefix):
+            return _resp(400, {"error": "Media key does not belong to this user."})
         if kind == "avatar":
             media_item["state"] = _normalize_state(item.get("state"))
             media["avatar"]["items"] = _upsert_media_item(media["avatar"]["items"], media_item)

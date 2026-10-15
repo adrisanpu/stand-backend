@@ -7,6 +7,7 @@ from typing import Optional
 
 import boto3
 import stripe
+from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 from stand_common.utils import log, _resp, _iso_now, _parse_iso
 
@@ -15,6 +16,7 @@ dynamodb = boto3.resource("dynamodb")
 
 # ========= ENV =========
 USERS_TABLE = (os.environ.get("USERS_TABLE", "") or "").strip()
+STRIPE_EVENTS_TABLE = (os.environ.get("STRIPE_EVENTS_TABLE", "") or "").strip()
 
 # Stripe keys solo desde Secrets Manager (STRIPE_SECRET_NAME obligatorio)
 STRIPE_SECRET_KEY = ""
@@ -32,6 +34,7 @@ if _stripe_secret_name:
         print(json.dumps({"msg": "stripe_secret_load_failed", "error": repr(e)}))
 
 stripe.api_key = STRIPE_SECRET_KEY
+_serializer = TypeSerializer()
 
 
 def _raw_body(event: dict) -> bytes:
@@ -71,6 +74,91 @@ def _plus_24h_from(active_until: Optional[str]) -> str:
     return _iso_from_dt(base + timedelta(hours=24))
 
 
+def _serialize_item(item: dict) -> dict:
+    return {key: _serializer.serialize(value) for key, value in item.items()}
+
+
+def _grant_paid_access(user_id: str, event_id: str, obj: dict) -> bool:
+    users = dynamodb.Table(USERS_TABLE)
+    events = dynamodb.Table(STRIPE_EVENTS_TABLE)
+    client = users.meta.client
+
+    for attempt in range(5):
+        current = users.get_item(Key={"userId": user_id}, ConsistentRead=True).get("Item") or {}
+        now = _iso_now()
+        active_until = _plus_24h_from(current.get("activeUntil"))
+        values = {
+            ":plan": "EVENT_24H",
+            ":until": active_until,
+            ":now": now,
+            ":event": event_id,
+        }
+        condition = "attribute_not_exists(activeUntil)"
+        if "activeUntil" in current:
+            values[":previous"] = current["activeUntil"]
+            condition = "activeUntil = :previous"
+
+        names = {
+            "#plan": "plan",
+            "#activeUntil": "activeUntil",
+            "#updatedAt": "updatedAt",
+            "#lastStripeEventId": "lastStripeEventId",
+            "#createdAt": "createdAt",
+        }
+        update = (
+            "SET #plan=:plan, #activeUntil=:until, #updatedAt=:now, "
+            "#lastStripeEventId=:event, #createdAt=if_not_exists(#createdAt, :now)"
+        )
+        for attr, key in (("customer", "#stripeCustomerId"), ("payment_intent", "#lastPaymentIntentId"), ("id", "#lastCheckoutSessionId")):
+            if obj.get(attr):
+                names[key] = key[1:]
+                value_name = f":{key[1:]}"
+                values[value_name] = obj[attr]
+                update += f", {key}={value_name}"
+
+        expiry = int(datetime.now(timezone.utc).timestamp()) + 400 * 24 * 60 * 60
+        try:
+            client.transact_write_items(
+                TransactItems=[
+                    {
+                        "Put": {
+                            "TableName": STRIPE_EVENTS_TABLE,
+                            "Item": _serialize_item({
+                                "eventId": event_id,
+                                "userId": user_id,
+                                "processedAt": now,
+                                "expiresAt": expiry,
+                            }),
+                            "ConditionExpression": "attribute_not_exists(eventId)",
+                        }
+                    },
+                    {
+                        "Update": {
+                            "TableName": USERS_TABLE,
+                            "Key": _serialize_item({"userId": user_id}),
+                            "UpdateExpression": update,
+                            "ExpressionAttributeNames": names,
+                            "ExpressionAttributeValues": _serialize_item(values),
+                            "ConditionExpression": condition,
+                        }
+                    },
+                ]
+            )
+            return True
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "TransactionCanceledException":
+                raise
+            processed = events.get_item(
+                Key={"eventId": event_id},
+                ConsistentRead=True,
+            ).get("Item")
+            if processed:
+                return False
+            if attempt == 4:
+                raise
+    raise RuntimeError("Stripe event transaction retries exhausted")
+
+
 def lambda_handler(event, context):
     log("webhook:start", {"requestId": getattr(context, "aws_request_id", None)})
 
@@ -78,6 +166,7 @@ def lambda_handler(event, context):
         "STRIPE_SECRET_KEY": STRIPE_SECRET_KEY,
         "STRIPE_WEBHOOK_SECRET": STRIPE_WEBHOOK_SECRET,
         "USERS_TABLE": USERS_TABLE,
+        "STRIPE_EVENTS_TABLE": STRIPE_EVENTS_TABLE,
     }.items() if not v]
     if missing:
         log("webhook:error_missing_env", missing)
@@ -125,73 +214,16 @@ def lambda_handler(event, context):
             })
             return _resp(200, {"ok": True})
 
-        table = dynamodb.Table(USERS_TABLE)
-        now = _iso_now()
-
-        # Leer activeUntil actual para extender correctamente
-        current = table.get_item(Key={"userId": user_id}).get("Item") or {}
-        current_until = current.get("activeUntil")
-        active_until = _plus_24h_from(current_until)
-
-        # Construir UpdateExpression (upsert)
-        update_expr = """
-        SET #plan=:plan,
-            #activeUntil=:until,
-            #updatedAt=:now,
-            #lastStripeEventId=:eid,
-            #createdAt=if_not_exists(#createdAt, :now)
-        """
-        expr_names = {
-            "#plan": "plan",
-            "#activeUntil": "activeUntil",
-            "#updatedAt": "updatedAt",
-            "#lastStripeEventId": "lastStripeEventId",
-            "#createdAt": "createdAt",
-        }
-        expr_vals = {
-            ":plan": "EVENT_24H",
-            ":until": active_until,
-            ":now": now,
-            ":eid": evt_id,
-        }
-
-        # Campos útiles para debug
-        customer_id = obj.get("customer")
-        payment_intent = obj.get("payment_intent")
-        session_id = obj.get("id")
-
-        if customer_id:
-            update_expr += ", #stripeCustomerId=:cid"
-            expr_names["#stripeCustomerId"] = "stripeCustomerId"
-            expr_vals[":cid"] = customer_id
-
-        if payment_intent:
-            update_expr += ", #lastPaymentIntentId=:pi"
-            expr_names["#lastPaymentIntentId"] = "lastPaymentIntentId"
-            expr_vals[":pi"] = payment_intent
-
-        if session_id:
-            update_expr += ", #lastCheckoutSessionId=:sid"
-            expr_names["#lastCheckoutSessionId"] = "lastCheckoutSessionId"
-            expr_vals[":sid"] = session_id
-
-        # Idempotencia: procesar cada Stripe event una sola vez
-        table.update_item(
-            Key={"userId": user_id},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_vals,
-            ConditionExpression="attribute_not_exists(lastStripeEventId) OR lastStripeEventId <> :eid",
-        )
-
-        log("webhook:plan_activated", {"userId": user_id, "activeUntil": active_until})
-        return _resp(200, {"ok": True})
-
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+        if not evt_id:
+            return _resp(400, {"error": "Missing Stripe event ID"})
+        if not _grant_paid_access(user_id, evt_id, obj):
             log("webhook:duplicate_event_ignored", {"eventId": evt_id})
             return _resp(200, {"ok": True})
 
+        log("webhook:plan_activated", {"userId": user_id})
+        return _resp(200, {"ok": True})
+
+    except ClientError as e:
         log("webhook:dynamo_error", {
             "error": str(e),
             "response": getattr(e, "response", None),

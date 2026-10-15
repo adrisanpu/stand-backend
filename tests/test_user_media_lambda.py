@@ -34,7 +34,10 @@ def _setup_tables():
 def test_upload_url_for_avatar_contains_state_in_key():
     _setup_tables()
     mod.s3 = MagicMock()
-    mod.s3.generate_presigned_url.return_value = "https://upload"
+    mod.s3.generate_presigned_post.return_value = {
+        "url": "https://upload",
+        "fields": {"key": "test-key", "policy": "policy"},
+    }
 
     response = mod.lambda_handler(
         _event(

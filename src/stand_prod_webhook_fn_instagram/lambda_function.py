@@ -1,4 +1,4 @@
-import os, json, base64, urllib.parse, urllib.request
+import os, json, base64, binascii, hashlib, hmac, urllib.parse, urllib.request
 import boto3
 from stand_common.utils import log, is_valid_join_code
 
@@ -15,6 +15,7 @@ ICE_BREAKER_PLAY_PAYLOAD = "PLAY"
 IG_PAGE_TOKEN = ""
 VERIFY_TOKEN  = ""
 IG_SENDER_ID  = ""
+IG_APP_SECRET = ""
 _instagram_secret_name = os.environ.get("INSTAGRAM_SECRET_NAME", "")
 
 if _instagram_secret_name:
@@ -26,6 +27,7 @@ if _instagram_secret_name:
             IG_PAGE_TOKEN = data.get("PAGE_TOKEN") or ""
             VERIFY_TOKEN  = data.get("VERIFY_TOKEN") or ""
             IG_SENDER_ID  = data.get("SENDER_ID") or ""
+            IG_APP_SECRET = data.get("APP_SECRET") or ""
     except Exception as e:
         print(json.dumps({"msg": "instagram_secret_load_failed", "error": repr(e)}))
 # ======================
@@ -40,6 +42,24 @@ def _ok(status=200, body=None, headers=None):
     if headers:
         h.update(headers)
     return {"statusCode": int(status), "headers": h, "body": json.dumps(body or {"ok": True}, ensure_ascii=False)}
+
+
+def _get_header(event: dict, name: str):
+    headers = (event or {}).get("headers") or {}
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _raw_body(event: dict) -> bytes:
+    body = (event or {}).get("body") or ""
+    if (event or {}).get("isBase64Encoded"):
+        try:
+            return base64.b64decode(body, validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            return b""
+    return body.encode("utf-8")
 
 
 # ---------- Instagram Graph helpers ----------
@@ -150,7 +170,7 @@ def _classify_message(m: dict):
 
 # ---------- Dispatcher ----------
 
-def _invoke_async(function_name: str, payload: dict):
+def _invoke_async(function_name: str, payload: dict) -> bool:
     try:
         lambda_client.invoke(
             FunctionName=function_name,
@@ -169,11 +189,11 @@ def _handle_and_dispatch(m: dict):
 
     if not psid:
         log("missing_psid_in_message", m)
-        return
+        return True
 
     # 🚫 Ignorar mensajes enviados por tu propia cuenta (echo)
     if (IG_SENDER_ID and psid == IG_SENDER_ID) or msg.get("is_echo"):
-        return
+        return True
 
     # ----- Referral / postback con referral (ig.me?ref=, Ice Breaker payload "PLAY") -----
     ref = _ref_from_referral(m)
@@ -189,8 +209,7 @@ def _handle_and_dispatch(m: dict):
             "raw_event": m,
         }
         log("dispatching_referral", {"psid": psid, "ref": ref, "username_at": username_at})
-        _invoke_async(ASSIGN_LAMBDA, normalized_event)
-        return
+        return _invoke_async(ASSIGN_LAMBDA, normalized_event)
 
     # Texto plano = código de partida (p. ej. QR no envía referral con el chat ya abierto)
     if not (msg.get("quick_reply") or {}).get("payload"):
@@ -206,13 +225,12 @@ def _handle_and_dispatch(m: dict):
                 "raw_event": m,
             }
             log("dispatching_text_join", {"psid": psid, "game_id": token, "username_at": username_at})
-            _invoke_async(ASSIGN_LAMBDA, normalized_event)
-            return
+            return _invoke_async(ASSIGN_LAMBDA, normalized_event)
 
     kind, data = _classify_message(m)
 
     if kind == "other":
-        return
+        return True
 
     if kind == "quiz_answer":
         normalized_event = {
@@ -222,10 +240,18 @@ def _handle_and_dispatch(m: dict):
             "raw_event": m,
         }
         log("dispatching_quiz_answer", {"psid": psid, "quizPayload": str(data)[:120]})
-        _invoke_async(QUIZ_LAMBDA, normalized_event)
-        return
+        return _invoke_async(QUIZ_LAMBDA, normalized_event)
 
     log("unhandled_kind", {"kind": kind})
+    return True
+
+
+def _has_valid_signature(event: dict) -> bool:
+    signature = _get_header(event, "X-Hub-Signature-256") or ""
+    if not IG_APP_SECRET or not signature.startswith("sha256="):
+        return False
+    expected = hmac.new(IG_APP_SECRET.encode("utf-8"), _raw_body(event), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature[7:], expected)
 
 
 # ---------- Lambda handler ----------
@@ -251,13 +277,26 @@ def lambda_handler(event, context):
             log("webhook_verify_missing_challenge", {"qs": qs})
             return {"statusCode": 400, "headers": JSON_HEADERS, "body": "missing challenge"}
 
-        if VERIFY_TOKEN and verify != VERIFY_TOKEN:
+        if not VERIFY_TOKEN:
+            log("webhook_verify_missing_token")
+            return {"statusCode": 503, "headers": JSON_HEADERS, "body": "verification unavailable"}
+        if verify != VERIFY_TOKEN:
             log("webhook_bad_verify_token", {"provided": verify})
             return {"statusCode": 403, "headers": JSON_HEADERS, "body": "bad verify token"}
 
         log("webhook_verified")
         # Instagram/Facebook espera texto plano con el challenge
         return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": str(challenge)}
+
+    if method != "POST":
+        return {"statusCode": 405, "headers": JSON_HEADERS, "body": "method not allowed"}
+
+    if not IG_APP_SECRET:
+        log("webhook_missing_app_secret")
+        return _ok(503, {"received": False})
+    if not _has_valid_signature(event):
+        log("webhook_invalid_signature")
+        return _ok(401, {"received": False})
 
     # POST: eventos IG
     try:
@@ -274,14 +313,18 @@ def lambda_handler(event, context):
 
         # Recorremos mensajes
         count = 0
+        failed = 0
         for entry in entries:
             for m in (entry.get("messaging") or []):
                 count += 1
-                _handle_and_dispatch(m)
+                if not _handle_and_dispatch(m):
+                    failed += 1
 
+        if failed:
+            log("webhook_dispatch_failed", {"events": count, "failed": failed})
+            return _ok(503, {"received": False, "events": count, "failed": failed})
         return _ok(200, {"received": True, "events": count})
 
     except Exception as e:
         log("webhook_error", {"error": repr(e)})
-        # Facebook recomienda responder 200 para no reintentar en bucle si ya logueamos
-        return _ok(200, {"received": False})
+        return _ok(500, {"received": False})

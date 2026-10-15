@@ -197,6 +197,12 @@ def _get_quiz_meta(game_id: str):
     return item.get("quizOrder", []) or [], item.get("quizQuestions", {}) or {}, item
 
 
+def _is_game_owner(event: dict, game: dict) -> bool:
+    claims = (event.get("requestContext") or {}).get("authorizer") or {}
+    claims = (claims.get("jwt") or {}).get("claims") or claims.get("claims") or {}
+    return bool(claims.get("sub") and claims["sub"] == game.get("ownerUserId"))
+
+
 def _prepare_quiz_for_existing_players(game_id: str, game_type_upper: str):
     if not game_type_upper:
         raise ValueError("Missing gameType")
@@ -386,15 +392,20 @@ def lambda_handler(event, context):
     # ========== SQS MODE ==========
     # Triggered by StandProdQuizQueue; each record carries a quiz_start payload.
     if isinstance(event, dict) and "Records" in event:
-        results = []
+        batch_item_failures = []
         for record in event["Records"]:
             try:
                 inner = json.loads(record.get("body") or "{}")
-                results.append(lambda_handler(inner, context))
+                result = lambda_handler(inner, context)
+                if isinstance(result, dict) and result.get("ok") is False:
+                    batch_item_failures.append({"itemIdentifier": record["messageId"]})
             except Exception as e:
                 log("sqs_record_error", {"error": repr(e)})
-                results.append({"ok": False, "error": repr(e)})
-        return {"ok": True, "processed": len(event["Records"]), "results": results}
+                message_id = record.get("messageId")
+                if not message_id:
+                    raise
+                batch_item_failures.append({"itemIdentifier": message_id})
+        return {"batchItemFailures": batch_item_failures}
 
     # ========== HTTP MODE ==========
     if isinstance(event, dict) and ("httpMethod" in event or "requestContext" in event):
@@ -412,6 +423,8 @@ def lambda_handler(event, context):
             quiz_order, quiz_questions, meta = _get_quiz_meta(game_id)
             if not meta:
                 return _resp(404, {"ok": False, "error": "GameNotFound"})
+            if not _is_game_owner(event, meta):
+                return _resp(403, {"ok": False, "error": "Forbidden"})
 
             game_type = (meta.get("gameType") or "").upper() or "UNKNOWN"
             gk = game_type.upper()
@@ -500,6 +513,8 @@ def lambda_handler(event, context):
             quiz_order, quiz_questions, meta = _get_quiz_meta(game_id)
             if not meta:
                 return _resp(404, {"ok": False, "error": "GameNotFound"})
+            if not _is_game_owner(event, meta):
+                return _resp(403, {"ok": False, "error": "Forbidden"})
 
             try:
                 _save_quiz_meta(game_id, questions)

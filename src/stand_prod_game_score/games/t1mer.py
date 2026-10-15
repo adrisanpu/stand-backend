@@ -1,4 +1,5 @@
 # games/t1mer.py
+import math
 from datetime import datetime, timezone
 from decimal import Decimal
 from boto3.dynamodb.conditions import Key
@@ -94,9 +95,11 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         return {"ok": False, "error": "invalid_playerId", "message": "playerId debe ser numérico."}
 
     try:
-        timer_float = float(str(timer_raw).strip())
+        submitted_timer = float(str(timer_raw).strip())
     except Exception:
         return {"ok": False, "error": "invalid_timer", "message": "timer debe ser un número (segundos)."}
+    if not math.isfinite(submitted_timer) or submitted_timer < 0:
+        return {"ok": False, "error": "invalid_timer", "message": "timer debe ser un número finito no negativo."}
 
     try:
         score_int = int(score_raw)
@@ -117,7 +120,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         UpdateExpression="SET #type.#g.timer = :t, #type.#g.score = :s, #type.#g.scoreUpdatedAt = :ts",
         ExpressionAttributeNames={"#type": "type", "#g": gk},
         ExpressionAttributeValues={
-            ":t": Decimal(str(timer_float)),
+            ":t": Decimal(str(submitted_timer)),
             ":s": Decimal(int(score_int)),
             ":ts": now,
         },
@@ -170,7 +173,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         "gameId": game_id,
         "playerId": player_id,
         "username": item.get("instagramUsername", ""),
-        "timer": timer_float,
+        "timer": submitted_timer,
         "score": score_int,
         "scoreUpdatedAt": now,
         "rank": rank,
