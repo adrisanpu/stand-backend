@@ -127,6 +127,7 @@ def handle_checkout(event: dict):
             client_reference_id=user_id,
             customer_email=email if email else None,
             metadata={"userId": user_id},
+            idempotency_key=idempotency_key,
         )
 
         # Guardamos sessionId (debug)

@@ -14,10 +14,47 @@ from unittest.mock import MagicMock
 # ---------------------------------------------------------------------------
 boto3_stub = MagicMock()
 sys.modules.setdefault("boto3", boto3_stub)
+sys.modules.setdefault("stripe", MagicMock())
 sys.modules.setdefault("botocore", MagicMock())
-sys.modules.setdefault("botocore.exceptions", MagicMock())
-sys.modules.setdefault("boto3.dynamodb", MagicMock())
+botocore_exceptions = types.ModuleType("botocore.exceptions")
+
+
+class ClientError(Exception):
+    def __init__(self, response, operation_name=""):
+        super().__init__(response.get("Error", {}).get("Message", "AWS client error"))
+        self.response = response
+        self.operation_name = operation_name
+
+
+botocore_exceptions.ClientError = ClientError
+sys.modules.setdefault("botocore.exceptions", botocore_exceptions)
+
+boto3_dynamodb = types.ModuleType("boto3.dynamodb")
+boto3_dynamodb.__path__ = []
+sys.modules.setdefault("boto3.dynamodb", boto3_dynamodb)
 sys.modules.setdefault("boto3.dynamodb.conditions", MagicMock())
+boto3_dynamodb_types = types.ModuleType("boto3.dynamodb.types")
+
+
+class TypeSerializer:
+    def serialize(self, value):
+        if isinstance(value, bool):
+            return {"BOOL": value}
+        if isinstance(value, str):
+            return {"S": value}
+        if isinstance(value, (int, float)):
+            return {"N": str(value)}
+        if value is None:
+            return {"NULL": True}
+        if isinstance(value, dict):
+            return {"M": {key: self.serialize(item) for key, item in value.items()}}
+        if isinstance(value, list):
+            return {"L": [self.serialize(item) for item in value]}
+        raise TypeError(f"Unsupported DynamoDB test value: {type(value).__name__}")
+
+
+boto3_dynamodb_types.TypeSerializer = TypeSerializer
+sys.modules.setdefault("boto3.dynamodb.types", boto3_dynamodb_types)
 
 # ---------------------------------------------------------------------------
 # 2. Add the Lambda Layer (stand_common) to sys.path so imports resolve

@@ -24,6 +24,8 @@ ALLOWED_CONTENT_TYPES = {
 }
 
 PRESIGNED_URL_TTL = 3600  # 1 hour
+MAX_PDF_SIZE = 20 * 1024 * 1024
+MAX_MEDIA_SIZE = 30 * 1024 * 1024
 
 
 def lambda_handler(event, context):
@@ -80,6 +82,8 @@ def lambda_handler(event, context):
         # Generate presigned URLs
         upload_urls = []
         for file_info in files:
+            if not isinstance(file_info, dict):
+                return _resp(400, {"error": "Each file entry must be an object."})
             file_name = (file_info.get("fileName") or "").strip()
             content_type = (file_info.get("contentType") or "").strip()
 
@@ -92,16 +96,22 @@ def lambda_handler(event, context):
                     "allowedTypes": sorted(ALLOWED_CONTENT_TYPES),
                 })
 
+            size_bytes = file_info.get("sizeBytes")
+            max_size = MAX_PDF_SIZE if content_type == "application/pdf" else MAX_MEDIA_SIZE
+            if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or not 1 <= size_bytes <= max_size:
+                return _resp(400, {"error": f"sizeBytes must be between 1 and {max_size}."})
+
             key = f"infocards/{game_id}/{uuid.uuid4()}-{file_name}"
 
             try:
-                presigned_url = s3.generate_presigned_url(
-                    "put_object",
-                    Params={
-                        "Bucket": INFOCARDS_BUCKET,
-                        "Key": key,
-                        "ContentType": content_type,
-                    },
+                upload = s3.generate_presigned_post(
+                    Bucket=INFOCARDS_BUCKET,
+                    Key=key,
+                    Fields={"Content-Type": content_type},
+                    Conditions=[
+                        {"Content-Type": content_type},
+                        ["content-length-range", 1, max_size],
+                    ],
                     ExpiresIn=PRESIGNED_URL_TTL,
                 )
             except ClientError as e:
@@ -110,7 +120,8 @@ def lambda_handler(event, context):
 
             upload_urls.append({
                 "key": key,
-                "url": presigned_url,
+                "url": upload["url"],
+                "fields": upload["fields"],
                 "fileName": file_name,
                 "expiresIn": PRESIGNED_URL_TTL,
             })

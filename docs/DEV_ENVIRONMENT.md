@@ -37,9 +37,13 @@ Create secrets (Stripe **test mode** keys recommended for dev):
 | Secret name | Contents |
 |-------------|----------|
 | `stand/dev/stripe` | Stripe secret key (test) |
-| `stand/dev/instagram` | Instagram page token (optional; only if testing webhooks/DMs) |
+| `stand/dev/instagram` | Instagram page token and sender ID; include `VERIFY_TOKEN` and Meta app `APP_SECRET` to enable verified webhooks |
 
 Same JSON shape as the prod secrets under `stand/prod/*`.
+
+The Instagram webhook rejects POSTs unless `APP_SECRET` is present and the
+`X-Hub-Signature-256` matches the raw request body. Its GET verification also
+requires a configured `VERIFY_TOKEN`; missing values fail closed.
 
 ## 2. Cognito App Client (dev)
 
