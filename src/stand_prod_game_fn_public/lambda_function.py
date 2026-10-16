@@ -3,6 +3,12 @@ import json
 from decimal import Decimal
 
 import boto3
+from stand_common.stack import (
+    game_config as stack_game_config,
+    public_assignment as stack_public_assignment,
+    response_status as stack_response_status,
+    get_ranking as stack_ranking,
+)
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import (
@@ -149,6 +155,14 @@ def _handle_get_game(event):
     }
     if game_type == "T1MER":
         payload["ranking"] = _t1mer_ranking(game_id, 10)
+    elif game_type == "STACK":
+        try:
+            payload["stackConfig"] = stack_game_config(item)
+        except ValueError:
+            return _resp(400, {"ok": False, "error": "InvalidStackConfig"})
+        payload["ranking"] = stack_ranking(game_id, gp_table, 10)["results"]
+        payload["stackStartSnapshot"] = True
+        payload["stackFinishSupported"] = True
 
     return _resp(200, _json_sanitize(payload))
 
@@ -213,7 +227,7 @@ def _handle_join(event):
 
 
 def _get_player(game_id: str, player_id: int) -> dict | None:
-    resp = gp_table.get_item(Key={"gameId": game_id, "playerId": int(player_id)})
+    resp = gp_table.get_item(Key={"gameId": game_id, "playerId": int(player_id)}, ConsistentRead=True)
     return resp.get("Item")
 
 
@@ -386,14 +400,18 @@ def _t1mer_assignment_from_player(player: dict) -> dict:
 
 
 def _invoke_score_store(game_id: str, player_id: int, timer, score) -> dict:
+    return _invoke_score_payload({
+        "gameId": game_id,
+        "playerId": player_id,
+        "timer": timer,
+        "score": score,
+    })
+
+
+def _invoke_score_payload(payload: dict) -> dict:
     event = {
         "requestContext": {"http": {"method": "POST"}},
-        "body": json.dumps({
-            "gameId": game_id,
-            "playerId": player_id,
-            "timer": timer,
-            "score": score,
-        }, ensure_ascii=False),
+        "body": json.dumps(payload, ensure_ascii=False),
     }
     resp = lambda_client.invoke(
         FunctionName=SCORE_LAMBDA,
@@ -413,11 +431,17 @@ def _invoke_score_store(game_id: str, player_id: int, timer, score) -> dict:
 
 def _handle_score(event):
     body = _read_json_body(event)
-    if body is None:
+    if not isinstance(body, dict):
         return _resp(400, {"ok": False, "error": "InvalidJson"})
 
-    game_id = (body.get("gameId") or "").strip()
-    player_token = (body.get("playerToken") or "").strip()
+    game_id = body.get("gameId")
+    player_token = body.get("playerToken")
+    if not isinstance(game_id, str):
+        return _resp(400, {"ok": False, "error": "InvalidGameId"})
+    game_id = game_id.strip()
+    if not isinstance(player_token, str):
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    player_token = player_token.strip()
     timer = body.get("timer")
     score = body.get("score")
 
@@ -425,7 +449,7 @@ def _handle_score(event):
         return _resp(400, {"ok": False, "error": "InvalidGameId"})
     if not player_token:
         return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
-    if timer is None or score is None:
+    if body.get("action") is None and (timer is None or score is None):
         return _resp(400, {"ok": False, "error": "MissingFields"})
 
     claims = verify_player_token(player_token, PLAYER_TOKEN_SECRET)
@@ -441,13 +465,31 @@ def _handle_score(event):
     if not meta.get("isActive", True):
         return _resp(403, {"ok": False, "error": "GameInactive"})
     game_type = (meta.get("gameType") or "").upper()
-    if game_type != "T1MER":
+    if game_type not in ("T1MER", "STACK"):
         return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
 
     player = _get_player(game_id, claims["playerId"])
     if not player:
-        return _resp(403, {"ok": False, "error": "PlayerNotFound"})
+        return _resp(404 if game_type == "STACK" else 403, {"ok": False, "error": "PlayerNotFound"})
 
+    if game_type == "STACK":
+        allowed = {"gameId", "playerToken", "action", "attemptId"}
+        if body.get("action") == "finish":
+            allowed.add("placements")
+        if set(body) - allowed:
+            return _resp(400, {"ok": False, "error": "InvalidStackFields"})
+        payload = {
+            "gameId": game_id,
+            "playerId": claims["playerId"],
+            "action": body.get("action"),
+            "attemptId": body.get("attemptId"),
+        }
+        if body.get("action") == "finish":
+            payload["placements"] = body.get("placements")
+        result = _invoke_score_payload(payload)
+        return _resp(stack_response_status(result), _json_sanitize(result))
+    if timer is None or score is None:
+        return _resp(400, {"ok": False, "error": "MissingFields"})
     result = _invoke_score_store(game_id, claims["playerId"], timer, score)
     status = 200 if result.get("ok") else 400
     return _resp(status, _json_sanitize(result))
@@ -475,6 +517,11 @@ def _handle_get_player(event):
         prizes = _empareja2_prizes(player, claims["gameId"], claims["playerId"])
     elif game_type == "T1MER":
         assignment = _t1mer_assignment_from_player(player)
+        prizes = []
+    elif game_type == "STACK":
+        if not meta.get("isActive", True):
+            return _resp(403, {"ok": False, "error": "GameInactive"})
+        assignment = stack_public_assignment(player, gp_table)
         prizes = []
     else:
         assignment = None

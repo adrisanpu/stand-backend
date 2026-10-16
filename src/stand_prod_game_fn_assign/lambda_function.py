@@ -275,8 +275,9 @@ def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
     try:
         kwargs = {
             "KeyConditionExpression": Key("gameId").eq(game_id),
-            "ProjectionExpression": "gameId, playerId, email, instagramUsername, instagramPSID, joinedAt, validated, validationCode, #type",
+            "ProjectionExpression": "gameId, playerId, email, instagramUsername, instagramProfilePicUrl, instagramPSID, joinedAt, validated, validationCode, #type",
             "ExpressionAttributeNames": {"#type": "type"},
+            "ConsistentRead": True,
         }
         while True:
             page = gp_table.query(**kwargs)
@@ -310,7 +311,7 @@ def _normalize_instagram_handle(raw: str | None) -> str | None:
     return s or None
 
 
-WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER"})
+WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK"})
 
 
 def _empareja2_web_assignment(player: dict) -> dict:
@@ -356,6 +357,9 @@ def _t1mer_web_assignment(player: dict) -> dict:
 def _web_assignment(game_type: str, player: dict) -> dict:
     if game_type == "EMPAREJA2":
         return _empareja2_web_assignment(player)
+    if game_type == "STACK":
+        from stand_common.stack import public_assignment
+        return public_assignment(player, gp_table)
     return _t1mer_web_assignment(player)
 
 

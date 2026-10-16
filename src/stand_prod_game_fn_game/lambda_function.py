@@ -5,6 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
+from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import (
@@ -39,7 +40,7 @@ gp_table = dynamodb.Table(GAMEPLAYER_TABLE)
 catalog_table = dynamodb.Table(CATALOG_TABLE)
 
 # ========= CONST =========
-SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS", "IMPOSTOR"}
+SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS", "IMPOSTOR", "STACK"}
 
 JOIN_CODE_MAX_ATTEMPTS = 10
 
@@ -253,6 +254,8 @@ def _handle_get(event):
             payload["settings"] = {"l3tras": (item.get("type") or {}).get("L3TRAS") or {}}
         elif (item.get("gameType") or "").upper() == "IMPOSTOR":
             payload["settings"] = {"impostor": (item.get("type") or {}).get("IMPOSTOR") or {}}
+        elif (item.get("gameType") or "").upper() == "STACK":
+            payload["game"]["type"] = {"STACK": stack_game_config(item)}
         return _resp(200, payload)
 
     # ---------------- 2) gameName (optional) ----------------
@@ -337,6 +340,8 @@ def _handle_get(event):
             payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
         elif game_type == "IMPOSTOR":
             payload["settings"] = {"impostor": (item.get("type") or {}).get("IMPOSTOR") or {}}
+        elif game_type == "STACK":
+            payload["game"]["type"] = {"STACK": stack_game_config(item)}
         return _resp(200, payload)
     
     # ---------------- 3) & 4) list user's games ----------------
@@ -401,6 +406,20 @@ def _handle_post(event):
             "error": f"Unsupported gameType '{game_type_raw}'.",
             "supportedGameTypes": sorted(SUPPORTED_GAME_TYPES),
         })
+
+    stack_config = None
+    if game_type == "STACK":
+        settings = body.get("settings", {})
+        if not isinstance(settings, dict):
+            return _resp(400, {"error": "settings must be an object."})
+        if "stack" in settings and not isinstance(settings["stack"], dict):
+            return _resp(400, {"error": "settings.stack must be an object."})
+        if (body.get("joinChannel") or "web") != "web":
+            return _resp(400, {"error": "STACK only supports joinChannel 'web'."})
+        try:
+            stack_config = validate_stack_config(settings.get("stack"))
+        except ValueError as exc:
+            return _resp(400, {"error": str(exc)})
 
     # Plan enforcement: FREE => only 1 game
     user_item = _get_user(owner_user_id)
@@ -471,9 +490,12 @@ def _handle_post(event):
             item["quizOrder"] = quiz_order
             item["quizQuestions"] = quiz_questions
 
-        if game_type in ("EMPAREJA2", "T1MER"):
+        if game_type in ("EMPAREJA2", "T1MER", "STACK"):
             item["joinChannel"] = (body.get("joinChannel") or "web").strip().lower()
             item["participantFields"] = body.get("participantFields") or default_participant_fields(game_type)
+        if game_type == "STACK":
+            item["type"] = {"STACK": stack_config}
+            item["requiresValidation"] = False
         
         try:
             games_table.put_item(
@@ -523,11 +545,16 @@ def _handle_put(event):
 
     is_active = body.get("isActive", None)
     settings = body.get("settings") or {}
+    if not isinstance(settings, dict):
+        return _resp(400, {"error": "settings must be an object."})
+    if "stack" in settings and not isinstance(settings["stack"], dict):
+        return _resp(400, {"error": "settings.stack must be an object."})
     empareja2_settings = settings.get("empareja2")
     raffle_settings = settings.get("raffle")
     prize_update = settings.get("prizeDelivered")
     l3tras_settings = settings.get("l3tras")
     impostor_settings = settings.get("impostor")
+    stack_settings = settings.get("stack")
     participant_fields = body.get("participantFields")
     join_channel = body.get("joinChannel")
 
@@ -539,10 +566,11 @@ def _handle_put(event):
         and not prize_update
         and not l3tras_settings
         and not impostor_settings
+        and stack_settings is None
         and participant_fields is None
         and join_channel is None
     ):
-        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', 'settings.impostor', 'settings.prizeDelivered', 'participantFields', or 'joinChannel'."})
+        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', 'settings.impostor', 'settings.stack', 'settings.prizeDelivered', 'participantFields', or 'joinChannel'."})
 
     now = _iso_now()
 
@@ -557,6 +585,25 @@ def _handle_put(event):
         return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+
+    stack_config = None
+    if stack_settings is not None:
+        if (item.get("gameType") or "").upper() != "STACK":
+            return _resp(400, {"error": "settings.stack is only valid for STACK games."})
+        try:
+            stack_config = validate_stack_config(stack_settings, base=stack_game_config(item))
+        except ValueError as exc:
+            return _resp(400, {"error": str(exc)})
+    if (item.get("gameType") or "").upper() == "STACK" and join_channel is not None:
+        if join_channel != "web":
+            return _resp(400, {"error": "STACK only supports joinChannel 'web'."})
+
+    if stack_config is not None:
+        set_game_type_blob(
+            games_table, game_id, "STACK", stack_config, updated_at=now,
+            condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
+            condition_values={":owner": owner_user_id},
+        )
 
     if participant_fields is not None:
         if not isinstance(participant_fields, dict):

@@ -7,6 +7,8 @@ import boto3
 from stand_common.utils import log, _json_sanitize, _resp
 
 import games.t1mer as t1mer
+import games.stack as stack
+from stand_common.stack import response_status as stack_response_status, get_ranking as stack_ranking
 
 # ===== ENV =====
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -45,15 +47,21 @@ def _method(event):
 
 
 def _get_game_meta(game_id: str):
-    resp = games_table.get_item(Key={"gameId": game_id})
+    resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
     return resp.get("Item")
 
 
 # -------------------- POST: store score --------------------
 def _handle_post(event):
     body = _parse_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
 
-    game_id = (body.get("gameId") or "").strip().upper()
+    if not body.get("gameId"):
+        return _resp(400, {"ok": False, "error": "MissingGameId"})
+    if not isinstance(body.get("gameId"), str):
+        return _resp(400, {"ok": False, "error": "InvalidGameId"})
+    game_id = body["gameId"].strip().upper()
     if not game_id:
         return _resp(400, {"ok": False, "error": "MissingGameId"})
 
@@ -84,6 +92,10 @@ def _handle_post(event):
 
         return _resp(200 if result.get("ok") else 400, result)
 
+    if game_type == "STACK":
+        result = stack.store_score(game_id, gp_table, body, meta)
+        return _resp(stack_response_status(result), _json_sanitize(result))
+
     return _resp(400, {"ok": False, "error": "UnsupportedGame", "message": f"{game_type} no soporta score."})
 
 
@@ -111,6 +123,9 @@ def _handle_get(event):
         return _resp(500, {"ok": False, "error": "MissingGameType"})
 
     log("score_get_request", {"gameId": game_id, "gameType": game_type, "limit": limit})
+
+    if game_type == "STACK":
+        return _resp(200, _json_sanitize(stack_ranking(game_id, gp_table, limit)))
 
     if game_type == "T1MER":
         result = t1mer.get_ranking(

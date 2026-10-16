@@ -181,6 +181,7 @@ GAME_DISPLAY_NAMES = {
     "SEMAFORO": "SEMAFORO",
     "INFOCARDS": "INFOCARDS",
     "IMPOSTOR": "IMPOSTOR",
+    "STACK": "STACK",
 }
 
 
@@ -220,7 +221,7 @@ def mask_email(email: str) -> str:
 
 
 def default_participant_fields(game_type: str) -> dict:
-    if (game_type or "").upper() in ("EMPAREJA2", "T1MER"):
+    if (game_type or "").upper() in ("EMPAREJA2", "T1MER", "STACK"):
         return {"email": {"required": True}, "instagram": {"required": False}}
     return {"email": {"required": False}, "instagram": {"required": True}}
 
