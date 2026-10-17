@@ -1000,6 +1000,7 @@ def _handle_redeem(event):
         rank = next((entry["rank"] for entry in ranking if entry["playerId"] == player_id), None)
         if not _stack_ranking_prize_eligible(meta, rank):
             return _resp(400, {"ok": False, "error": "NotEligible"})
+        prize = (_public_prize_catalog(meta) or {}).get("ranking")
         try:
             gp_table.update_item(
                 Key={"gameId": game_id, "playerId": int(player_id)},
@@ -1022,6 +1023,7 @@ def _handle_redeem(event):
         return _resp(200, _json_sanitize({
             "ok": True, "gameId": game_id, "playerId": player_id, "kind": "ranking",
             "delivered": True, "label": _player_display_label(player),
+            "prize": prize,
         }))
 
     if kind == "v":
@@ -1041,6 +1043,7 @@ def _handle_redeem(event):
     else:
         return _resp(400, {"ok": False, "error": "NotEligible"})
 
+    prize = (_public_prize_catalog(meta) or {}).get(kind_out)
     try:
         _set_prize_delivered(game_id, player_id, "EMPAREJA2", attr)
     except ClientError as e:
@@ -1054,6 +1057,7 @@ def _handle_redeem(event):
         "kind": kind_out,
         "delivered": True,
         "label": _player_display_label(player),
+        "prize": prize,
     }))
 
 

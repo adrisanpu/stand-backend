@@ -107,6 +107,15 @@ def test_validator_redeems_ranking_prize_atomically():
     assert "#type.#g.#attempt.#status = :finished" in write["ConditionExpression"]
 
 
+def test_validator_returns_redeemed_prize_with_fresh_image():
+    prize = {"name": "Consola", "limit": 3, "topX": 5, "imageUrl": "https://media.example/prize"}
+    with patch.object(public_mod, "_public_prize_catalog", return_value={"ranking": prize}) as catalog:
+        response, _ = redeem()
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["prize"] == prize
+    catalog.assert_called_once_with(META)
+
+
 @pytest.mark.parametrize("rank,kind", [(6, "k"), (4, "k"), (None, "k"), (1, "v"), (1, "r")])
 def test_validator_rechecks_eligibility_not_just_signed_token(rank, kind):
     response, table = redeem(rank=rank, kind=kind)

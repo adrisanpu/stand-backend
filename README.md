@@ -337,6 +337,10 @@ prize configuration, then conditionally sets
 `type.STACK.rankingPrizeDelivered = true`. Duplicate/concurrent scans return
 409 `AlreadyDelivered`; ineligible claims return 400 `NotEligible`. A claim
 does not reserve a future rank: eligibility is checked again at collection.
+
+Successful redemption responses also include `prize`: the redeemed catalog entry
+with a fresh signed `imageUrl`, or `null` for legacy prizes without catalog data.
+The QR validator shows its image and name above the delivery confirmation.
 Player responses retain delivered claims even if the rank later changes.
 
 #### Configuration

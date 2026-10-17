@@ -645,6 +645,7 @@ def test_redeem_validation_happy():
     body = json.loads(resp["body"])
     assert body["ok"] is True
     assert body["kind"] == "validation"
+    assert body["prize"] is None
     assert mock_gp.update_item.call_count == 3
 
 
