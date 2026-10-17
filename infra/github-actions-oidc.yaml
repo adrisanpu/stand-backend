@@ -76,6 +76,17 @@ Resources:
                   - sns:*
                   - cognito-idp:DescribeUserPoolClient
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:SetDefaultPolicyVersion
+                  - iam:TagPolicy
+                  - iam:UntagPolicy
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/stand-dev-game-role-policy"
 
 Outputs:
   RoleArn:
