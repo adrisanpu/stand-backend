@@ -13,11 +13,24 @@ from stand_common.stack import response_status as stack_response_status, get_ran
 # ===== ENV =====
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
+USER_MEDIA_BUCKET = os.environ.get("USER_MEDIA_BUCKET", "")
 # ==============
 
 dynamo_r = boto3.resource("dynamodb")
+s3 = boto3.client("s3")
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
+
+
+def _player_profile_pic_url(player: dict) -> str | None:
+    photo_key = player.get("participantPhotoKey")
+    if photo_key:
+        if not USER_MEDIA_BUCKET:
+            raise RuntimeError("Missing USER_MEDIA_BUCKET for participant photo")
+        return s3.generate_presigned_url(
+            "get_object", Params={"Bucket": USER_MEDIA_BUCKET, "Key": photo_key}, ExpiresIn=3600,
+        )
+    return (player.get("instagramProfilePicUrl") or "").strip() or None
 
 
 def _parse_body(event):
@@ -125,7 +138,9 @@ def _handle_get(event):
     log("score_get_request", {"gameId": game_id, "gameType": game_type, "limit": limit})
 
     if game_type == "STACK":
-        return _resp(200, _json_sanitize(stack_ranking(game_id, gp_table, limit)))
+        return _resp(200, _json_sanitize(
+            stack_ranking(game_id, gp_table, limit, profile_pic_url_fn=_player_profile_pic_url)
+        ))
 
     if game_type == "T1MER":
         result = t1mer.get_ranking(
@@ -134,6 +149,7 @@ def _handle_get(event):
             gp_table=gp_table,
             limit=limit,
             log_fn=log,
+            profile_pic_url_fn=_player_profile_pic_url,
         )
         return _resp(200, result)
 

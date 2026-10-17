@@ -275,8 +275,8 @@ def verify_player_token(token: str, secret: str) -> dict | None:
     return {"gameId": gid, "playerId": int(pid)}
 
 
-# Prize kinds: "v" = validation, "r" = raffle
-PRIZE_KINDS = frozenset({"v", "r"})
+# Prize kinds: "v" = validation, "r" = raffle, "k" = ranking
+PRIZE_KINDS = frozenset({"v", "r", "k"})
 
 
 # ---------- Personal access links (Instagram -> mobile) ----------
@@ -338,7 +338,7 @@ def verify_access_token(token, secret: str) -> tuple[dict | None, str | None]:
 def issue_prize_token(
     game_id: str, player_id: int, kind: str, secret: str, ttl_seconds: int = 604800
 ) -> str:
-    """HMAC prize claim token. kind is 'v' (validation) or 'r' (raffle). Default TTL 7 days."""
+    """HMAC claim for validation ('v'), raffle ('r') or ranking ('k'). Default TTL 7 days."""
     k = (kind or "").strip().lower()
     if k not in PRIZE_KINDS:
         raise ValueError(f"invalid prize kind: {kind}")

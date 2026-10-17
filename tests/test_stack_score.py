@@ -501,3 +501,15 @@ def test_ranking_all_pages_descending_deterministic_ties_safe_display():
     table.query.side_effect = deepcopy(pages)
     all_results = get_ranking("ABCDEF", table, None)["results"]
     assert [p["playerId"] for p in all_results] == [9, 7, 5, 3, 4, 13, 6]
+
+
+def test_ranking_uses_profile_photo_resolver():
+    table = MagicMock()
+    player = ranked_player(9, 10, instagramUsername="ana")
+    player["participantPhotoKey"] = "players/ABCDEF/9/profile.png"
+    table.query.return_value = {"Items": [player]}
+    result = get_ranking(
+        "ABCDEF", table, 10,
+        profile_pic_url_fn=lambda item: f"signed:{item['participantPhotoKey']}",
+    )["results"]
+    assert result[0]["profilePicUrl"] == "signed:players/ABCDEF/9/profile.png"

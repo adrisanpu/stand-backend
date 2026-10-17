@@ -180,6 +180,11 @@ Resources:
               - s3:GetObject
               - s3:PutObject
             Resource: !Sub "${UserMediaBucket.Arn}/games/*"
+          - Sid: S3ParticipantPhotosRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${UserMediaBucket.Arn}/players/*"
           - Sid: S3StagedPrizeImageTags
             Effect: Allow
             Action:
@@ -227,6 +232,15 @@ Resources:
                 Condition:
                   StringEquals:
                     ses:FromAddress: !Ref EmailSenderAddress
+        - PolicyName: ParticipantPhotoUploads
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: UploadParticipantPhotos
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${UserMediaBucket.Arn}/players/*"
 
   StandAssignRole:
     Type: AWS::IAM::Role
@@ -552,7 +566,7 @@ Resources:
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
-            AllowedMethods: [PUT, GET, DELETE]
+            AllowedMethods: [PUT, POST, GET, DELETE]
             AllowedOrigins: ["*"]
             MaxAge: 3600
 
@@ -830,6 +844,14 @@ Resources:
             Method: POST
             Auth:
               Authorizer: NONE
+        PublicPlayerPhotoPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/player/photo
+            Method: POST
+            Auth:
+              Authorizer: NONE
         PublicAccessPost:
           Type: HttpApi
           Properties:
@@ -872,6 +894,7 @@ Resources:
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Events:
         ScoreGet:
           Type: HttpApi

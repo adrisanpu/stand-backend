@@ -52,6 +52,16 @@ def registration_values(meta, body):
             if not value:
                 raise RegistrationError("missing_instagram")
         values[name] = value
+    if not fields["instagram"]["required"]:
+        raw = body.get("username")
+        if raw is not None and not isinstance(raw, str):
+            raise RegistrationError("invalid_username")
+        username = (raw or "").strip()
+        if not username:
+            raise RegistrationError("missing_username")
+        if len(username) > 100 or re.search(r"[\x00-\x1f\x7f-\x9f]", username):
+            raise RegistrationError("invalid_username")
+        values["username"] = username
     return values
 
 

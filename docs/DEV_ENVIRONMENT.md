@@ -96,11 +96,12 @@ Both stacks use `StageName: prod` (literal) on HTTP APIs so CloudFormation keeps
 
 Follow [EMAIL_SETUP.md](EMAIL_SETUP.md) to provision the **single shared**
 `playstand.app` SES identity in **us-east-1**, publish its DNS records, verify
-`no-reply@playstand.app`, and prepare sending/monitoring. No transactional
-provider is currently configured; adding parameters alone does not enable
+`contact@playstand.app` for dev, and prepare sending/monitoring. Adding
+parameters alone does not enable
 delivery. Do not create duplicate domain identities in dev/prod stacks.
-`samconfig.toml` explicitly supplies `EmailSenderAddress=no-reply@playstand.app`
-and `EmailIdentityName=playstand.app` for both environments.
+`samconfig.toml` explicitly supplies `EmailSenderAddress=contact@playstand.app`
+for dev, `EmailSenderAddress=no-reply@playstand.app` for prod, and
+`EmailIdentityName=playstand.app` for both environments.
 
 The backend adds `stand-dev-email-verification-table` (and the corresponding
 prod table), with string key `id` and numeric epoch-seconds `expiresAt` TTL for

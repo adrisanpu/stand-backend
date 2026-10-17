@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import uuid
 from decimal import Decimal
 
 import boto3
@@ -43,6 +45,12 @@ VALIDATE_LAMBDA = os.environ.get("VALIDATE_LAMBDA", "")
 SCORE_LAMBDA = os.environ.get("SCORE_LAMBDA", "")
 PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
 INSTAGRAM_DM_HANDLE = os.environ.get("INSTAGRAM_DM_HANDLE", "playstand_")
+PARTICIPANT_PHOTO_MAX_SIZE = 5 * 1024 * 1024
+PARTICIPANT_PHOTO_TYPES = {
+    "image/jpeg": ("jpg", b"\xff\xd8\xff"),
+    "image/png": ("png", b"\x89PNG\r\n\x1a\n"),
+    "image/webp": ("webp", b"RIFF"),
+}
 
 dynamo_r = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
@@ -72,10 +80,25 @@ def _player_display_label(player: dict) -> str:
     ig = (player.get("instagramUsername") or "").strip()
     if ig:
         return ig if ig.startswith("@") else f"@{ig}"
+    username = (player.get("username") or "").strip()
+    if username:
+        return username
     email = (player.get("email") or "").strip()
     if email:
         return mask_email(email)
     return f"Jugador {player.get('playerId', '')}"
+
+
+def _player_profile_pic_url(player: dict) -> str | None:
+    photo_key = player.get("participantPhotoKey")
+    if photo_key:
+        bucket = os.environ.get("USER_MEDIA_BUCKET")
+        if not bucket:
+            raise RuntimeError("Missing USER_MEDIA_BUCKET for participant photo")
+        return boto3.client("s3").generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": photo_key}, ExpiresIn=3600,
+        )
+    return (player.get("instagramProfilePicUrl") or "").strip() or None
 
 
 def _get_game(game_id: str) -> dict | None:
@@ -145,7 +168,7 @@ def _t1mer_ranking(game_id: str, limit: int = 10) -> list[dict]:
         ranking.append({
             "playerId": pid,
             "username": it.get("instagramUsername") or _player_display_label(it),
-            "profilePicUrl": (it.get("instagramProfilePicUrl") or "").strip() or None,
+            "profilePicUrl": _player_profile_pic_url(it),
             "timer": timer_f,
             "score": score_f,
         })
@@ -226,7 +249,9 @@ def _handle_get_game(event):
             payload["stackConfig"] = stack_game_config(item)
         except ValueError:
             return _resp(400, {"ok": False, "error": "InvalidStackConfig"})
-        payload["ranking"] = stack_ranking(game_id, gp_table, 10)["results"]
+        payload["ranking"] = stack_ranking(
+            game_id, gp_table, 10, profile_pic_url_fn=_player_profile_pic_url,
+        )["results"]
         payload["stackStartSnapshot"] = True
         payload["stackFinishSupported"] = True
     if game_type in {"EMPAREJA2", "T1MER", "STACK"}:
@@ -236,7 +261,7 @@ def _handle_get_game(event):
 
 
 def _invoke_assign_web(game_id: str, email: str | None, instagram_username: str | None, phone: str | None = None,
-                       verification: str | None = None) -> dict:
+                       verification: str | None = None, username: str | None = None) -> dict:
     payload = {
         "source": "web",
         "game_id": game_id,
@@ -246,6 +271,8 @@ def _invoke_assign_web(game_id: str, email: str | None, instagram_username: str 
     }
     if verification:
         payload["email_verification"] = verification
+    if username:
+        payload["username"] = username
     resp = lambda_client.invoke(
         FunctionName=ASSIGN_LAMBDA,
         InvocationType="RequestResponse",
@@ -362,6 +389,7 @@ def _handle_join(event):
             result = _invoke_assign_web(
                 game_id, values.get("email"), values.get("instagram"), values.get("phone"),
                 verification=receipt,
+                username=values.get("username"),
             )
         else:
             if body.get("consent") is not True:
@@ -369,7 +397,10 @@ def _handle_join(event):
             values = registration_values(meta, {
                 **body, "instagram": body.get("instagram") or body.get("instagramUsername"),
             })
-            result = _invoke_assign_web(game_id, values.get("email"), values.get("instagram"), values.get("phone"))
+            result = _invoke_assign_web(
+                game_id, values.get("email"), values.get("instagram"), values.get("phone"),
+                username=values.get("username"),
+            )
     except RegistrationError as exc:
         return _resp(400, {"ok": False, "error": str(exc)})
     except VerificationError as exc:
@@ -379,12 +410,21 @@ def _handle_join(event):
             **result, "ok": False, "error": result.get("reason", "JoinFailed"),
         })
 
+    assignment = result.get("assignment")
+    player_token = result.get("playerToken")
+    claims = verify_player_token(player_token, PLAYER_TOKEN_SECRET) if isinstance(player_token, str) else None
+    if isinstance(assignment, dict) and claims:
+        player = _get_player(claims["gameId"], claims["playerId"])
+        if player:
+            assignment["profilePicUrl"] = _player_profile_pic_url(player)
+            assignment.setdefault("participantName", _player_display_label(player))
+
     return _resp(200, _json_sanitize({
         "ok": True,
         "gameId": game_id,
         "gameType": result.get("gameType"),
         "playerToken": result.get("playerToken"),
-        "assignment": result.get("assignment"),
+        "assignment": assignment,
         "alreadyJoined": bool(result.get("already_joined")),
     }))
 
@@ -503,6 +543,8 @@ def _empareja2_assignment_from_player(player: dict) -> dict | None:
                 log("character_image_url_error", {"error": str(exc)})
     return {
         "playerId": player.get("playerId"),
+        "participantName": _player_display_label(player),
+        "profilePicUrl": _player_profile_pic_url(player),
         "characterId": blob.get("characterId"),
         "characterName": cname,
         "partnerCharacterName": blob.get("partnerCharacterName"),
@@ -555,12 +597,34 @@ def _set_prize_delivered(game_id: str, player_id: int, game_type: str, attr: str
     )
 
 
+def _stack_ranking_prize_eligible(meta: dict, rank) -> bool:
+    prize = (meta.get("prizeCatalog") or {}).get("ranking") or {}
+    top_x, limit = prize.get("topX"), prize.get("limit")
+    return bool(
+        rank is not None and top_x is not None and rank >= 1 and rank <= top_x
+        and (limit is None or rank <= limit)
+        and (prize.get("name") or prize.get("imageKey"))
+    )
+
+
+def _stack_prizes(meta: dict, player: dict, rank) -> list[dict]:
+    blob = get_game_type_blob(player, "STACK")
+    delivered = bool(blob.get("rankingPrizeDelivered"))
+    if not delivered and not _stack_ranking_prize_eligible(meta, rank):
+        return []
+    return [{
+        "kind": "ranking",
+        "token": issue_prize_token(player["gameId"], player["playerId"], "k", PLAYER_TOKEN_SECRET),
+        "delivered": delivered,
+    }]
+
+
 def _t1mer_assignment_from_player(player: dict) -> dict:
     code = player.get("validationCode")
     blob = (player.get("type") or {}).get("T1MER") or {}
     score_raw = blob.get("score")
     timer_raw = blob.get("timer")
-    pic = (player.get("instagramProfilePicUrl") or "").strip() or None
+    pic = _player_profile_pic_url(player)
     out = {
         "playerId": player.get("playerId"),
         "displayName": _player_display_label(player),
@@ -674,6 +738,122 @@ def _handle_score(event):
     return _resp(status, _json_sanitize(result))
 
 
+def _participant_photo_type_is_valid(image_type: str, data: bytes) -> bool:
+    if image_type == "image/webp":
+        return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    signature = PARTICIPANT_PHOTO_TYPES.get(image_type)
+    return bool(signature and data.startswith(signature[1]))
+
+
+def _handle_player_photo(event):
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+
+    token = body.get("playerToken")
+    claims = verify_player_token(token.strip(), PLAYER_TOKEN_SECRET) if isinstance(token, str) else None
+    if not claims:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+
+    game_id = claims["gameId"]
+    player_id = claims["playerId"]
+    player = _get_player(game_id, player_id)
+    if not player:
+        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+    if player.get("joinSource") != "web":
+        return _resp(403, {"ok": False, "error": "WebPhotoUploadOnly"})
+    action = body.get("action")
+    existing_photo_key = player.get("participantPhotoKey")
+    if existing_photo_key:
+        if action == "complete" and body.get("photoKey") == existing_photo_key:
+            return _resp(200, {
+                "ok": True,
+                "profilePicUrl": _player_profile_pic_url({"participantPhotoKey": existing_photo_key}),
+            })
+        return _resp(409, {"ok": False, "error": "PhotoAlreadyUploaded"})
+
+    bucket = os.environ.get("USER_MEDIA_BUCKET")
+    if not bucket:
+        return _resp(503, {"ok": False, "error": "PhotoStorageUnavailable"})
+
+    s3 = boto3.client("s3")
+    if action == "upload-url":
+        image_type = body.get("contentType")
+        size_bytes = body.get("sizeBytes")
+        if image_type not in PARTICIPANT_PHOTO_TYPES:
+            return _resp(400, {"ok": False, "error": "UnsupportedPhotoType"})
+        if (isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+                or size_bytes <= 0 or size_bytes > PARTICIPANT_PHOTO_MAX_SIZE):
+            return _resp(400, {"ok": False, "error": "InvalidPhotoSize"})
+
+        extension = PARTICIPANT_PHOTO_TYPES[image_type][0]
+        key = f"players/{game_id}/{int(player_id)}/profile-{uuid.uuid4()}.{extension}"
+        upload = s3.generate_presigned_post(
+            Bucket=bucket,
+            Key=key,
+            Fields={"Content-Type": image_type},
+            Conditions=[
+                {"Content-Type": image_type},
+                ["content-length-range", 1, PARTICIPANT_PHOTO_MAX_SIZE],
+            ],
+            ExpiresIn=300,
+        )
+        return _resp(200, {
+            "ok": True,
+            "uploadUrl": upload["url"],
+            "uploadFields": upload["fields"],
+            "photoKey": key,
+        })
+
+    if action != "complete":
+        return _resp(400, {"ok": False, "error": "InvalidPhotoAction"})
+
+    photo_key = body.get("photoKey")
+    prefix = f"players/{game_id}/{int(player_id)}/profile-"
+    match = re.fullmatch(
+        re.escape(prefix) + r"([0-9a-f-]{36})\.(jpg|png|webp)",
+        photo_key if isinstance(photo_key, str) else "",
+    )
+    if not match:
+        return _resp(400, {"ok": False, "error": "InvalidPhotoKey"})
+    try:
+        uuid.UUID(match.group(1))
+    except ValueError:
+        return _resp(400, {"ok": False, "error": "InvalidPhotoKey"})
+
+    try:
+        uploaded = s3.head_object(Bucket=bucket, Key=photo_key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
+            return _resp(400, {"ok": False, "error": "PhotoNotUploaded"})
+        raise
+
+    image_type = (uploaded.get("ContentType") or "").strip().lower()
+    expected_extension = PARTICIPANT_PHOTO_TYPES.get(image_type, (None, None))[0]
+    size_bytes = uploaded.get("ContentLength")
+    if (expected_extension is None or not photo_key.endswith(f".{expected_extension}")
+            or isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+            or size_bytes <= 0 or size_bytes > PARTICIPANT_PHOTO_MAX_SIZE):
+        return _resp(400, {"ok": False, "error": "InvalidPhoto"})
+
+    image = s3.get_object(Bucket=bucket, Key=photo_key, Range="bytes=0-11")
+    body_stream = image["Body"]
+    try:
+        image_header = body_stream.read(12)
+    finally:
+        body_stream.close()
+    if not _participant_photo_type_is_valid(image_type, image_header):
+        return _resp(400, {"ok": False, "error": "InvalidPhoto"})
+
+    gp_table.update_item(
+        Key={"gameId": game_id, "playerId": int(player_id)},
+        UpdateExpression="SET participantPhotoKey = :key",
+        ConditionExpression="attribute_exists(playerId) AND attribute_not_exists(participantPhotoKey)",
+        ExpressionAttributeValues={":key": photo_key},
+    )
+    return _resp(200, {"ok": True, "profilePicUrl": _player_profile_pic_url({"participantPhotoKey": photo_key})})
+
+
 def _player_response(meta: dict, player: dict, game_id: str, player_id: int, token: str):
     """Shared PlayerResponse: {ok, gameId, gameType, playerToken, assignment, prizes}."""
     game_type = (meta.get("gameType") or "").upper()
@@ -686,8 +866,8 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
     elif game_type == "STACK":
         if not meta.get("isActive", True):
             return _resp(403, {"ok": False, "error": "GameInactive"})
-        assignment = stack_public_assignment(player, gp_table)
-        prizes = []
+        assignment = stack_public_assignment(player, gp_table, _player_profile_pic_url)
+        prizes = _stack_prizes(meta, player, assignment.get("rank"))
     else:
         assignment = None
         prizes = []
@@ -802,14 +982,47 @@ def _handle_redeem(event):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (meta.get("gameType") or "").upper()
-    if game_type != "EMPAREJA2":
+    if game_type not in {"EMPAREJA2", "STACK"}:
         return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
 
     player = _get_player(game_id, player_id)
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
 
-    blob = (player.get("type") or {}).get("EMPAREJA2") or {}
+    blob = get_game_type_blob(player, game_type)
+
+    if game_type == "STACK":
+        if kind != "k":
+            return _resp(400, {"ok": False, "error": "NotEligible"})
+        if blob.get("rankingPrizeDelivered"):
+            return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "ranking"})
+        ranking = stack_ranking(game_id, gp_table, None)["results"]
+        rank = next((entry["rank"] for entry in ranking if entry["playerId"] == player_id), None)
+        if not _stack_ranking_prize_eligible(meta, rank):
+            return _resp(400, {"ok": False, "error": "NotEligible"})
+        try:
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": int(player_id)},
+                UpdateExpression="SET #type.#g.#delivered = :yes",
+                ConditionExpression=(
+                    "attribute_exists(playerId) AND #type.#g.#attempt.#status = :finished "
+                    "AND (attribute_not_exists(#type.#g.#delivered) OR #type.#g.#delivered = :no)"
+                ),
+                ExpressionAttributeNames={
+                    "#type": "type", "#g": "STACK", "#delivered": "rankingPrizeDelivered",
+                    "#attempt": "attempt", "#status": "status",
+                },
+                ExpressionAttributeValues={":yes": True, ":no": False, ":finished": "finished"},
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "ranking"})
+            log("public_redeem_failed", {"error": str(exc), "gameId": game_id, "playerId": player_id})
+            return _resp(500, {"ok": False, "error": "UpdateFailed"})
+        return _resp(200, _json_sanitize({
+            "ok": True, "gameId": game_id, "playerId": player_id, "kind": "ranking",
+            "delivered": True, "label": _player_display_label(player),
+        }))
 
     if kind == "v":
         if not player.get("validated"):
@@ -818,13 +1031,15 @@ def _handle_redeem(event):
             return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "validation"})
         attr = "validationPrizeDelivered"
         kind_out = "validation"
-    else:
+    elif kind == "r":
         if not blob.get("raffleWin"):
             return _resp(400, {"ok": False, "error": "NotEligible"})
         if blob.get("prizeDelivered"):
             return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "raffle"})
         attr = "prizeDelivered"
         kind_out = "raffle"
+    else:
+        return _resp(400, {"ok": False, "error": "NotEligible"})
 
     try:
         _set_prize_delivered(game_id, player_id, "EMPAREJA2", attr)
@@ -859,6 +1074,8 @@ def lambda_handler(event, context):
             return _handle_validate(event)
         if path.endswith("/player") and method in ("GET", "POST"):
             return _handle_get_player(event)
+        if path.endswith("/player/photo") and method == "POST":
+            return _handle_player_photo(event)
         if path.endswith("/access") and method == "POST":
             return _handle_access(event)
         if path.endswith("/redeem") and method == "POST":

@@ -86,15 +86,18 @@ def display_name(player: dict) -> str:
     if isinstance(username, str) and username.strip() and "@" not in username.strip().lstrip("@"):
         username = username.strip()
         return username if username.startswith("@") else f"@{username}"
+    name = (player.get("username") or "").strip()
+    if name:
+        return name
     return f"Jugador {player.get('playerId', '')}"
 
 
-def public_assignment(player: dict, gp_table=None) -> dict:
+def public_assignment(player: dict, gp_table=None, profile_pic_url_fn=None) -> dict:
     blob = get_game_type_blob(player, "STACK")
     attempt = blob.get("attempt")
     ig = (player.get("instagramUsername") or "").strip()
     email = (player.get("email") or "").strip()
-    display = (ig if ig.startswith("@") else f"@{ig}") if ig else (
+    display = (ig if ig.startswith("@") else f"@{ig}") if ig else (player.get("username") or "").strip() or (
         mask_email(email) if email else f"Jugador {player.get('playerId', '')}"
     )
     result = {
@@ -103,7 +106,10 @@ def public_assignment(player: dict, gp_table=None) -> dict:
         "displayName": display,
         "attempt": None,
     }
-    pic = (player.get("instagramProfilePicUrl") or "").strip()
+    pic = (
+        profile_pic_url_fn(player) if profile_pic_url_fn
+        else (player.get("instagramProfilePicUrl") or "").strip()
+    )
     if pic:
         result["profilePicUrl"] = pic
     if attempt:
@@ -169,7 +175,8 @@ def replay(placements: list, snapshot: dict) -> tuple[int, float, str]:
     return score, minimum, digest.hexdigest()
 
 
-def get_ranking(game_id: str, gp_table, limit: int | None = 10) -> dict:
+def get_ranking(game_id: str, gp_table, limit: int | None = 10,
+                profile_pic_url_fn=None) -> dict:
     """Read every page before sorting; never limit the candidate set by player ID."""
     entries, last = [], None
     while True:
@@ -191,7 +198,10 @@ def get_ranking(game_id: str, gp_table, limit: int | None = 10) -> dict:
                 continue
             entries.append((finished, {
                 "playerId": int(pid), "username": display_name(player),
-                "profilePicUrl": (player.get("instagramProfilePicUrl") or "").strip() or None,
+                "profilePicUrl": (
+                    profile_pic_url_fn(player) if profile_pic_url_fn
+                    else (player.get("instagramProfilePicUrl") or "").strip() or None
+                ),
                 "score": int(score), "finishedAt": attempt["finishedAt"],
             }))
         last = page.get("LastEvaluatedKey")
