@@ -56,6 +56,244 @@ The game table (`stand-prod-game-table` in prod, `stand-dev-game-table` in dev) 
 
 ## Adding a new backend game (lean checklist)
 
+### Independent gameplay and participant access
+
+Game CRUD and public metadata expose `playMode: "master" | "mobile"` independently
+of `joinChannel: "instagram" | "web"`. The former selects where gameplay/validation
+happens; the latter selects the QR destination (Instagram DM or the web form).
+Updates validate compatibility before writing and persist the two access fields
+together in one conditional update. Other game settings can be saved without
+overwriting either access field.
+
+| Games | Allowed play modes | Allowed join channels |
+| --- | --- | --- |
+| EMPAREJA2, T1MER | master, mobile | instagram, web (all four combinations) |
+| STACK | mobile | instagram, web |
+| L3TRAS, RULET4, CUPIDO, SEMAFORO, INFOCARDS, IMPOSTOR | master | instagram |
+
+Legacy records without `playMode` retain the previous behavior: EMPAREJA2/T1MER
+infer mobile from web access and master from Instagram; missing channels default
+to web for these games and STACK, and Instagram for the remaining games. No table
+migration is necessary. Explicit saves persist both fields. Public mobile score
+and validation actions reject master-mode campaigns; authenticated operator
+endpoints remain available for master gameplay.
+
+For Instagram/mobile campaigns, the existing assignment and optional quiz flow
+sends a personal **Jugar ahora** button for the same PSID/player. Repeating the
+game code reissues a link without registering a second player or resetting a
+STACK attempt. The link has a 15-minute default lifetime (bounded to 1–60 minutes
+through `ACCESS_LINK_TTL_SECONDS`) and contains a purpose-separated signed
+credential in its URL fragment, never in a public QR. Only a random nonce hash
+and issuance timestamp are retained on the existing player record.
+
+`POST /v1/public/access` accepts `{ "gameId": "...", "accessToken": "..." }`.
+It checks the signature, expiration, game/player, mobile configuration and PSID identity
+and quiz completion, then conditionally consumes the nonce exactly once and
+returns the existing `PlayerResponse` session/assignment/prizes shape. Superseded
+or used links return 409, expired links 410, and invalid/mismatched credentials
+403. `POST /v1/public/player` accepts `{ "gameId": "...", "playerToken": "..." }`
+for session recovery without query-string credentials; the old GET remains for
+compatibility. Opening or exchanging a link never starts an attempt.
+
+EMPAREJA2 assignments returned by web registration, session recovery and personal
+access exchange include nullable `characterImageUrl` and `partnerCharacterImageUrl`.
+Both use signed URLs for the corresponding character's PNG in `CHAR_BUCKET`;
+the partner field is additive and may be absent in older responses. The participant
+screen uses it for the mission thumbnail. Deploy the backend before the frontend
+that displays this thumbnail.
+
+EMPAREJA2 public game metadata also returns nullable `clientLogoUrl`: a signed URL
+for the game owner's selected client logo, without exposing media history or owner
+details. If no logo is selected, the participant uses the game logo. The public
+Lambda reads the owner's media selection from `USERS_TABLE` and signs only keys
+under that owner's `users/{owner}/logos/` prefix in `USER_MEDIA_BUCKET`; its role
+has read-only object access to logo prefixes. Deploy the updated SAM template
+alongside the Lambda before the frontend.
+
+`PUT /v1/user/media` also accepts `{ "kind": "appearance", "appearance":
+{ "colors": { "primary": "#112233", "accent": "#445566" }, "themeMode": "dark" } }`.
+Colors must be six-digit hex; use `colors: null` for the game's default palette,
+and `themeMode` is `dark` or `light`. The authenticated owner's media document
+stores the selection; GET media and EMPAREJA2/T1MER/STACK public game metadata return it as
+`appearance`. Old events without a saved appearance return default dark/game
+colors. Existing browser-only palettes need one new save to publish them.
+
+**Deployment configuration:** provide a private `PlayerTokenSecret` of at least
+32 characters through the authorized deployment configuration; it has no public
+default in SAM and is shared by assignment, quiz and public API through Globals.
+Personal access fails closed with 503 if the signing configuration is missing
+or too short. Do not commit a secret to `samconfig.toml`. Reuse a sufficiently
+strong existing secret where available; rotating a key invalidates existing
+participant/prize sessions and requires coordinated rollout. `PublicAppOrigin`
+must point to the matching frontend environment (`samconfig.toml` distinguishes
+dev and prod); personal links require HTTPS except localhost development.
+
+Publish the compatible backend before the frontend. Automated tests cover the
+contracts and DM payloads offline; actual Instagram button delivery, fragment
+preservation in its in-app browser and the quiz-to-mobile journey still require
+an authorized test event before release. This change does not itself deploy
+either application or modify any configured secrets.
+
+### Configurable web registration fields (`/play`)
+
+For EMPAREJA2, T1MER and STACK, game POST/PUT accepts `participantFields`:
+
+```json
+{
+  "email": { "required": true },
+  "instagram": { "required": false },
+  "phone": { "required": false }
+}
+```
+
+`required: true` means **request and require** the field; `false` means **do not
+request or store** it. There is no optional-but-requested state. Missing
+configuration/keys use the defaults shown above (including legacy records without
+phone). PUT replaces the field configuration, filling omitted keys from defaults,
+not from the previous configuration. Only these three field names and boolean
+`required` values are accepted; malformed configuration returns 400 before writes.
+Operator game responses and `GET /v1/public/game?gameId=...` expose the resolved
+configuration, including phone.
+
+`POST /v1/public/join` accepts `gameId`, `consent: true`, and only enabled fields:
+`email`, `instagram` (legacy alias `instagramUsername` accepted), and `phone`.
+Required fields must be non-empty strings. Email retains its format validation and
+is lowercased; Instagram is trimmed and stored with one leading `@`; phone is
+trimmed and stored as the top-level player `phone` string, preserving `+`, spacing
+and punctuation (no country-specific format restriction). Disabled incoming values
+are ignored, including malformed values, and never persisted. Errors include
+`missing_email`, `invalid_email`, `missing_instagram`, `invalid_instagram`,
+`missing_phone` and `invalid_phone` (HTTP 400).
+
+An enabled email retains existing duplicate-registration recovery after email
+verification (see below). Without email,
+joins create distinct players; Instagram/phone are not substitute deduplication
+keys. Keep the returned `playerToken` for session recovery. All fields may be
+disabled. Existing stored contact data is not retroactively removed by config
+changes. Instagram DM registration remains PSID-based and does not require these
+web form fields; Instagram-only campaigns still reject public web joins.
+
+### Email verification for web registration
+
+When email is requested, first call `POST /v1/public/email/request` with the same
+registration fields (`gameId`, `consent: true`, enabled contact fields), plus
+`language: "es" | "en"`. Its response is:
+
+```json
+{
+  "ok": true,
+  "challengeId": "...",
+  "emailMasked": "p***@example.com",
+  "expiresAt": "2026-10-17T12:00:00Z",
+  "resendAvailableAt": "2026-10-17T11:51:00Z"
+}
+```
+
+Both timestamps are ISO 8601. Submit the registration to `/v1/public/join` with
+the returned `challengeId` and the emailed `code`. Email-enabled joins, including
+duplicate-registration recovery, require verification before a participant
+session can be issued; the successful join response is unchanged. Resending uses
+the request endpoint again after `resendAvailableAt`. Do not log codes, full
+email addresses, participant tokens or request bodies.
+
+Verification uses SES in `us-east-1`, from `no-reply@playstand.app`, and
+`stand-{prod|dev}-email-verification-table` (string PK `id`, on-demand billing).
+Pending challenges and rate counters use numeric epoch-seconds `expiresAt` TTL;
+TTL cleanup is asynchronous, so expiry must also be enforced by application code.
+Permanent HMAC-keyed verified-email-to-player mappings intentionally omit
+`expiresAt`. Assignment atomically creates the player and identity mapping and
+increments the game's player count, preventing concurrent duplicate registrations.
+Repeating the same correctly verified challenge before its original expiry
+returns the same participant without consuming another slot or starting an
+attempt; it cannot authorize a different registration.
+Only public/assign receive `EMAIL_VERIFICATION_TABLE`. The public Lambda alone
+can send email, restricted to the configured identity and From address. Both
+dedicated roles retain the existing game managed policy to preserve public
+session, assignment, media and game behavior; the shared game role receives no
+new verification-table or SES permissions.
+
+Public limits default to `EMAIL_MAX_PER_HOUR=5` per email,
+`EMAIL_IP_MAX_PER_HOUR=3000` per source IP, and
+`EMAIL_GLOBAL_MAX_PER_HOUR=20000` per environment. These abuse controls do not
+replace SES account quotas (shared by dev/prod). Existing valid sessions,
+Instagram registration and no-email web registration do not require an email
+challenge. The existing private `PlayerTokenSecret` also derives a
+purpose-separated verification key; no new committed secret is needed.
+
+**Release gate:** set up and verify the shared sender using
+[docs/EMAIL_SETUP.md](docs/EMAIL_SETUP.md) before enabling email registration.
+The identity is managed once by `infra/email-sender.yaml`, never once per
+dev/prod stack. Deploy the compatible backend before the new UI, but coordinate
+the breaking email-enabled join contract: old forms cannot submit email joins
+without a code. Use a maintenance window/controlled event and refresh cached
+clients rather than leaving old email forms live. No automatic production
+deployment or SES provisioning is performed by this change.
+
+### Approved prize PNG catalog
+
+Authenticated `PUT /v1/game` accepts a `prizeCatalog` replacement:
+
+```json
+{
+  "gameId": "ABC123",
+  "prizeCatalog": {
+    "validation": { "name": "Gift", "limit": 10, "imageKey": "games/..." },
+    "ranking": { "name": "Top prize", "limit": null, "topX": 3, "imageKey": null },
+    "raffle": { "name": "Raffle prize", "limit": 5, "imageKey": null }
+  }
+}
+```
+
+Catalog slots are optional and omitted slots are not configured. Validation is
+available for EMPAREJA2, CUPIDO, SEMAFORO and L3TRAS; ranking for T1MER and
+STACK; raffle prizes retain the existing paid-plan availability. `name` is a
+non-empty string (up to 200 characters), `limit` is a non-negative integer or
+`null`, and ranking `topX` is an integer from 1 to 100. `imageKey` may be
+omitted to preserve that slot's existing image, or set to `null` to remove it.
+Client-supplied URLs and
+unknown catalog fields are rejected. Saving `{}` explicitly stores an empty
+catalog; records without a catalog remain unchanged for legacy compatibility.
+
+`POST /v1/game/prizes?action=upload-url` accepts
+`{ "gameId": "...", "slot": "validation|ranking|raffle", "fileName": "...",
+"contentType": "image/png", "sizeBytes": N }` and returns
+`{ "ok": true, "key": "...", "uploadUrl": "..." }`. The owner and slot/plan
+are checked before issuing a one-hour S3 PUT URL. Uploads are bound to a
+server-generated owner/game/slot key and tagged `staged=true`. Before catalog
+association, the backend checks the stored object's actual size (maximum 5 MiB),
+PNG signature, chunk CRCs, image structure, bounded decompression and scanlines.
+Only verified objects for the same owner, game and slot can be associated.
+Catalog and `EMPAREJA2` `type.EMPAREJA2.maxValidations` (when a validation
+prize is included) are saved in one conditional DynamoDB update. The cap update
+targets only that nested setting (initializing only the required map when absent),
+so unrelated `type` configuration is not rewritten from a read snapshot. A
+`null` validation limit removes the legacy cap in the same update. Invalid images,
+foreign keys and failed writes do not replace the existing catalog. Upload URLs
+write only under `games/staged/`; at save, the backend reads and validates the
+bounded bytes then writes those exact bytes under a new server-generated
+`games/{owner}/{game}/{slot}/...` key. The catalog refers only to that committed
+key, which is never exposed through a client PUT URL. After the catalog commit,
+the staging tag is removed from the source; a seven-day lifecycle rule expires
+only staged-prefix uploads
+that were abandoned before association. If tag removal fails after a successful
+catalog commit, the response includes a `PrizeImageCleanupPending` warning and
+the backend logs the affected key for cleanup.
+
+A user whose plan no longer enables raffles may still save other catalog changes
+when the request includes the unchanged existing raffle entry. Editing, replacing,
+or omitting that raffle entry is rejected until the plan allows raffle edits;
+this prevents an unrelated save from silently deleting previously configured
+raffle data.
+
+Authenticated `GET /v1/game?gameId=...` and `?gameName=...`, public
+`GET /v1/public/game?gameId=...`, and public player responses include the
+optional top-level `prizeCatalog` only after it has been explicitly saved. Each
+configured prize contains its stored fields and an `imageUrl` (a fresh signed
+read URL, or `null` when no image is associated); URLs are never stored as
+catalog data. The player response continues to include all already-awarded
+prizes, including raffle wins. Prize display configuration does not change
+award eligibility, validation, ranking, raffle selection or delivery semantics.
+
 ### STACK: mobile `/play` validated finish and ranking (Phase 3)
 
 STACK is registered for operator CRUD and public web join using the existing
@@ -71,8 +309,9 @@ change does not add frontend changes, TV controls, infrastructure or deployment.
 configuration; operator GET by gameId/gameName returns `game.type.STACK`
 (not `settings.STACK` or `settings.stack`).
 The complete configuration is stored directly in game `type.STACK`, not a
-new table. Only `joinChannel: "web"` is supported. Default participant fields
-require email; Instagram is optional (same signed identity/token helpers).
+new table. `playMode` is always `mobile`; `joinChannel` supports `web` and
+`instagram`. Web registration defaults to required email with Instagram/phone disabled;
+Instagram registration uses the existing PSID identity and personal access flow.
 
 `GET /v1/public/game?gameId=...` returns **`stackConfig`**:
 
@@ -86,12 +325,15 @@ require email; Instagram is optional (same signed identity/token helpers).
   "initialDepth": 2,
   "layerHeight": 0.24,
   "movementRange": 4,
-  "configVersion": "1"
+  "configVersion": "1",
+  "skin": "blocks"
 }
 ```
 
-Only initialSpeed, speedIncrement, maxSpeed and perfectTolerance are editable
-through `settings.stack`. Only finite JSON numbers are accepted (not booleans,
+Only initialSpeed, speedIncrement, maxSpeed, perfectTolerance and skin are editable
+through `settings.stack`. `skin` is purely visual (not used by score replay) and
+must be `blocks`, `pizza` or `baklava`; stored configs without it read as `blocks`.
+Numeric fields accept only finite JSON numbers (not booleans,
 strings or null). Dimensions, movementRange and configVersion are fixed server
 values, not accepted as settings edits. Unknown fields are rejected. Bounds:
 
@@ -162,7 +404,7 @@ extra fields, including supplied score, timer, playerId or configuration.
 Success (HTTP 200), including retry of the **same** attemptId:
 
 ```json
-{"ok":true,"gameId":"ABCDEF","playerId":7,"attemptId":"<same id>","status":"started","configVersion":"1","startedAt":"<server ISO timestamp>","configSnapshot":{"configVersion":"1","initialSpeed":2,"speedIncrement":0.08,"maxSpeed":5,"perfectTolerance":0.06,"initialWidth":3,"initialDepth":2,"layerHeight":0.24,"movementRange":4}}
+{"ok":true,"gameId":"ABCDEF","playerId":7,"attemptId":"<same id>","status":"started","configVersion":"1","startedAt":"<server ISO timestamp>","configSnapshot":{"configVersion":"1","initialSpeed":2,"speedIncrement":0.08,"maxSpeed":5,"perfectTolerance":0.06,"initialWidth":3,"initialDepth":2,"layerHeight":0.24,"movementRange":4,"skin":"blocks"}}
 ```
 
 A single DynamoDB conditional update stores `type.STACK.attempt` only if the

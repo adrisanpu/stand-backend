@@ -56,11 +56,11 @@ def _graph_post(path: str, payload: dict):
             err_body = e.read().decode("utf-8")
         except Exception:
             err_body = "<no body>"
-        log("graph_http_error", {"status": e.code, "path": path, "err_body": err_body[:500]})
+        log("graph_http_error", {"status": e.code, "path": path})
         return False, e.code, err_body
 
     except Exception as e:
-        log("graph_error", {"error": repr(e), "path": path})
+        log("graph_error", {"error": type(e).__name__, "path": path})
         return False, None, None
 
 
@@ -125,6 +125,29 @@ def _build_follow_accounts_template(handles: list) -> dict:
                 "template_type": "generic",
                 "elements": elements
             }
+        }
+    }
+
+
+def _build_access_link_template(url, ttl_minutes) -> dict | None:
+    """Personal one-use access link as a button; the URL is never placed in text or logs."""
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        return None
+    try:
+        minutes = max(1, int(ttl_minutes))
+    except (TypeError, ValueError):
+        minutes = 15
+    return {
+        "attachment": {
+            "type": "template",
+            "payload": {
+                "template_type": "generic",
+                "elements": [{
+                    "title": "📱 Tu acceso personal para jugar",
+                    "subtitle": f"Un solo uso · caduca en {minutes} min · no lo compartas",
+                    "buttons": [{"type": "web_url", "url": url, "title": "Jugar ahora"}],
+                }],
+            },
         }
     }
 
@@ -231,6 +254,19 @@ def lambda_handler(event, context):
             image_url = msg.get("image_url")
             template_type = msg.get("template")
             handles = msg.get("handles") if isinstance(msg.get("handles"), list) else None
+
+            if template_type == "access_link":
+                template_payload = _build_access_link_template(msg.get("url"), msg.get("ttlMinutes"))
+                if psid and template_payload:
+                    r = _send_template_message(psid, template_payload)
+                else:
+                    r = {"ok": False, "error": "invalid_access_link"}
+                if r.get("ok"):
+                    success += 1
+                else:
+                    failed += 1
+                results.append({"psid": psid, **r})
+                continue
 
             # follow_accounts: send Generic Template with one card per handle
             if psid and template_type == "follow_accounts" and handles:

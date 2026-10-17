@@ -9,7 +9,7 @@ from stand_common.stack import (
     response_status as stack_response_status,
     get_ranking as stack_ranking,
 )
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import (
     log,
@@ -22,9 +22,19 @@ from stand_common.utils import (
     issue_prize_token,
     verify_prize_token,
     mask_email,
-    default_participant_fields,
+    normalize_participant_fields,
     is_valid_join_code,
+    issue_player_token,
+    verify_access_token,
+    get_game_type_blob,
 )
+from stand_common.game_access import resolve_game_access
+from stand_common.player_access import consume_access_nonce, require_access_secret
+from stand_common.email_verification import (
+    VerificationError, RegistrationError, registration_values, verification_table,
+    request_code, confirm_code,
+)
+from stand_common.prizes import serialize_prize_catalog
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -32,6 +42,7 @@ ASSIGN_LAMBDA = os.environ.get("ASSIGN_LAMBDA", "")
 VALIDATE_LAMBDA = os.environ.get("VALIDATE_LAMBDA", "")
 SCORE_LAMBDA = os.environ.get("SCORE_LAMBDA", "")
 PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
+INSTAGRAM_DM_HANDLE = os.environ.get("INSTAGRAM_DM_HANDLE", "playstand_")
 
 dynamo_r = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
@@ -70,6 +81,29 @@ def _player_display_label(player: dict) -> str:
 def _get_game(game_id: str) -> dict | None:
     resp = games_table.get_item(Key={"gameId": game_id})
     return resp.get("Item")
+
+
+def _public_prize_catalog(meta: dict):
+    if "prizeCatalog" not in meta:
+        return None
+    return serialize_prize_catalog(
+        meta["prizeCatalog"],
+        meta.get("ownerUserId") or "",
+        meta.get("gameId") or "",
+        os.environ.get("USER_MEDIA_BUCKET", ""),
+        boto3.client("s3").generate_presigned_url,
+    )
+
+
+def _is_mobile_play(meta: dict) -> bool:
+    return resolve_game_access(meta)["playMode"] == "mobile"
+
+
+def _public_join_url(game_id: str, join_channel: str) -> str:
+    """QR/link target: Instagram DM with the game code, or the web form."""
+    if join_channel == "instagram":
+        return f"https://ig.me/m/{INSTAGRAM_DM_HANDLE}?ref={game_id}"
+    return f"/play/{game_id}"
 
 
 def _as_float(x) -> float | None:
@@ -122,6 +156,34 @@ def _t1mer_ranking(game_id: str, limit: int = 10) -> list[dict]:
     return ranking
 
 
+def _client_appearance(game: dict) -> dict:
+    result = {"clientLogoUrl": None, "appearance": {"colors": None, "themeMode": "dark"}}
+    owner = game.get("ownerUserId")
+    bucket = os.environ.get("USER_MEDIA_BUCKET")
+    if not owner:
+        return result
+    user = dynamo_r.Table(os.environ["USERS_TABLE"]).get_item(
+        Key={"userId": owner}, ProjectionExpression="media",
+    ).get("Item") or {}
+    media = user.get("media") or {}
+    result["appearance"] = media.get("appearance") or result["appearance"]
+    logo = media.get("logo") or {}
+    selected = logo.get("selectedId")
+    if not selected:
+        return result
+    item = next((item for item in logo.get("items", []) if item.get("id") == selected), None)
+    key = item.get("key") if item else None
+    if not key or not key.startswith(f"users/{owner}/logos/"):
+        log("public_client_logo_invalid", {"gameId": game.get("gameId")})
+        return result
+    if not bucket:
+        raise ValueError("Missing USER_MEDIA_BUCKET for selected client logo")
+    result["clientLogoUrl"] = boto3.client("s3").generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600,
+    )
+    return result
+
+
 def _handle_get_game(event):
     params = event.get("queryStringParameters") or {}
     game_id = (params.get("gameId") or "").strip()
@@ -135,10 +197,11 @@ def _handle_get_game(event):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (item.get("gameType") or "").upper()
-    pf = item.get("participantFields") or default_participant_fields(game_type)
+    pf = normalize_participant_fields(game_type, item.get("participantFields"))
     recent = item.get("recentPairs") or []
     if not isinstance(recent, list):
         recent = []
+    access = resolve_game_access(item)
 
     payload = {
         "ok": True,
@@ -146,13 +209,16 @@ def _handle_get_game(event):
         "gameName": item.get("gameName"),
         "gameType": item.get("gameType"),
         "isActive": bool(item.get("isActive", True)),
-        "joinChannel": item.get("joinChannel") or "web",
+        "playMode": access["playMode"],
+        "joinChannel": access["joinChannel"],
         "participantFields": pf,
         "playerCount": _as_int(item.get("playersCount")),
         "validatedCount": _as_int(item.get("validatedCount")),
         "recentPairs": recent[-10:],
-        "joinUrl": f"/play/{game_id}",
+        "joinUrl": _public_join_url(game_id, access["joinChannel"]),
     }
+    if "prizeCatalog" in item:
+        payload["prizeCatalog"] = _public_prize_catalog(item)
     if game_type == "T1MER":
         payload["ranking"] = _t1mer_ranking(game_id, 10)
     elif game_type == "STACK":
@@ -163,24 +229,35 @@ def _handle_get_game(event):
         payload["ranking"] = stack_ranking(game_id, gp_table, 10)["results"]
         payload["stackStartSnapshot"] = True
         payload["stackFinishSupported"] = True
+    if game_type in {"EMPAREJA2", "T1MER", "STACK"}:
+        payload.update(_client_appearance(item))
 
     return _resp(200, _json_sanitize(payload))
 
 
-def _invoke_assign_web(game_id: str, email: str, instagram_username: str | None) -> dict:
+def _invoke_assign_web(game_id: str, email: str | None, instagram_username: str | None, phone: str | None = None,
+                       verification: str | None = None) -> dict:
     payload = {
         "source": "web",
         "game_id": game_id,
         "email": email,
         "instagram_username": instagram_username,
+        "phone": phone,
     }
+    if verification:
+        payload["email_verification"] = verification
     resp = lambda_client.invoke(
         FunctionName=ASSIGN_LAMBDA,
         InvocationType="RequestResponse",
         Payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
     )
+    if resp.get("FunctionError"):
+        raise RuntimeError("Assignment Lambda failed")
     raw = resp.get("Payload").read().decode("utf-8")
-    return json.loads(raw) if raw else {"ok": False, "reason": "empty_assign_response"}
+    result = json.loads(raw) if raw else None
+    if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+        raise RuntimeError("Invalid assignment response")
+    return result
 
 
 def _reason_to_status(reason: str) -> int:
@@ -188,33 +265,119 @@ def _reason_to_status(reason: str) -> int:
         "missing_email": 400,
         "invalid_email": 400,
         "missing_instagram": 400,
+        "invalid_instagram": 400,
+        "missing_phone": 400,
+        "invalid_phone": 400,
         "game_not_found": 404,
         "game_inactive": 403,
         "player_limit_reached": 403,
         "unsupported_game_type": 400,
+        "web_join_disabled": 403,
+        "GameNotFound": 404,
+        "GameInactive": 403,
+        "internal_error": 500,
+        "put_failed": 500,
+        "race_condition_retry_exhausted": 503,
+        "VerificationRequired": 403,
+        "VerificationExpired": 410,
+        "VerificationAttemptsExceeded": 429,
+        "VerificationSuperseded": 409,
+        "VerificationUsed": 409,
+        "VerificationUnavailable": 503,
     }.get(reason, 400)
+
+
+def _verification_error(error):
+    payload = {"ok": False, "error": error.code}
+    if error.retry_after is not None:
+        payload["retryAfter"] = error.retry_after
+    return _resp(error.status, payload)
+
+
+def _registration_game(game_id):
+    if not isinstance(game_id, str) or not is_valid_join_code(game_id):
+        raise VerificationError("InvalidGameId", 400)
+    meta = _get_game(game_id)
+    if not meta:
+        raise VerificationError("GameNotFound", 404)
+    if not meta.get("isActive", True):
+        raise VerificationError("GameInactive", 403)
+    if (meta.get("gameType") or "").upper() not in {"EMPAREJA2", "T1MER", "STACK"}:
+        raise VerificationError("unsupported_game_type", 400)
+    if resolve_game_access(meta)["joinChannel"] != "web":
+        raise VerificationError("web_join_disabled", 403)
+    return meta
+
+
+def _handle_email_request(event):
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+    try:
+        game_id = body.get("gameId")
+        meta = _registration_game(game_id)
+        if body.get("consent") is not True:
+            return _resp(400, {"ok": False, "error": "ConsentRequired"})
+        values = registration_values(meta, body)
+        if "email" not in values:
+            return _resp(400, {"ok": False, "error": "EmailNotRequested"})
+        language = body.get("language", "es")
+        if language not in ("es", "en"):
+            return _resp(400, {"ok": False, "error": "InvalidLanguage"})
+        request_context = event.get("requestContext") or {}
+        source_ip = (request_context.get("http") or {}).get("sourceIp") or (
+            request_context.get("identity") or {}
+        ).get("sourceIp")
+        result = request_code(
+            verification_table(dynamo_r), boto3.client("ses"), PLAYER_TOKEN_SECRET,
+            game_id, values, source_ip, language,
+        )
+        return _resp(200, result)
+    except RegistrationError as exc:
+        return _resp(400, {"ok": False, "error": str(exc)})
+    except VerificationError as exc:
+        return _verification_error(exc)
 
 
 def _handle_join(event):
     body = _read_json_body(event)
-    if body is None:
+    if not isinstance(body, dict):
         return _resp(400, {"ok": False, "error": "InvalidJson"})
 
-    game_id = (body.get("gameId") or "").strip()
-    email = (body.get("email") or "").strip()
-    instagram = (body.get("instagram") or body.get("instagramUsername") or "").strip() or None
-    consent = body.get("consent")
-
-    if not game_id or not is_valid_join_code(game_id):
-        return _resp(400, {"ok": False, "error": "InvalidGameId"})
-    if not consent:
-        return _resp(400, {"ok": False, "error": "ConsentRequired"})
     if not ASSIGN_LAMBDA:
         return _resp(500, {"ok": False, "error": "AssignNotConfigured"})
 
-    result = _invoke_assign_web(game_id, email, instagram)
+    try:
+        game_id = body.get("gameId")
+        meta = _registration_game(game_id)
+        fields = normalize_participant_fields(meta["gameType"], meta.get("participantFields"))
+        if fields["email"]["required"]:
+            record, receipt = confirm_code(
+                verification_table(dynamo_r), PLAYER_TOKEN_SECRET, game_id,
+                body.get("challengeId"), body.get("code"),
+            )
+            values = registration_values(meta, record["registration"])
+            if values != record["registration"]:
+                raise VerificationError("VerificationSuperseded", 409)
+            result = _invoke_assign_web(
+                game_id, values.get("email"), values.get("instagram"), values.get("phone"),
+                verification=receipt,
+            )
+        else:
+            if body.get("consent") is not True:
+                return _resp(400, {"ok": False, "error": "ConsentRequired"})
+            values = registration_values(meta, {
+                **body, "instagram": body.get("instagram") or body.get("instagramUsername"),
+            })
+            result = _invoke_assign_web(game_id, values.get("email"), values.get("instagram"), values.get("phone"))
+    except RegistrationError as exc:
+        return _resp(400, {"ok": False, "error": str(exc)})
+    except VerificationError as exc:
+        return _verification_error(exc)
     if not result.get("ok"):
-        return _resp(_reason_to_status(result.get("reason", "")), {"ok": False, **result})
+        return _resp(_reason_to_status(result.get("reason", "")), {
+            **result, "ok": False, "error": result.get("reason", "JoinFailed"),
+        })
 
     return _resp(200, _json_sanitize({
         "ok": True,
@@ -294,6 +457,15 @@ def _handle_validate(event):
     if not claims or claims.get("gameId") != game_id:
         return _resp(403, {"valid": False, "error": "InvalidPlayerToken"})
 
+    meta = _get_game(game_id)
+    if not meta:
+        return _resp(404, {"valid": False, "error": "GameNotFound"})
+    if not meta.get("isActive", True):
+        return _resp(403, {"valid": False, "error": "GameInactive"})
+    # Participant-side validation is a mobile-only action; operator validation is unaffected.
+    if not _is_mobile_play(meta):
+        return _resp(403, {"valid": False, "error": "MobilePlayDisabled"})
+
     player = _get_player(game_id, claims["playerId"])
     if not player:
         return _resp(403, {"valid": False, "error": "PlayerNotFound"})
@@ -314,24 +486,28 @@ def _empareja2_assignment_from_player(player: dict) -> dict | None:
         return None
     cname = blob.get("characterName")
     code = player.get("validationCode")
-    img = None
+    images = {}
     bucket = os.environ.get("CHAR_BUCKET", "")
-    if cname and bucket:
-        try:
-            s3 = boto3.client("s3")
-            img = s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": bucket, "Key": f"{cname}.png"},
-                ExpiresIn=int(os.environ.get("CHAR_URL_TTL", "120")),
-            )
-        except Exception:
-            pass
+    if bucket:
+        s3 = boto3.client("s3")
+        for name in (cname, blob.get("partnerCharacterName")):
+            if not name or name in images:
+                continue
+            try:
+                images[name] = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": bucket, "Key": f"{name}.png"},
+                    ExpiresIn=int(os.environ.get("CHAR_URL_TTL", "120")),
+                )
+            except (ClientError, BotoCoreError, ValueError) as exc:
+                log("character_image_url_error", {"error": str(exc)})
     return {
         "playerId": player.get("playerId"),
         "characterId": blob.get("characterId"),
         "characterName": cname,
         "partnerCharacterName": blob.get("partnerCharacterName"),
-        "characterImageUrl": img,
+        "characterImageUrl": images.get(cname),
+        "partnerCharacterImageUrl": images.get(blob.get("partnerCharacterName")),
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
     }
@@ -467,6 +643,9 @@ def _handle_score(event):
     game_type = (meta.get("gameType") or "").upper()
     if game_type not in ("T1MER", "STACK"):
         return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
+    # Participant score/attempts are mobile-only; the operator score endpoint is unaffected.
+    if not _is_mobile_play(meta):
+        return _resp(403, {"ok": False, "error": "MobilePlayDisabled"})
 
     player = _get_player(game_id, claims["playerId"])
     if not player:
@@ -495,26 +674,12 @@ def _handle_score(event):
     return _resp(status, _json_sanitize(result))
 
 
-def _handle_get_player(event):
-    params = event.get("queryStringParameters") or {}
-    token = (params.get("playerToken") or "").strip()
-    game_id = (params.get("gameId") or "").strip()
-
-    claims = verify_player_token(token, PLAYER_TOKEN_SECRET)
-    if not claims:
-        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
-    if game_id and claims.get("gameId") != game_id:
-        return _resp(403, {"ok": False, "error": "TokenGameMismatch"})
-
-    player = _get_player(claims["gameId"], claims["playerId"])
-    if not player:
-        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
-
-    meta = _get_game(claims["gameId"]) or {}
+def _player_response(meta: dict, player: dict, game_id: str, player_id: int, token: str):
+    """Shared PlayerResponse: {ok, gameId, gameType, playerToken, assignment, prizes}."""
     game_type = (meta.get("gameType") or "").upper()
     if game_type == "EMPAREJA2":
         assignment = _empareja2_assignment_from_player(player)
-        prizes = _empareja2_prizes(player, claims["gameId"], claims["playerId"])
+        prizes = _empareja2_prizes(player, game_id, player_id)
     elif game_type == "T1MER":
         assignment = _t1mer_assignment_from_player(player)
         prizes = []
@@ -527,14 +692,93 @@ def _handle_get_player(event):
         assignment = None
         prizes = []
 
-    return _resp(200, _json_sanitize({
+    payload = {
         "ok": True,
-        "gameId": claims["gameId"],
+        "gameId": game_id,
         "gameType": game_type,
         "playerToken": token,
         "assignment": assignment,
         "prizes": prizes,
-    }))
+    }
+    if "prizeCatalog" in meta:
+        payload["prizeCatalog"] = _public_prize_catalog(meta)
+    return _resp(200, _json_sanitize(payload))
+
+
+def _handle_get_player(event):
+    """GET ?gameId&playerToken (legacy) or POST {gameId, playerToken} (keeps the session out of URLs)."""
+    if _get_http_method(event) == "POST":
+        body = _read_json_body(event)
+        if not isinstance(body, dict):
+            return _resp(400, {"ok": False, "error": "InvalidJson"})
+        params = body
+    else:
+        params = event.get("queryStringParameters") or {}
+    token = params.get("playerToken")
+    game_id = params.get("gameId")
+    token = token.strip() if isinstance(token, str) else ""
+    game_id = game_id.strip() if isinstance(game_id, str) else ""
+
+    claims = verify_player_token(token, PLAYER_TOKEN_SECRET)
+    if not claims:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    if game_id and claims.get("gameId") != game_id:
+        return _resp(403, {"ok": False, "error": "TokenGameMismatch"})
+
+    player = _get_player(claims["gameId"], claims["playerId"])
+    if not player:
+        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+
+    meta = _get_game(claims["gameId"]) or {}
+    return _player_response(meta, player, claims["gameId"], claims["playerId"], token)
+
+
+def _handle_access(event):
+    """POST {gameId, accessToken}: one-use personal link -> participant session (PlayerResponse)."""
+    try:
+        require_access_secret(PLAYER_TOKEN_SECRET)
+    except RuntimeError:
+        log("public_access_not_configured")
+        return _resp(503, {"ok": False, "error": "AccessNotConfigured"})
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+    game_id = body.get("gameId")
+    access_token = body.get("accessToken")
+    game_id = game_id.strip() if isinstance(game_id, str) else ""
+    if not game_id or not is_valid_join_code(game_id):
+        return _resp(400, {"ok": False, "error": "InvalidGameId"})
+
+    claims, error = verify_access_token(access_token.strip() if isinstance(access_token, str) else None,
+                                        PLAYER_TOKEN_SECRET)
+    if error == "AccessTokenExpired":
+        return _resp(410, {"ok": False, "error": "AccessTokenExpired"})
+    if not claims:
+        return _resp(403, {"ok": False, "error": "InvalidAccessToken"})
+    if claims["gameId"] != game_id:
+        return _resp(403, {"ok": False, "error": "TokenGameMismatch"})
+
+    meta = _get_game(game_id)
+    if not meta:
+        return _resp(404, {"ok": False, "error": "GameNotFound"})
+    if not meta.get("isActive", True):
+        return _resp(403, {"ok": False, "error": "GameInactive"})
+    if not _is_mobile_play(meta):
+        return _resp(403, {"ok": False, "error": "MobilePlayDisabled"})
+    player_id = claims["playerId"]
+    player = _get_player(game_id, player_id)
+    if not player:
+        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+    if not player.get("instagramPSID"):
+        return _resp(403, {"ok": False, "error": "InstagramPlayerRequired"})
+    if meta.get("quizOrder") and not get_game_type_blob(player, meta.get("gameType", "")).get("quizCompleted"):
+        return _resp(403, {"ok": False, "error": "QuizIncomplete"})
+    if not consume_access_nonce(gp_table, game_id, player_id, claims["nonce"]):
+        return _resp(409, {"ok": False, "error": "AccessTokenUsed"})
+
+    log("public_access_exchanged", {"gameId": game_id, "playerId": player_id})
+    player_token = issue_player_token(game_id, player_id, PLAYER_TOKEN_SECRET)
+    return _player_response(meta, player, game_id, player_id, player_token)
 
 
 def _handle_redeem(event):
@@ -609,10 +853,14 @@ def lambda_handler(event, context):
             return _handle_get_game(event)
         if path.endswith("/join") and method == "POST":
             return _handle_join(event)
+        if path.endswith("/email/request") and method == "POST":
+            return _handle_email_request(event)
         if path.endswith("/validate") and method == "POST":
             return _handle_validate(event)
-        if path.endswith("/player") and method == "GET":
+        if path.endswith("/player") and method in ("GET", "POST"):
             return _handle_get_player(event)
+        if path.endswith("/access") and method == "POST":
+            return _handle_access(event)
         if path.endswith("/redeem") and method == "POST":
             return _handle_redeem(event)
         if path.endswith("/score") and method == "POST":
@@ -620,5 +868,5 @@ def lambda_handler(event, context):
 
         return _resp(404, {"ok": False, "error": "NotFound"})
     except Exception as e:
-        log("public_internal_error", {"error": repr(e)})
+        log("public_internal_error", {"errorType": type(e).__name__})
         return _resp(500, {"ok": False, "error": "InternalError"})

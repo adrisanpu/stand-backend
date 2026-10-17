@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
+import pytest
 
 ROOT = Path(__file__).parent.parent
 LAMBDA_PATH = ROOT / "src" / "stand_prod_user_fn_media" / "lambda_function.py"
@@ -67,6 +68,40 @@ def test_select_logo_requires_existing_media_id():
         None,
     )
     assert response["statusCode"] == 404
+    table.update_item.assert_not_called()
+
+
+@pytest.mark.parametrize("colors,mode", [
+    ({"primary": "#ff1234", "accent": "#1234FF"}, "light"),
+    (None, "dark"),
+])
+def test_appearance_is_persisted_and_returned_with_media(colors, mode):
+    table = _setup_tables()
+    media = mod._empty_media()
+    media["logo"]["items"] = [{"id": "client", "key": "users/user-1/logos/logo.png"}]
+    media["logo"]["selectedId"] = "client"
+    table.get_item.return_value = {"Item": {"userId": "user-1", "media": media}}
+    appearance = {"colors": colors, "themeMode": mode}
+    response = mod.lambda_handler(_event("PUT", {"kind": "appearance", "appearance": appearance}), None)
+    assert response["statusCode"] == 200
+    saved = table.update_item.call_args.kwargs["ExpressionAttributeValues"][":media"]
+    assert saved["appearance"] == appearance
+    assert saved["logo"] == media["logo"]
+    table.get_item.return_value = {"Item": {"userId": "user-1", "media": saved}}
+    response = mod.lambda_handler(_event("GET"), None)
+    assert json.loads(response["body"])["appearance"] == appearance
+
+
+@pytest.mark.parametrize("appearance", [
+    None, {}, {"themeMode": "invalid"},
+    {"themeMode": "dark", "colors": {"primary": "#123456"}},
+    {"themeMode": "dark", "colors": {"primary": "red", "accent": "#123456"}},
+    {"themeMode": "dark", "colors": {"primary": "#123456", "accent": 123}},
+])
+def test_appearance_rejects_invalid_values_without_writes(appearance):
+    table = _setup_tables()
+    response = mod.lambda_handler(_event("PUT", {"kind": "appearance", "appearance": appearance}), None)
+    assert response["statusCode"] == 400
     table.update_item.assert_not_called()
 
 

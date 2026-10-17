@@ -50,11 +50,18 @@ def operator_event(body, **query):
     {"initialDepth": 0}, {"layerHeight": 0}, {"movementRange": 3},
     {"version": 1}, {"version": "2"}, {"unknown": 1}, [],
     {"configVersion": "1"}, {"initialWidth": 3}, {"initialDepth": 2},
-    {"layerHeight": 0.24}, {"movementRange": 4},
+    {"layerHeight": 0.24}, {"movementRange": 4}, {"skin": "donut"}, {"skin": None}, {"skin": 1},
 ])
 def test_config_rejects_invalid_fields(config):
     with pytest.raises(ValueError):
         validate_config(config)
+
+
+def test_config_skin_is_editable_and_legacy_configs_default_to_blocks():
+    assert validate_config({"skin": "baklava"})["skin"] == "baklava"
+    legacy = {key: value for key, value in DEFAULT_CONFIG.items() if key != "skin"}
+    assert game_config({"type": {"STACK": legacy}})["skin"] == "blocks"
+    assert validate_config({"initialSpeed": 3}, base=legacy)["skin"] == "blocks"
 
 
 def test_config_defaults_and_partial_merge_are_dynamodb_safe():
@@ -77,6 +84,7 @@ def test_crud_create_stack_web_and_get_settings():
         item = table.put_item.call_args.kwargs["Item"]
         assert item["type"]["STACK"] == DEFAULT_CONFIG
         assert item["joinChannel"] == "web"
+        assert item["playMode"] == "mobile"
         assert item["participantFields"] == default_participant_fields("STACK")
         assert item["requiresValidation"] is False
         table.get_item.return_value = {"Item": item}
@@ -101,7 +109,8 @@ def test_create_custom_config_and_reject_invalid_without_writes():
         assert result["statusCode"] == 201
         assert table.put_item.call_args.kwargs["Item"]["type"]["STACK"]["initialSpeed"] == 3
         table.reset_mock()
-        for invalid in ({"settings": {"stack": {"initialSpeed": 8}}}, {"joinChannel": "instagram"}):
+        for invalid in ({"settings": {"stack": {"initialSpeed": 8}}}, {"playMode": "master"},
+                        {"joinChannel": "email"}):
             result = game._handle_post(operator_event({"gameType": "STACK", **invalid}))
             assert result["statusCode"] == 400
         table.put_item.assert_not_called()
@@ -128,7 +137,8 @@ def test_put_merges_valid_settings_using_existing_blob_helper():
 @pytest.mark.parametrize("meta,updates,status", [
     (META, {"settings": {"stack": {"initialSpeed": float("nan")}}, "isActive": False}, 400),
     (META, {"settings": {"stack": []}}, 400),
-    (META, {"joinChannel": "instagram"}, 400),
+    (META, {"playMode": "master"}, 400),
+    (META, {"joinChannel": "instagram", "playMode": "master"}, 400),
     ({**META, "ownerUserId": "other"}, {"settings": {"stack": {"initialSpeed": 3}}}, 403),
     ({**META, "gameType": "T1MER"}, {"settings": {"stack": {"initialSpeed": 3}}}, 400),
 ])
@@ -140,7 +150,7 @@ def test_put_rejects_before_any_write(meta, updates, status):
     table.update_item.assert_not_called()
 
 
-def test_web_join_creates_identity_but_no_attempt_and_dedup_recovers():
+def test_web_join_creates_identity_but_no_attempt_and_dedup_recovers(verified_web_assignment):
     captured = {}
 
     def put(player):
@@ -181,6 +191,9 @@ def test_public_join_forwards_stack_assignment():
     result = {"ok": True, "gameType": "STACK", "playerToken": "signed",
               "assignment": {"playerId": 7, "attempt": None}}
     with patch.object(public_mod, "ASSIGN_LAMBDA", "assign"), \
+         patch.object(public_mod, "_get_game", return_value=META), \
+         patch.object(public_mod, "verification_table"), \
+         patch.object(public_mod, "confirm_code", return_value=({"registration": {"email": "ana@example.com"}}, "receipt")), \
          patch.object(public_mod, "_invoke_assign_web", return_value=result):
         response = public_mod._handle_join({"body": json.dumps({
             "gameId": "ABCDEF", "email": "ana@example.com", "consent": True,
@@ -189,7 +202,8 @@ def test_public_join_forwards_stack_assignment():
     assert json.loads(response["body"])["assignment"] == result["assignment"]
 
 
-def test_public_game_preview_returns_stack_config_without_writing():
+@patch.object(public_mod, "_client_appearance", return_value={})
+def test_public_game_preview_returns_stack_config_without_writing(_branding):
     table = MagicMock()
     table.get_item.return_value = {"Item": META}
     gp = MagicMock()
@@ -205,7 +219,7 @@ def test_public_game_preview_returns_stack_config_without_writing():
     table.update_item.assert_not_called()
 
 
-@pytest.mark.parametrize("field", list(DEFAULT_CONFIG))
+@pytest.mark.parametrize("field", [field for field in DEFAULT_CONFIG if field != "skin"])
 def test_missing_persisted_config_is_rejected_without_silent_defaults(field):
     incomplete = deepcopy(DEFAULT_CONFIG)
     incomplete.pop(field)
@@ -218,7 +232,7 @@ def test_missing_persisted_config_is_rejected_without_silent_defaults(field):
     assert json.loads(response["body"])["error"] == "InvalidStackConfig"
 
 
-def test_public_score_dispatcher_and_recover_end_to_end_offline(monkeypatch):
+def test_public_score_dispatcher_and_recover_end_to_end_offline(monkeypatch, verified_web_assignment):
     table = AttemptTable()
     monkeypatch.setattr(dispatcher.stack, "ClientError", ConditionalFailure)
     token = issue_player_token("ABCDEF", 7, SECRET)
@@ -362,7 +376,8 @@ def test_stack_empty_ranking_queries_without_inventing_scores():
     timer_ranking.assert_not_called()
 
 
-def test_public_and_operator_ranking_share_order_and_schema():
+@patch.object(public_mod, "_client_appearance", return_value={})
+def test_public_and_operator_ranking_share_order_and_schema(_branding):
     games = MagicMock()
     games.get_item.return_value = {"Item": META}
     gp = MagicMock()

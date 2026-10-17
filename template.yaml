@@ -33,9 +33,25 @@ Parameters:
 
   PlayerTokenSecret:
     Type: String
-    Default: stand-dev-player-token-v1
+    MinLength: 32
     NoEcho: true
-    Description: HMAC secret for participant web session tokens
+    Description: Required private HMAC secret (at least 32 characters) for participant sessions and personal access links
+
+  PublicAppOrigin:
+    Type: String
+    Default: https://playstand.app
+    AllowedPattern: "^https?://[^/#?]+$"
+    Description: Public frontend origin used to build personal participant access links (no trailing slash)
+
+  EmailSenderAddress:
+    Type: String
+    Default: no-reply@playstand.app
+    Description: Verified SES From address for participant email verification
+
+  EmailIdentityName:
+    Type: String
+    Default: playstand.app
+    Description: Existing shared SES domain identity in us-east-1 (managed outside this stack)
 
 Globals:
   Function:
@@ -153,12 +169,91 @@ Resources:
               - ssm:GetParameter
               - ssm:GetParameters
             Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/config/*"
+          - Sid: S3ClientLogos
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${UserMediaBucket.Arn}/users/*/logos/*"
+          - Sid: S3GamePrizeImages
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "${UserMediaBucket.Arn}/games/*"
+          - Sid: S3StagedPrizeImageTags
+            Effect: Allow
+            Action:
+              - s3:PutObjectTagging
+              - s3:DeleteObjectTagging
+            Resource: !Sub "${UserMediaBucket.Arn}/games/staged/*"
           # Raffle Lambda needs Instagram PAGE_TOKEN to check is_user_follow_business
           - Sid: InstagramSecretRaffle
             Effect: Allow
             Action: secretsmanager:GetSecretValue
             Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
           # Game functions invoke the sender Lambda for all IG/Stripe calls — no secret access needed here.
+
+  StandPublicRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "stand-${Environment}-public-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StandProdGameRolePolicy
+      Policies:
+        - PolicyName: EmailVerification
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: VerificationRecords
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:ConditionCheckItem
+                Resource: !GetAtt StandEmailVerificationTable.Arn
+              - Sid: SendVerificationEmail
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub "arn:${AWS::Partition}:ses:us-east-1:${AWS::AccountId}:identity/${EmailIdentityName}"
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Ref EmailSenderAddress
+
+  StandAssignRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "stand-${Environment}-assign-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StandProdGameRolePolicy
+      Policies:
+        - PolicyName: EmailVerification
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ConsumeVerification
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:ConditionCheckItem
+                Resource: !GetAtt StandEmailVerificationTable.Arn
 
 # ----- Webhook role (Instagram webhook dispatcher) -----
 
@@ -293,6 +388,21 @@ Resources:
 # =========================
 # DYNAMODB TABLES
 # =========================
+
+  StandEmailVerificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "stand-${Environment}-email-verification-table"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
 
   StandProdUserTable:
     Type: AWS::DynamoDB::Table
@@ -430,6 +540,15 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub "stand-${Environment}-user-media-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUncommittedGamePrizeImages
+            Status: Enabled
+            Prefix: games/staged/
+            TagFilters:
+              - Key: staged
+                Value: "true"
+            ExpirationInDays: 7
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
@@ -554,6 +673,9 @@ Resources:
       Role: !GetAtt StandProdGameRole.Arn
       Layers:
         - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Events:
         GameCrudGet:
           Type: HttpApi
@@ -579,6 +701,12 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game
             Method: DELETE
+        GamePrizeUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/prizes
+            Method: POST
 
   StandProdGameFnAssign:
     Type: AWS::Serverless::Function
@@ -587,7 +715,7 @@ Resources:
       Description: Assigns players to games, enforces plan limits, prevents duplicates, and initializes per-game player state.
       CodeUri: src/stand_prod_game_fn_assign/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandAssignRole.Arn
       Layers:
         - !Ref StandCommonLayer
       Environment:
@@ -595,6 +723,9 @@ Resources:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
           QUIZ_QUEUE_URL: !Ref StandProdQuizQueue
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
+          PUBLIC_APP_ORIGIN: !Ref PublicAppOrigin
+          ACCESS_LINK_TTL_SECONDS: "900"
+          EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
       Events:
         AssignPost:
           Type: HttpApi
@@ -633,7 +764,7 @@ Resources:
       Description: Public participant APIs (join, validate, display) without Cognito auth.
       CodeUri: src/stand_prod_game_fn_public/
       Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdGameRole.Arn
+      Role: !GetAtt StandPublicRole.Arn
       Layers:
         - !Ref StandCommonLayer
       Environment:
@@ -641,8 +772,15 @@ Resources:
           ASSIGN_LAMBDA: !Ref StandProdGameFnAssign
           VALIDATE_LAMBDA: !Ref StandProdGameValidate
           SCORE_LAMBDA: !Ref StandProdGameScore
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
           CHAR_URL_TTL: "120"
+          EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
+          EMAIL_SENDER_ADDRESS: !Ref EmailSenderAddress
+          EMAIL_IDENTITY_NAME: !Ref EmailIdentityName
+          EMAIL_MAX_PER_HOUR: "5"
+          EMAIL_IP_MAX_PER_HOUR: "3000"
+          EMAIL_GLOBAL_MAX_PER_HOUR: "20000"
       Events:
         PublicGameGet:
           Type: HttpApi
@@ -650,6 +788,14 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/public/game
             Method: GET
+            Auth:
+              Authorizer: NONE
+        PublicEmailRequestPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/email/request
+            Method: POST
             Auth:
               Authorizer: NONE
         PublicJoinPost:
@@ -674,6 +820,22 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/public/player
             Method: GET
+            Auth:
+              Authorizer: NONE
+        PublicPlayerPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/player
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicAccessPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/access
+            Method: POST
             Auth:
               Authorizer: NONE
         PublicRedeemPost:
@@ -737,6 +899,8 @@ Resources:
       Environment:
         Variables:
           IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          PUBLIC_APP_ORIGIN: !Ref PublicAppOrigin
+          ACCESS_LINK_TTL_SECONDS: "900"
       Events:
         QuizGet:
           Type: HttpApi
@@ -1084,4 +1248,3 @@ Outputs:
 
   GameApiUrl:
     Value: !Sub "https://${GameApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
-

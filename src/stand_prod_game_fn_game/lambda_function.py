@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import uuid
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -19,7 +20,22 @@ from stand_common.utils import (
     set_game_type_blob,
     JOIN_CODE_ALPHABET,
     JOIN_CODE_LENGTH,
-    default_participant_fields,
+    is_valid_join_code,
+    normalize_participant_fields,
+)
+from stand_common.game_access import (
+    GameAccessError,
+    access_for_create,
+    access_for_update,
+    resolve_game_access,
+)
+from stand_common.prizes import (
+    MAX_PRIZE_IMAGE_BYTES,
+    allowed_prize_slots,
+    serialize_prize_catalog,
+    staged_prize_image_key,
+    validate_png,
+    validate_prize_catalog,
 )
 
 # ========= ENV VARS =========
@@ -27,6 +43,7 @@ GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 USERS_TABLE = os.environ.get("USERS_TABLE", "stand-prod-user-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 CATALOG_TABLE = os.environ.get("CATALOG_TABLE", "stand-prod-catalog-table")
+USER_MEDIA_BUCKET = os.environ.get("USER_MEDIA_BUCKET", "")
 
 # GSI names (recommended)
 GSI_OWNER = os.environ.get("GSI_OWNER", "gsi-ownerUserId")
@@ -38,6 +55,7 @@ games_table = dynamodb.Table(GAMES_TABLE)
 users_table = dynamodb.Table(USERS_TABLE)
 gp_table = dynamodb.Table(GAMEPLAYER_TABLE)
 catalog_table = dynamodb.Table(CATALOG_TABLE)
+prize_s3 = boto3.client("s3")
 
 # ========= CONST =========
 SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS", "IMPOSTOR", "STACK"}
@@ -68,7 +86,7 @@ def _get_user(user_id: str):
 def _new_join_code(length: int = JOIN_CODE_LENGTH) -> str:
     return "".join(random.choice(JOIN_CODE_ALPHABET) for _ in range(length))
 
-def _public_game_shape(item: dict) -> dict:
+def _public_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
     # Safe shape for clients/players
     shape = {
         "gameId": item.get("gameId"),
@@ -76,10 +94,114 @@ def _public_game_shape(item: dict) -> dict:
         "gameType": item.get("gameType"),
         "createdAt": item.get("createdAt"),
         "maxPlayers": item.get("maxPlayers"),
-        "joinChannel": item.get("joinChannel"),
-        "participantFields": item.get("participantFields"),
+        "participantFields": normalize_participant_fields(item.get("gameType") or "", item.get("participantFields")),
     }
-    return {k: v for k, v in shape.items() if v is not None}
+    shape = {k: v for k, v in shape.items() if v is not None}
+    # Always the effective (legacy-resolved) pair, so clients never guess defaults.
+    shape.update(resolve_game_access(item))
+    if include_prize_catalog and "prizeCatalog" in item:
+        shape["prizeCatalog"] = _serialize_prize_catalog(item)
+    return shape
+
+
+def _serialize_prize_catalog(item: dict) -> dict:
+    return serialize_prize_catalog(
+        item.get("prizeCatalog"),
+        item.get("ownerUserId") or "",
+        item.get("gameId") or "",
+        USER_MEDIA_BUCKET,
+        prize_s3.generate_presigned_url,
+    )
+
+
+def _get_game(game_id: str):
+    return games_table.get_item(Key={"gameId": game_id}).get("Item")
+
+
+def _read_verified_prize_image(key: str) -> bytes:
+    try:
+        head = prize_s3.head_object(Bucket=USER_MEDIA_BUCKET, Key=key)
+        size = head.get("ContentLength")
+        if type(size) is not int or size < 1 or size > MAX_PRIZE_IMAGE_BYTES:
+            raise ValueError("Prize image must be between 1 byte and 5 MB.")
+        response = prize_s3.get_object(Bucket=USER_MEDIA_BUCKET, Key=key)
+        body = response["Body"]
+        try:
+            data = bytearray()
+            while len(data) <= MAX_PRIZE_IMAGE_BYTES:
+                chunk = body.read(min(64 * 1024, MAX_PRIZE_IMAGE_BYTES + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+        finally:
+            close = getattr(body, "close", None)
+            if close:
+                close()
+        if len(data) != size:
+            raise ValueError("Prize image size does not match the uploaded object.")
+        image = bytes(data)
+        validate_png(image)
+        return image
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code")
+        if code in {"NoSuchKey", "NotFound", "404"}:
+            raise ValueError("Prize image upload was not found.") from exc
+        log("Prize image object verification failed", {"key": key, "error": str(exc)})
+        raise RuntimeError("Could not verify prize image upload.") from exc
+
+
+def _handle_prize_upload_url(event):
+    if not USER_MEDIA_BUCKET:
+        return _resp(500, {"error": "Missing USER_MEDIA_BUCKET env var"})
+    claims = _get_claims(event)
+    owner_user_id = (claims.get("sub") or "").strip()
+    if not owner_user_id:
+        return _resp(401, {"error": "Missing sub claim (unauthorized)"})
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "Invalid JSON body"})
+    game_id = body.get("gameId")
+    slot = body.get("slot")
+    file_name = body.get("fileName")
+    content_type = body.get("contentType")
+    size_bytes = body.get("sizeBytes")
+    if not isinstance(game_id, str) or not is_valid_join_code(game_id.strip()):
+        return _resp(400, {"error": "Invalid gameId."})
+    game_id = game_id.strip()
+    if not isinstance(slot, str) or slot not in {"validation", "ranking", "raffle"}:
+        return _resp(400, {"error": "slot must be validation, ranking, or raffle."})
+    if not isinstance(file_name, str) or not file_name.strip():
+        return _resp(400, {"error": "fileName is required."})
+    if content_type != "image/png":
+        return _resp(400, {"error": "contentType must be image/png."})
+    if type(size_bytes) is not int or size_bytes < 1 or size_bytes > MAX_PRIZE_IMAGE_BYTES:
+        return _resp(400, {"error": "Prize image must be between 1 byte and 5 MB."})
+
+    item = _get_game(game_id)
+    if not item:
+        return _resp(404, {"error": "GameNotFound", "gameId": game_id})
+    if (item.get("ownerUserId") or "") != owner_user_id:
+        return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+    raffle_enabled = _is_user_pro(_get_user(owner_user_id))
+    if slot not in allowed_prize_slots(item.get("gameType") or "", raffle_enabled):
+        return _resp(400, {"error": f"The {slot} prize is not supported for this game or plan."})
+
+    key = f"games/staged/{owner_user_id}/{game_id}/{slot}/{uuid.uuid4()}.png"
+    try:
+        upload_url = prize_s3.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": USER_MEDIA_BUCKET,
+                "Key": key,
+                "ContentType": "image/png",
+                "Tagging": "staged=true",
+            },
+            ExpiresIn=3600,
+        )
+    except ClientError as exc:
+        log("Prize image upload URL creation failed", {"gameId": game_id, "error": str(exc)})
+        return _resp(500, {"error": "UploadUrlCreationFailed"})
+    return _resp(200, {"ok": True, "key": key, "uploadUrl": upload_url})
 
 def _quiz_enabled_from_game(game_item: dict) -> bool:
     order = game_item.get("quizOrder") or []
@@ -246,7 +368,10 @@ def _handle_get(event):
         if not item.get("isActive", True):
             return _resp(403, {"error": "GameInactive", "gameId": game_id})
 
-        payload = {"ok": True, "game": _public_game_shape(item)}
+        game_shape = _public_game_shape(item, include_prize_catalog=False)
+        payload = {"ok": True, "game": game_shape}
+        if "prizeCatalog" in item:
+            payload["prizeCatalog"] = _serialize_prize_catalog(item)
         if (item.get("gameType") or "").upper() == "EMPAREJA2":
             payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
             payload["empareja2CatalogPairCount"] = _empareja2_catalog_pair_count()
@@ -310,7 +435,7 @@ def _handle_get(event):
 
         payload = {
             "ok": True,
-            "game": _public_game_shape(item),
+            "game": _public_game_shape(item, include_prize_catalog=False),
             "playerCount": player_count,
             "validatedCount": validated_count,
             "raffleWinners": _raffle_winners_from_game(item),
@@ -320,6 +445,8 @@ def _handle_get(event):
                 "questionsCount": len(item.get("quizOrder") or []) if _quiz_enabled_from_game(item) else 0
             }
         }
+        if "prizeCatalog" in item:
+            payload["prizeCatalog"] = _serialize_prize_catalog(item)
         # enrich raffleWinners with prizeDelivered flag per player
         try:
             game_type = (item.get("gameType") or "").upper()
@@ -407,6 +534,16 @@ def _handle_post(event):
             "supportedGameTypes": sorted(SUPPORTED_GAME_TYPES),
         })
 
+    try:
+        access = access_for_create(game_type, body.get("playMode"), body.get("joinChannel"))
+    except GameAccessError as exc:
+        return _resp(400, {"error": str(exc)})
+
+    try:
+        participant_fields = normalize_participant_fields(game_type, body.get("participantFields"))
+    except ValueError as exc:
+        return _resp(400, {"error": str(exc)})
+
     stack_config = None
     if game_type == "STACK":
         settings = body.get("settings", {})
@@ -414,8 +551,6 @@ def _handle_post(event):
             return _resp(400, {"error": "settings must be an object."})
         if "stack" in settings and not isinstance(settings["stack"], dict):
             return _resp(400, {"error": "settings.stack must be an object."})
-        if (body.get("joinChannel") or "web") != "web":
-            return _resp(400, {"error": "STACK only supports joinChannel 'web'."})
         try:
             stack_config = validate_stack_config(settings.get("stack"))
         except ValueError as exc:
@@ -479,6 +614,8 @@ def _handle_post(event):
             "validatedCount": 0,
             "raffleWinners": [],
             "requiresValidation": requires_validation,
+            "playMode": access["playMode"],
+            "joinChannel": access["joinChannel"],
             "createdAt": now,
             "updatedAt": now,
         }
@@ -491,8 +628,7 @@ def _handle_post(event):
             item["quizQuestions"] = quiz_questions
 
         if game_type in ("EMPAREJA2", "T1MER", "STACK"):
-            item["joinChannel"] = (body.get("joinChannel") or "web").strip().lower()
-            item["participantFields"] = body.get("participantFields") or default_participant_fields(game_type)
+            item["participantFields"] = participant_fields
         if game_type == "STACK":
             item["type"] = {"STACK": stack_config}
             item["requiresValidation"] = False
@@ -531,7 +667,7 @@ def _handle_put(event):
     - settings.l3tras: optional. Merges into type.L3TRAS (objectiveWord, always stored uppercase).
     """
     body = _read_json_body(event)
-    if body is None:
+    if not isinstance(body, dict):
         return _resp(400, {"error": "Invalid JSON body"})
 
     claims = _get_claims(event)
@@ -542,6 +678,8 @@ def _handle_put(event):
     game_id = (body.get("gameId") or "").strip()
     if not game_id:
         return _resp(400, {"error": "Missing required field 'gameId'."})
+    prize_catalog_supplied = "prizeCatalog" in body
+    raw_prize_catalog = body.get("prizeCatalog")
 
     is_active = body.get("isActive", None)
     settings = body.get("settings") or {}
@@ -557,6 +695,7 @@ def _handle_put(event):
     stack_settings = settings.get("stack")
     participant_fields = body.get("participantFields")
     join_channel = body.get("joinChannel")
+    play_mode = body.get("playMode")
 
     # At least one update
     if (
@@ -569,8 +708,10 @@ def _handle_put(event):
         and stack_settings is None
         and participant_fields is None
         and join_channel is None
+        and play_mode is None
+        and not prize_catalog_supplied
     ):
-        return _resp(400, {"error": "Provide at least one of 'isActive', 'settings.empareja2', 'settings.raffle', 'settings.l3tras', 'settings.impostor', 'settings.stack', 'settings.prizeDelivered', 'participantFields', or 'joinChannel'."})
+        return _resp(400, {"error": "Provide at least one game update, including 'prizeCatalog'."})
 
     now = _iso_now()
 
@@ -586,6 +727,57 @@ def _handle_put(event):
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
+    prepared_prize_catalog = None
+    prepared_prize_response = None
+    staged_upload_keys = []
+    if prize_catalog_supplied:
+        existing_catalog = item.get("prizeCatalog")
+        raffle_enabled = (
+            _is_user_pro(_get_user(owner_user_id))
+            if (
+                isinstance(raw_prize_catalog, dict) and "raffle" in raw_prize_catalog
+                or isinstance(existing_catalog, dict) and "raffle" in existing_catalog
+            )
+            else False
+        )
+        try:
+            prepared_prize_catalog = validate_prize_catalog(
+                raw_prize_catalog,
+                item.get("gameType") or "",
+                raffle_enabled,
+                owner_user_id,
+                game_id,
+                existing_catalog=existing_catalog,
+            )
+            for slot, prize in prepared_prize_catalog.items():
+                image_key = prize["imageKey"]
+                if image_key is None:
+                    continue
+                image_data = _read_verified_prize_image(image_key)
+                if staged_prize_image_key(owner_user_id, game_id, slot, image_key):
+                    committed_key = f"games/{owner_user_id}/{game_id}/{slot}/{uuid.uuid4()}.png"
+                    prize_s3.put_object(
+                        Bucket=USER_MEDIA_BUCKET,
+                        Key=committed_key,
+                        Body=image_data,
+                        ContentLength=len(image_data),
+                        ContentType="image/png",
+                    )
+                    staged_upload_keys.append(image_key)
+                    prize["imageKey"] = committed_key
+            prepared_prize_response = serialize_prize_catalog(
+                prepared_prize_catalog,
+                owner_user_id,
+                game_id,
+                USER_MEDIA_BUCKET,
+                prize_s3.generate_presigned_url,
+            )
+        except ValueError as exc:
+            return _resp(400, {"error": str(exc)})
+        except RuntimeError as exc:
+            log("Prize catalog image verification failed", {"gameId": game_id, "error": str(exc)})
+            return _resp(500, {"error": "PrizeImageVerificationFailed", "detail": str(exc)})
+
     stack_config = None
     if stack_settings is not None:
         if (item.get("gameType") or "").upper() != "STACK":
@@ -594,9 +786,17 @@ def _handle_put(event):
             stack_config = validate_stack_config(stack_settings, base=stack_game_config(item))
         except ValueError as exc:
             return _resp(400, {"error": str(exc)})
-    if (item.get("gameType") or "").upper() == "STACK" and join_channel is not None:
-        if join_channel != "web":
-            return _resp(400, {"error": "STACK only supports joinChannel 'web'."})
+    access = None
+    if join_channel is not None or play_mode is not None:
+        try:
+            access = access_for_update(item, play_mode, join_channel)
+        except GameAccessError as exc:
+            return _resp(400, {"error": str(exc)})
+    if participant_fields is not None:
+        try:
+            participant_fields = normalize_participant_fields(item.get("gameType") or "", participant_fields)
+        except ValueError as exc:
+            return _resp(400, {"error": str(exc)})
 
     if stack_config is not None:
         set_game_type_blob(
@@ -606,8 +806,6 @@ def _handle_put(event):
         )
 
     if participant_fields is not None:
-        if not isinstance(participant_fields, dict):
-            return _resp(400, {"error": "participantFields must be an object."})
         try:
             games_table.update_item(
                 Key={"gameId": game_id},
@@ -621,21 +819,22 @@ def _handle_put(event):
             log("Update participantFields failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
-    if join_channel is not None:
-        jc = str(join_channel).strip().lower()
-        if jc not in ("web", "instagram"):
-            return _resp(400, {"error": "joinChannel must be 'web' or 'instagram'."})
+    if access is not None:
+        # Single write: playMode and joinChannel are always persisted together.
         try:
             games_table.update_item(
                 Key={"gameId": game_id},
-                UpdateExpression="SET joinChannel = :jc, updatedAt = :u",
-                ExpressionAttributeValues={":jc": jc, ":u": now, ":owner": owner_user_id},
-                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+                UpdateExpression="SET playMode = :pm, joinChannel = :jc, updatedAt = :u",
+                ExpressionAttributeValues={
+                    ":pm": access["playMode"], ":jc": access["joinChannel"], ":u": now,
+                    ":owner": owner_user_id, ":gt": item.get("gameType"),
+                },
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner AND gameType = :gt",
             )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
-            log("Update joinChannel failed", {"error": str(e)})
+            log("Update game access failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
     if isinstance(is_active, bool):
@@ -856,13 +1055,129 @@ def _handle_put(event):
             log("UpdatePrizeDeliveredFailed", {"error": str(e), "gameId": game_id, "playerId": pid_int})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
+    prize_image_cleanup_pending = False
+    if prize_catalog_supplied:
+        try:
+            latest_item = _get_game(game_id)
+        except ClientError as e:
+            log("GetItem failed before prize catalog update", {"error": str(e), "gameId": game_id})
+            return _resp(500, {"error": "PrizeCatalogReadFailed"})
+        if not latest_item:
+            return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+        if (latest_item.get("ownerUserId") or "") != owner_user_id:
+            return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+
+        expression_values = {
+            ":catalog": prepared_prize_catalog,
+            ":updated": _iso_now(),
+            ":owner": owner_user_id,
+            ":gameType": latest_item.get("gameType"),
+        }
+        expression = "SET prizeCatalog = :catalog, updatedAt = :updated"
+        expression_names = {}
+        if (
+            (latest_item.get("gameType") or "").upper() == "EMPAREJA2"
+            and "validation" in prepared_prize_catalog
+        ):
+            current_type = latest_item.get("type")
+            if current_type is not None and not isinstance(current_type, dict):
+                return _resp(500, {"error": "InvalidStoredGameTypeConfig"})
+            current_type = current_type or {}
+            empareja2 = current_type.get("EMPAREJA2")
+            if empareja2 is not None and not isinstance(empareja2, dict):
+                return _resp(500, {"error": "InvalidStoredEmpareja2Config"})
+            validation_limit = prepared_prize_catalog["validation"]["limit"]
+            if isinstance(empareja2, dict):
+                expression_names.update({
+                    "#type": "type",
+                    "#gameType": "EMPAREJA2",
+                    "#maxValidations": "maxValidations",
+                })
+                if validation_limit is None:
+                    expression += " REMOVE #type.#gameType.#maxValidations"
+                else:
+                    expression += " , #type.#gameType.#maxValidations = :maxValidations"
+                    expression_values[":maxValidations"] = validation_limit
+            elif validation_limit is not None:
+                if isinstance(latest_item.get("type"), dict):
+                    expression += ", #type.#gameType = :gameConfig"
+                    expression_names.update({"#type": "type", "#gameType": "EMPAREJA2"})
+                else:
+                    expression += ", #type = :type"
+                    expression_names["#type"] = "type"
+                if isinstance(latest_item.get("type"), dict):
+                    expression_values[":gameConfig"] = {"maxValidations": validation_limit}
+                else:
+                    expression_values[":type"] = {"EMPAREJA2": {"maxValidations": validation_limit}}
+
+        condition = "attribute_exists(gameId) AND ownerUserId = :owner AND gameType = :gameType"
+        previous_updated = latest_item.get("updatedAt")
+        if previous_updated is None:
+            condition += " AND attribute_not_exists(updatedAt)"
+        else:
+            condition += " AND updatedAt = :previousUpdated"
+            expression_values[":previousUpdated"] = previous_updated
+        update_kwargs = {
+            "Key": {"gameId": game_id},
+            "UpdateExpression": expression,
+            "ConditionExpression": condition,
+            "ExpressionAttributeValues": expression_values,
+        }
+        if expression_names:
+            update_kwargs["ExpressionAttributeNames"] = expression_names
+        try:
+            games_table.update_item(**update_kwargs)
+        except ClientError as e:
+            code = (e.response.get("Error") or {}).get("Code")
+            if code == "ConditionalCheckFailedException":
+                return _resp(409, {"error": "PrizeCatalogChanged", "gameId": game_id})
+            log("Prize catalog update failed", {"error": str(e), "gameId": game_id})
+            return _resp(500, {"error": "PrizeCatalogUpdateFailed"})
+
+        for key in staged_upload_keys:
+            for attempt in range(2):
+                try:
+                    prize_s3.delete_object_tagging(Bucket=USER_MEDIA_BUCKET, Key=key)
+                    break
+                except Exception as e:
+                    if attempt == 1:
+                        prize_image_cleanup_pending = True
+                        log("Committed prize image staging tag cleanup failed", {
+                            "gameId": game_id, "key": key, "error": str(e),
+                        })
+
     # Return current state
     try:
         resp = games_table.get_item(Key={"gameId": game_id})
         attrs = resp.get("Item") or item
     except Exception:
         attrs = item
-    return _resp(200, {"message": "Game updated successfully", "game": attrs})
+    if isinstance(attrs, dict):
+        attrs = {**attrs, **resolve_game_access(attrs)}
+    payload = {"message": "Game updated successfully", "game": attrs}
+    if prize_catalog_supplied:
+        attrs = {**attrs, "prizeCatalog": prepared_prize_catalog}
+        if (
+            (attrs.get("gameType") or "").upper() == "EMPAREJA2"
+            and "validation" in prepared_prize_catalog
+        ):
+            current_type = dict(attrs.get("type") or {})
+            empareja2 = dict(current_type.get("EMPAREJA2") or {})
+            validation_limit = prepared_prize_catalog["validation"]["limit"]
+            if validation_limit is None:
+                empareja2.pop("maxValidations", None)
+            else:
+                empareja2["maxValidations"] = validation_limit
+            current_type["EMPAREJA2"] = empareja2
+            attrs["type"] = current_type
+        payload["prizeCatalog"] = prepared_prize_response
+        # The public catalog is returned at the response top level, never as unsigned S3 data.
+        attrs = dict(attrs)
+        attrs.pop("prizeCatalog", None)
+        payload["game"] = attrs
+    if prize_image_cleanup_pending:
+        payload["warnings"] = ["PrizeImageCleanupPending"]
+    return _resp(200, payload)
 
 # ---------------- DELETE ----------------
 
@@ -915,6 +1230,11 @@ def lambda_handler(event, context):
             return _handle_get(event)
 
         if method == "POST":
+            if _get_path(event).rstrip("/").endswith("/v1/game/prizes"):
+                action = ((_get_query_params(event).get("action") or "").strip().lower())
+                if action != "upload-url":
+                    return _resp(400, {"error": "Unsupported prize action."})
+                return _handle_prize_upload_url(event)
             return _handle_post(event)
 
         if method == "PUT":

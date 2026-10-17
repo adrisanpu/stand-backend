@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -234,6 +235,26 @@ def _handle_register(event, table, user_id: str):
 def _handle_select(event, table, user_id: str):
     body = _read_json_body(event) or {}
     kind = (body.get("kind") or "").strip().lower()
+    if kind == "appearance":
+        appearance = body.get("appearance")
+        if not isinstance(appearance, dict) or appearance.get("themeMode") not in {"dark", "light"}:
+            return _resp(400, {"error": "Invalid appearance themeMode."})
+        colors = appearance.get("colors")
+        if colors is not None and (
+            not isinstance(colors, dict) or set(colors) != {"primary", "accent"}
+            or any(not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value)
+                   for value in colors.values())
+        ):
+            return _resp(400, {"error": "Appearance colors must be primary/accent hex colors."})
+        _, media = _load_user_with_media(table, user_id)
+        media["appearance"] = {"colors": colors, "themeMode": appearance["themeMode"]}
+        table.update_item(
+            Key={"userId": user_id},
+            UpdateExpression="SET #media=:media, #updatedAt=:updatedAt",
+            ExpressionAttributeNames={"#media": "media", "#updatedAt": "updatedAt"},
+            ExpressionAttributeValues={":media": media, ":updatedAt": _iso_now()},
+        )
+        return _resp(200, {"ok": True})
     media_id = (body.get("mediaId") or "").strip()
     if kind not in {"logo", "avatar"}:
         return _resp(400, {"error": "kind must be 'logo' or 'avatar'."})
@@ -357,6 +378,7 @@ def _handle_get(table, user_id: str):
         200,
         {
             "ok": True,
+            "appearance": media.get("appearance"),
             "logo": {
                 "items": logo_items,
                 "selectedId": media["logo"]["selectedId"],

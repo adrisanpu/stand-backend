@@ -8,6 +8,7 @@ import sys
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
+import pytest
 
 # ---------------------------------------------------------------------------
 # 1. Stub boto3 so Lambda files can be imported without the real SDK
@@ -60,3 +61,22 @@ if not LAYER_PATH.exists() and "stand_common" not in sys.modules:
     stand_common.utils = utils
     sys.modules["stand_common"] = stand_common
     sys.modules["stand_common.utils"] = utils
+
+
+@pytest.fixture
+def verified_web_assignment(monkeypatch):
+    """Assignment unit tests start after verification; real gates have separate integration coverage."""
+    from tests.test_public_web import assign_mod
+
+    table, record = MagicMock(), {"verifiedAt": 1700000000}
+    monkeypatch.setattr(assign_mod, "_verified_email", lambda *_: (table, record))
+    monkeypatch.setattr(
+        assign_mod, "_find_verified_player",
+        lambda _table, game_id, email: assign_mod._find_existing_player_by_email(game_id, email),
+    )
+    def put(_table, _record, player, _max, _now):
+        assign_mod._put_player(player)
+        return "created"
+    monkeypatch.setattr(assign_mod, "_put_verified_player", put)
+    monkeypatch.setattr(assign_mod, "_complete_verified_player", MagicMock())
+    monkeypatch.setattr(assign_mod, "complete_registration", MagicMock())

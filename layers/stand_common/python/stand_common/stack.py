@@ -19,8 +19,10 @@ DEFAULT_CONFIG = {
     "layerHeight": Decimal("0.24"),
     "movementRange": Decimal("4"),
     "configVersion": CONFIG_VERSION,
+    "skin": "blocks",
 }
-EDITABLE_FIELDS = frozenset({"initialSpeed", "speedIncrement", "maxSpeed", "perfectTolerance"})
+SKINS = frozenset({"blocks", "pizza", "baklava"})
+EDITABLE_FIELDS = frozenset({"initialSpeed", "speedIncrement", "maxSpeed", "perfectTolerance", "skin"})
 _RANGES = {
     "initialSpeed": (Decimal("0.1"), Decimal("10")),
     "speedIncrement": (Decimal("0"), Decimal("1")),
@@ -38,16 +40,21 @@ def validate_config(settings: dict | None = None, *, base: dict | None = None) -
     if settings is not None and not isinstance(settings, dict):
         raise ValueError("settings.stack must be an object.")
     if set(settings or {}) - EDITABLE_FIELDS:
-        raise ValueError("settings.stack only supports initialSpeed, speedIncrement, maxSpeed and perfectTolerance.")
+        raise ValueError("settings.stack only supports initialSpeed, speedIncrement, maxSpeed, perfectTolerance and skin.")
     return _validate_complete_config({**(DEFAULT_CONFIG if base is None else base), **(settings or {})})
 
 
 def _validate_complete_config(raw_config: dict) -> dict:
-    if not isinstance(raw_config, dict) or set(raw_config) != set(DEFAULT_CONFIG):
+    if not isinstance(raw_config, dict):
         raise ValueError("STACK configuration must contain every required field, with no unknown fields.")
-    config = dict(raw_config)
+    # Games and attempt snapshots stored before skins existed default to blocks.
+    config = {"skin": DEFAULT_CONFIG["skin"], **raw_config}
+    if set(config) != set(DEFAULT_CONFIG):
+        raise ValueError("STACK configuration must contain every required field, with no unknown fields.")
     if config["configVersion"] != CONFIG_VERSION:
         raise ValueError("STACK configVersion must be '1'.")
+    if not isinstance(config["skin"], str) or config["skin"] not in SKINS:
+        raise ValueError("settings.stack.skin must be one of: baklava, blocks, pizza.")
     for field, (low, high) in _RANGES.items():
         raw = config[field]
         if isinstance(raw, bool) or not isinstance(raw, (int, float, Decimal)):
@@ -115,8 +122,7 @@ def public_assignment(player: dict, gp_table=None) -> dict:
 
 def replay(placements: list, snapshot: dict) -> tuple[int, float, str]:
     """Replay JS binary64 rectangle operations, returning score, minimum seconds, hash."""
-    config = {key: float(value) if key != "configVersion" else value
-              for key, value in _validate_complete_config(snapshot).items()}
+    config = {key: float(value) for key, value in _validate_complete_config(snapshot).items() if key in _RANGES}
     if not isinstance(placements, list) or not placements:
         raise ValueError("InvalidPlacements")
     support = {"x": 0.0, "z": 0.0, "width": config["initialWidth"], "depth": config["initialDepth"]}

@@ -8,7 +8,18 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _iso_now, get_game_type_blob, is_valid_email, normalize_email, issue_player_token, default_participant_fields
+from stand_common.utils import log, _json_sanitize, _iso_now, get_game_type_blob, normalize_email, issue_player_token
+from stand_common.game_access import resolve_game_access
+from stand_common.player_access import (
+    ACCESS_LINK_FAILED_TEXT,
+    access_link_message,
+    access_link_ttl_seconds,
+    issue_access_link,
+)
+from stand_common.email_verification import (
+    VerificationError, RegistrationError, registration_values, verification_table,
+    require_verified_registration, complete_registration, identity_id,
+)
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -79,6 +90,32 @@ def _send_code_then_raffle(psid: str, code_text: str, meta: dict) -> None:
     _send_bulk_messages(messages)
 
 
+def _is_mobile_play(meta: dict) -> bool:
+    return resolve_game_access(meta)["playMode"] == "mobile"
+
+
+def _quiz_completed(player: dict, game_type: str) -> bool:
+    return bool(get_game_type_blob(player or {}, game_type).get("quizCompleted"))
+
+
+def _send_access_link_then_raffle(psid: str, game_id: str, player_id, meta: dict, intro_text: str | None = None) -> bool:
+    """Mobile play: (optional intro) + personal one-use link + raffle follows, for the existing player."""
+    messages = [{"psid": psid, "text": intro_text}] if intro_text else []
+    ttl = access_link_ttl_seconds()
+    try:
+        url = issue_access_link(gp_table, game_id, int(player_id), PLAYER_TOKEN_SECRET, ttl_seconds=ttl)
+    except Exception as e:
+        # Never log the link/token itself.
+        log("assign_access_link_failed", {"error": type(e).__name__, "gameId": game_id, "playerId": player_id})
+        messages.append({"psid": psid, "text": ACCESS_LINK_FAILED_TEXT})
+        _send_bulk_messages(messages)
+        return False
+    messages.append(access_link_message(psid, url, ttl))
+    messages.extend(_raffle_follow_messages(psid, meta))
+    _send_bulk_messages(messages)
+    return True
+
+
 def _get_game_meta(game_id: str) -> dict | None:
     resp = games_table.get_item(Key={"gameId": game_id})
     return resp.get("Item")
@@ -135,6 +172,7 @@ def _get_last_player_id(game_id: str) -> int:
         ProjectionExpression="playerId",
         ScanIndexForward=False,
         Limit=1,
+        ConsistentRead=True,
     )
     items = resp.get("Items") or []
     if not items:
@@ -235,6 +273,9 @@ def _code_tail(code, game_type: str = "", letter: str | None = None) -> str:
 
 # Empareja2: aviso cuando hay quiz (el código llega tras responder)
 EMPAREJA2_QUIZ_NOTICE = "Para conseguir tu código de validación necesitas responder unas preguntas."
+# Mobile play: instructions point to the personal link, never to the master screen
+EMPAREJA2_MOBILE_NOTICE = "Abre tu enlace personal para ver tu código y validar con tu pareja desde el móvil."
+MOBILE_QUIZ_NOTICE = "Para conseguir tu enlace personal para jugar necesitas responder unas preguntas."
 
 
 def _requires_validation(meta: dict, game_type: str) -> bool:
@@ -289,26 +330,9 @@ def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
                 break
             kwargs["ExclusiveStartKey"] = lek
     except ClientError as e:
-        log("assign_email_query_failed", {"error": str(e), "gameId": game_id})
+        log("assign_email_query_failed", {"errorType": type(e).__name__, "gameId": game_id})
+        raise
     return None
-
-
-def _participant_fields(meta: dict) -> dict:
-    pf = meta.get("participantFields")
-    if isinstance(pf, dict) and pf:
-        return pf
-    return default_participant_fields(meta.get("gameType") or "")
-
-
-def _field_required(pf: dict, name: str) -> bool:
-    return bool((pf.get(name) or {}).get("required", False))
-
-
-def _normalize_instagram_handle(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    s = str(raw).strip().lstrip("@")
-    return s or None
 
 
 WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK"})
@@ -318,13 +342,15 @@ def _empareja2_web_assignment(player: dict) -> dict:
     from assigners.empareja2 import _character_image_url
     blob = (player.get("type") or {}).get("EMPAREJA2") or {}
     cname = blob.get("characterName")
+    partner = blob.get("partnerCharacterName")
     code = player.get("validationCode")
     return {
         "playerId": player.get("playerId"),
         "characterId": blob.get("characterId"),
         "characterName": cname,
-        "partnerCharacterName": blob.get("partnerCharacterName"),
+        "partnerCharacterName": partner,
         "characterImageUrl": _character_image_url(cname) if cname else None,
+        "partnerCharacterImageUrl": _character_image_url(partner) if partner else None,
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
     }
@@ -368,16 +394,116 @@ def _web_player_token(player: dict, game_id: str) -> str:
     return issue_player_token(game_id, int(pid) if not isinstance(pid, Decimal) else int(pid), PLAYER_TOKEN_SECRET)
 
 
+def _verified_email(event, game_id, values):
+    receipt = event.get("email_verification")
+    if not isinstance(receipt, str):
+        raise VerificationError("VerificationRequired", 403)
+    table = verification_table(dynamo_r)
+    record = require_verified_registration(table, PLAYER_TOKEN_SECRET, game_id, values, receipt)
+    return table, record
+
+
+def _find_verified_player(table, game_id, email):
+    mapping = table.get_item(
+        Key={"id": identity_id(PLAYER_TOKEN_SECRET, game_id, email)}, ConsistentRead=True,
+    ).get("Item")
+    if not mapping:
+        return _find_existing_player_by_email(game_id, email)
+    player = gp_table.get_item(
+        Key={"gameId": game_id, "playerId": int(mapping["playerId"])}, ConsistentRead=True,
+    ).get("Item")
+    if not player or normalize_email(player.get("email") or "") != email:
+        log("verified_player_mapping_invalid", {"gameId": game_id})
+        raise VerificationError("VerificationUnavailable", 503)
+    return player
+
+
+def _complete_verified_player(table, record, game_id, player_id):
+    verified_at = datetime.fromtimestamp(int(record["verifiedAt"]), timezone.utc).isoformat().replace("+00:00", "Z")
+    gp_table.update_item(
+        Key={"gameId": game_id, "playerId": int(player_id)},
+        UpdateExpression="SET emailVerifiedAt = if_not_exists(emailVerifiedAt, :at), emailVerificationMethod = :method",
+        ConditionExpression="attribute_exists(playerId)",
+        ExpressionAttributeValues={":at": verified_at, ":method": "email-code"},
+    )
+    complete_registration(table, record, player_id)
+
+
+def _existing_web_response(table, record, game_id, game_type, player):
+    _complete_verified_player(table, record, game_id, player["playerId"])
+    return _json_sanitize({
+        "ok": True, "created_new": False, "already_joined": True,
+        "gameId": game_id, "gameType": game_type,
+        "playerToken": _web_player_token(player, game_id),
+        "assignment": _web_assignment(game_type, player),
+    })
+
+
+def _put_verified_player(table, record, player, max_players, now):
+    """Commit identity, player and capacity together; a lost response is safely recoverable."""
+    game_id = player["gameId"]
+    challenge_id = record["id"].split(":", 1)[1]
+    transactions = [
+        {"Update": {
+            "TableName": games_table.name, "Key": {"gameId": game_id},
+            "UpdateExpression": "SET lastJoinAt = :now, updatedAt = :now ADD playersCount :one",
+            "ConditionExpression": (
+                "attribute_exists(gameId) AND (attribute_not_exists(playersCount) OR playersCount < :max) "
+                "AND (attribute_not_exists(isActive) OR isActive = :active)"
+            ),
+            "ExpressionAttributeValues": {":now": now, ":one": 1, ":max": max_players, ":active": True},
+        }},
+        {"Put": {
+            "TableName": gp_table.name, "Item": player,
+            "ConditionExpression": "attribute_not_exists(playerId)",
+        }},
+        {"Put": {
+            "TableName": table.name,
+            "Item": {"id": identity_id(PLAYER_TOKEN_SECRET, game_id, player["email"]), "playerId": player["playerId"]},
+            "ConditionExpression": "attribute_not_exists(id)",
+        }},
+        {"ConditionCheck": {
+            "TableName": table.name, "Key": {"id": record["recipientId"]},
+            "ConditionExpression": "challengeId = :cid",
+            "ExpressionAttributeValues": {":cid": challenge_id},
+        }},
+        {"ConditionCheck": {
+            "TableName": table.name, "Key": {"id": record["id"]},
+            "ConditionExpression": "attribute_exists(verifiedAt) AND expiresAt > :now AND attempts < :max",
+            "ExpressionAttributeValues": {":now": int(time.time()), ":max": 5},
+        }},
+    ]
+    try:
+        table.meta.client.transact_write_items(TransactItems=transactions)
+    except Exception as exc:
+        response = getattr(exc, "response", {})
+        if response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            reasons = response.get("CancellationReasons") or []
+            failed = {index for index, reason in enumerate(reasons) if reason.get("Code") == "ConditionalCheckFailed"}
+            if 3 in failed:
+                raise VerificationError("VerificationSuperseded", 409) from exc
+            if 4 in failed:
+                raise VerificationError("VerificationExpired", 410) from exc
+            if 2 in failed:
+                return "exists"
+            if 0 in failed:
+                current = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+                if not current:
+                    raise VerificationError("GameNotFound", 404) from exc
+                if not current.get("isActive", True):
+                    raise VerificationError("GameInactive", 403) from exc
+                return "full"
+            if 1 in failed:
+                return "collision"
+        raise
+    return "created"
+
+
 def _handle_web_assign(event: dict) -> dict:
     game_id = (event or {}).get("game_id", "").strip()
-    email_raw = (event or {}).get("email", "")
-    instagram_raw = (event or {}).get("instagram_username")
-    email = normalize_email(email_raw) if email_raw else ""
 
     if not game_id:
         return {"ok": False, "reason": "missing_game_id"}
-    if not email:
-        return {"ok": False, "reason": "missing_email"}
 
     meta = _get_game_meta(game_id)
     if not meta:
@@ -388,51 +514,55 @@ def _handle_web_assign(event: dict) -> dict:
     game_type = (meta.get("gameType") or "UNKNOWN").upper()
     if game_type not in WEB_ASSIGN_GAME_TYPES:
         return {"ok": False, "reason": "unsupported_game_type", "gameType": game_type}
+    # Instagram-channel games register only via DM (keeps PSID identity and quiz gating).
+    if resolve_game_access(meta)["joinChannel"] != "web":
+        return {"ok": False, "reason": "web_join_disabled", "gameType": game_type}
 
-    pf = _participant_fields(meta)
-    if _field_required(pf, "email") and not is_valid_email(email):
-        return {"ok": False, "reason": "invalid_email"}
-    ig_handle = _normalize_instagram_handle(instagram_raw)
-    if _field_required(pf, "instagram") and not ig_handle:
-        return {"ok": False, "reason": "missing_instagram"}
+    try:
+        values = registration_values(meta, {**event, "instagram": event.get("instagram_username")})
+    except RegistrationError as exc:
+        return {"ok": False, "reason": str(exc)}
+    email = values.get("email", "")
+    ig_handle = values.get("instagram")
+    phone = values.get("phone")
 
-    existing = _find_existing_player_by_email(game_id, email)
+    verified_table, verified_record = _verified_email(event, game_id, values) if email else (None, None)
+    existing = _find_verified_player(verified_table, game_id, email) if email else None
     if existing:
-        return _json_sanitize({
-            "ok": True,
-            "created_new": False,
-            "already_joined": True,
-            "gameId": game_id,
-            "gameType": game_type,
-            "playerToken": _web_player_token(existing, game_id),
-            "assignment": _web_assignment(game_type, existing),
-        })
+        return _existing_web_response(verified_table, verified_record, game_id, game_type, existing)
 
     max_players_raw = meta.get("maxPlayers") or 9999
     max_players = int(max_players_raw) if not isinstance(max_players_raw, Decimal) else int(max_players_raw)
     now = _iso_now()
-    try:
-        _ensure_game_counters(game_id)
-    except Exception as e:
-        log("assign_ensure_counters_failed", {"error": repr(e), "gameId": game_id})
+    if not email:
+        try:
+            _ensure_game_counters(game_id)
+        except Exception as e:
+            log("assign_ensure_counters_failed", {"error": repr(e), "gameId": game_id})
+        if not _reserve_player_slot(game_id, max_players, now):
+            return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
 
-    if not _reserve_player_slot(game_id, max_players, now):
-        return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
-
-    display_name = f"@{ig_handle}" if ig_handle else email.split("@", 1)[0]
     for _ in range(6):
         new_pid = int(_get_last_player_id(game_id)) + 1
+        display_name = f"@{ig_handle}" if ig_handle else (email.split("@", 1)[0] if email else f"Jugador {new_pid}")
         base_item = {
             "gameId": game_id,
             "playerId": new_pid,
-            "email": email,
             "joinSource": "web",
             "joinedAt": now,
             "validated": False,
             "validationCode": _code4(),
         }
+        if email:
+            base_item["email"] = email
+            base_item["emailVerifiedAt"] = datetime.fromtimestamp(
+                int(verified_record["verifiedAt"]), timezone.utc,
+            ).isoformat().replace("+00:00", "Z")
+            base_item["emailVerificationMethod"] = "email-code"
         if ig_handle:
             base_item["instagramUsername"] = f"@{ig_handle}"
+        if phone:
+            base_item["phone"] = phone
 
         assigner = ASSIGNERS.get(game_type, assign_generic)
         patch, _, _ = assigner({
@@ -457,7 +587,21 @@ def _handle_web_assign(event: dict) -> dict:
                 blob["raffleEligible"] = False
 
         try:
-            _put_player(base_item)
+            if email:
+                outcome = _put_verified_player(verified_table, verified_record, base_item, max_players, now)
+                if outcome == "collision":
+                    continue
+                if outcome == "full":
+                    return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
+                if outcome == "exists":
+                    # Another confirmation won the same identity; recover it without reserving another slot.
+                    winner = _find_verified_player(verified_table, game_id, email)
+                    if not winner:
+                        raise VerificationError("VerificationUnavailable", 503)
+                    return _existing_web_response(verified_table, verified_record, game_id, game_type, winner)
+                complete_registration(verified_table, verified_record, new_pid)
+            else:
+                _put_player(base_item)
             log("assign_web_ok", {"gameId": game_id, "playerId": new_pid, "gameType": game_type})
             return _json_sanitize({
                 "ok": True,
@@ -468,12 +612,15 @@ def _handle_web_assign(event: dict) -> dict:
                 "assignment": _web_assignment(game_type, base_item),
             })
         except ClientError as e:
+            if email:
+                raise
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 continue
-            try:
-                _rollback_player_slot(game_id, now)
-            except Exception as re:
-                log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
+            if not email:
+                try:
+                    _rollback_player_slot(game_id, now)
+                except Exception as re:
+                    log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
             return {"ok": False, "reason": "put_failed", "detail": str(e)}
 
     try:
@@ -489,8 +636,10 @@ def lambda_handler(event, context):
         if source == "web":
             return _handle_web_assign(event)
         return _handle_instagram_assign(event)
+    except VerificationError as e:
+        return {"ok": False, "reason": e.code}
     except Exception as e:
-        log("assign_internal_error", {"error": repr(e)})
+        log("assign_internal_error", {"errorType": type(e).__name__})
         return {"ok": False, "reason": "internal_error", "detail": repr(e)}
 
 
@@ -544,11 +693,20 @@ def _handle_instagram_assign(event: dict) -> dict:
         existing = _find_existing_player_by_psid(game_id, psid)
         if existing:
             pid = existing.get("playerId")
-            _send_single_dm(psid, "Ya estás dentro ✅\nContinúa jugando! 🚀")
+            already_in = "Ya estás dentro ✅\nContinúa jugando! 🚀"
             quiz_enabled = bool(meta.get("quizOrder"))
-            if quiz_enabled:
+            if _is_mobile_play(meta):
+                # Same PSID player: re-issue a personal link (no new player, no attempt consumed).
+                if quiz_enabled and not _quiz_completed(existing, game_type):
+                    _send_single_dm(psid, already_in)
+                    _enqueue_quiz_start(game_id, psid)
+                else:
+                    _send_access_link_then_raffle(psid, game_id, pid, meta, intro_text=already_in)
+            elif quiz_enabled:
+                _send_single_dm(psid, already_in)
                 _enqueue_quiz_start(game_id, psid)
             else:
+                _send_single_dm(psid, already_in)
                 if _requires_validation(meta, game_type):
                     code = existing.get("validationCode")
                     if code is not None:
@@ -627,13 +785,33 @@ def _handle_instagram_assign(event: dict) -> dict:
             if patch:
                 for k, v in patch.items():
                     base_item[k] = v
+            if game_type == "STACK":
+                base_item["type"]["STACK"]["raffleEligible"] = False
 
             try:
                 _put_player(base_item)
 
                 quiz_enabled = bool(meta.get("quizOrder"))
+                mobile = _is_mobile_play(meta)
 
-                if game_type == "EMPAREJA2":
+                if mobile:
+                    # Mobile play: same images/assignment/quiz order; finish with a personal link.
+                    if extra_messages:
+                        _send_bulk_messages(extra_messages)
+                    if game_type == "EMPAREJA2":
+                        time.sleep(2)
+                    if quiz_enabled:
+                        tail = MOBILE_QUIZ_NOTICE
+                    else:
+                        tail = EMPAREJA2_MOBILE_NOTICE if game_type == "EMPAREJA2" else ""
+                    intro = "\n\n".join(p.strip() for p in (welcome_header or "", tail) if p and p.strip()) or None
+                    if quiz_enabled:
+                        if intro:
+                            _send_single_dm(psid, intro)
+                        _enqueue_quiz_start(game_id, psid)
+                    else:
+                        _send_access_link_then_raffle(psid, game_id, new_pid, meta, intro_text=intro)
+                elif game_type == "EMPAREJA2":
                     # 1) Image first, 2) wait so image is delivered first, 3) single message: welcome + (quiz notice or code)
                     if extra_messages:
                         _send_bulk_messages(extra_messages)

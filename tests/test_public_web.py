@@ -43,6 +43,239 @@ SECRET = "test-secret"
 public_mod.PLAYER_TOKEN_SECRET = SECRET
 
 
+@pytest.mark.parametrize("selected,key,expected", [
+    ("client", "users/owner/logos/client.png", "signed:client"),
+    (None, "users/owner/logos/client.png", None),
+    ("missing", "users/owner/logos/client.png", None),
+    ("client", "users/someone-else/logos/client.png", None),
+])
+def test_public_game_exposes_only_selected_owner_logo(selected, key, expected, monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    monkeypatch.setenv("USERS_TABLE", "users")
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"media": {"logo": {
+        "selectedId": selected, "items": [{"id": "client", "key": key}],
+    }}}}
+    s3 = MagicMock()
+    s3.generate_presigned_url.return_value = "signed:client"
+    meta = {"gameId": "ABC123", "gameType": "EMPAREJA2", "ownerUserId": "owner"}
+    with patch.object(public_mod, "_get_game", return_value=meta), \
+         patch.object(public_mod.dynamo_r, "Table", return_value=table), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
+    assert response["statusCode"] == 200
+    payload = json.loads(response["body"])
+    assert payload["clientLogoUrl"] == expected
+    assert "media" not in payload
+    assert "ownerUserId" not in payload
+    if selected:
+        table.get_item.assert_called_once_with(Key={"userId": "owner"}, ProjectionExpression="media")
+    if expected:
+        s3.generate_presigned_url.assert_called_once_with(
+            "get_object", Params={"Bucket": "media", "Key": key}, ExpiresIn=3600,
+        )
+    else:
+        s3.generate_presigned_url.assert_not_called()
+
+
+def test_public_logo_without_owner_does_not_read_users(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    with patch.object(public_mod.dynamo_r, "Table") as table:
+        assert public_mod._client_appearance({}) == {
+            "clientLogoUrl": None, "appearance": {"colors": None, "themeMode": "dark"},
+        }
+    table.assert_not_called()
+
+
+def test_public_appearance_uses_owner_colors_and_logo(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    monkeypatch.setenv("USERS_TABLE", "users")
+    appearance = {"colors": {"primary": "#ff0000", "accent": "#00ff00"}, "themeMode": "light"}
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"media": {
+        "appearance": appearance,
+        "logo": {"selectedId": "chosen", "items": [{"id": "chosen", "key": "users/owner/logos/custom.png"}]},
+    }}}
+    s3 = MagicMock()
+    s3.generate_presigned_url.return_value = "signed:custom"
+    with patch.object(public_mod.dynamo_r, "Table", return_value=table), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        result = public_mod._client_appearance({"ownerUserId": "owner"})
+    assert result == {"clientLogoUrl": "signed:custom", "appearance": appearance}
+
+
+def test_public_game_adds_signed_prize_catalog_at_top_level(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    key = "games/owner/ABC123/ranking/01234567-89ab-cdef-0123-456789abcdef.png"
+    meta = {
+        "gameId": "ABC123",
+        "gameType": "T1MER",
+        "ownerUserId": "owner",
+        "prizeCatalog": {"ranking": {"name": "Top", "limit": 3, "imageKey": key}},
+    }
+    s3 = MagicMock()
+    s3.generate_presigned_url.return_value = "signed:prize"
+    with patch.object(public_mod, "_get_game", return_value=meta), \
+         patch.object(public_mod, "_client_appearance", return_value={
+             "clientLogoUrl": None, "appearance": {"colors": None, "themeMode": "dark"},
+         }), \
+         patch.object(public_mod, "_t1mer_ranking", return_value=[]), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
+    payload = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert payload["prizeCatalog"]["ranking"]["imageUrl"] == "signed:prize"
+    assert "game" not in payload
+    s3.generate_presigned_url.assert_called_once_with(
+        "get_object", Params={"Bucket": "media", "Key": key}, ExpiresIn=3600,
+    )
+
+
+def test_player_response_adds_catalog_and_keeps_won_raffle_prize(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    game_id = "ABC123"
+    validation_key = (
+        "games/owner/ABC123/validation/01234567-89ab-cdef-0123-456789abcdef.png"
+    )
+    raffle_key = "games/owner/ABC123/raffle/11234567-89ab-cdef-0123-456789abcdef.png"
+    meta = {
+        "gameId": game_id,
+        "gameType": "EMPAREJA2",
+        "ownerUserId": "owner",
+        "prizeCatalog": {
+            "validation": {"name": "Validado", "limit": 3, "imageKey": validation_key},
+            "raffle": {"name": "Sorteo", "limit": None, "imageKey": raffle_key},
+        },
+    }
+    player = {
+        "playerId": 7,
+        "validated": True,
+        "type": {"EMPAREJA2": {"raffleWin": True}},
+    }
+    token = issue_player_token(game_id, 7, SECRET)
+    s3 = MagicMock()
+    s3.generate_presigned_url.side_effect = ["signed:validation", "signed:raffle"]
+    with patch.object(public_mod, "_get_player", return_value=player), \
+         patch.object(public_mod, "_get_game", return_value=meta), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._handle_get_player({
+            "requestContext": {"http": {"method": "POST"}},
+            "body": json.dumps({"gameId": game_id, "playerToken": token}),
+        })
+    payload = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert payload["prizeCatalog"]["validation"]["imageUrl"] == "signed:validation"
+    assert payload["prizeCatalog"]["raffle"]["imageUrl"] == "signed:raffle"
+    assert {prize["kind"] for prize in payload["prizes"]} == {"validation", "raffle"}
+
+
+@pytest.mark.parametrize(("game_type", "slot"), [
+    ("EMPAREJA2", "validation"),
+    ("T1MER", "ranking"),
+    ("STACK", "ranking"),
+])
+def test_mobile_player_game_types_return_configured_catalog(game_type, slot, monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    meta = {
+        "gameId": "ABC123",
+        "gameType": game_type,
+        "ownerUserId": "owner",
+        "prizeCatalog": {slot: {"name": "Gift", "limit": None, "imageKey": None}},
+    }
+    with patch.object(public_mod, "stack_public_assignment", return_value={}), \
+         patch.object(public_mod, "_t1mer_ranking", return_value=[]):
+        response = public_mod._player_response(meta, {"playerId": 1}, "ABC123", 1, "token")
+    payload = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert payload["prizeCatalog"][slot]["imageUrl"] is None
+
+
+def test_legacy_player_response_omits_prize_catalog():
+    player = {"playerId": 7, "validated": True, "type": {"EMPAREJA2": {}}}
+    token = issue_player_token("ABC123", 7, SECRET)
+    with patch.object(public_mod, "_get_player", return_value=player), \
+         patch.object(public_mod, "_get_game", return_value={"gameType": "EMPAREJA2"}):
+        response = public_mod._handle_get_player({
+            "requestContext": {"http": {"method": "POST"}},
+            "body": json.dumps({"gameId": "ABC123", "playerToken": token}),
+        })
+    assert response["statusCode"] == 200
+    assert "prizeCatalog" not in json.loads(response["body"])
+
+
+@pytest.mark.parametrize("game_type", ["EMPAREJA2", "T1MER", "STACK"])
+def test_all_mobile_games_publish_owner_appearance(game_type):
+    branding = {"clientLogoUrl": None, "appearance": {
+        "colors": {"primary": "#ff0000", "accent": "#00ff00"}, "themeMode": "dark",
+    }}
+    slot = "validation" if game_type == "EMPAREJA2" else "ranking"
+    with patch.object(public_mod, "_get_game", return_value={
+             "gameId": "ABC123",
+             "gameType": game_type,
+             "prizeCatalog": {slot: {"name": "Gift", "limit": None, "imageKey": None}},
+         }), \
+         patch.object(public_mod, "_client_appearance", return_value=branding), \
+         patch.object(public_mod, "_t1mer_ranking", return_value=[]), \
+         patch.object(public_mod, "stack_game_config", return_value={}), \
+         patch.object(public_mod, "stack_ranking", return_value={"results": []}):
+        response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["appearance"] == branding["appearance"]
+    assert json.loads(response["body"])["prizeCatalog"][slot]["imageUrl"] is None
+
+
+@pytest.mark.parametrize("partner", ["Bob", None])
+def test_web_assignment_includes_partner_image(partner):
+    player = {
+        "playerId": 7, "validationCode": 1234,
+        "type": {"EMPAREJA2": {"characterName": "Alice", "partnerCharacterName": partner}},
+    }
+    with patch("assigners.empareja2._character_image_url", side_effect=lambda name: f"signed:{name}") as image:
+        result = assign_mod._empareja2_web_assignment(player)
+    assert result["characterImageUrl"] == "signed:Alice"
+    assert result["partnerCharacterImageUrl"] == ("signed:Bob" if partner else None)
+    assert image.call_count == (2 if partner else 1)
+
+
+@pytest.mark.parametrize("bucket", ["characters", ""])
+def test_recovered_empareja2_assignment_includes_partner_image(bucket, monkeypatch):
+    monkeypatch.setenv("CHAR_BUCKET", bucket)
+    player = {
+        "playerId": 7, "validationCode": 1234,
+        "type": {"EMPAREJA2": {"characterName": "Alice", "partnerCharacterName": "Bob"}},
+    }
+    s3 = MagicMock()
+    s3.generate_presigned_url.side_effect = lambda operation, **kwargs: f"signed:{kwargs['Params']['Key']}"
+    token = issue_player_token("ABC123", 7, SECRET)
+    with patch.object(public_mod, "_get_player", return_value=player), \
+         patch.object(public_mod, "_get_game", return_value={"gameType": "EMPAREJA2"}), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._handle_get_player({
+            "requestContext": {"http": {"method": "POST"}},
+            "body": json.dumps({"gameId": "ABC123", "playerToken": token}),
+        })
+    assert response["statusCode"] == 200
+    assignment = json.loads(response["body"])["assignment"]
+    assert assignment["characterImageUrl"] == ("signed:Alice.png" if bucket else None)
+    assert assignment["partnerCharacterImageUrl"] == ("signed:Bob.png" if bucket else None)
+    assert s3.generate_presigned_url.call_count == (2 if bucket else 0)
+
+
+def test_partner_image_signing_failure_keeps_own_image_and_logs(monkeypatch):
+    monkeypatch.setenv("CHAR_BUCKET", "characters")
+    player = {"type": {"EMPAREJA2": {"characterName": "Alice", "partnerCharacterName": "Bob"}}}
+    s3 = MagicMock()
+    s3.generate_presigned_url.side_effect = ["signed:Alice.png", ValueError("Cannot sign")]
+    with patch.object(public_mod.boto3, "client", return_value=s3), \
+         patch.object(public_mod, "ClientError", RuntimeError), \
+         patch.object(public_mod, "BotoCoreError", RuntimeError), \
+         patch.object(public_mod, "log") as log:
+        result = public_mod._empareja2_assignment_from_player(player)
+    assert result["characterImageUrl"] == "signed:Alice.png"
+    assert result["partnerCharacterImageUrl"] is None
+    log.assert_called_once_with("character_image_url_error", {"error": "Cannot sign"})
+
+
 def test_player_token_roundtrip():
     token = issue_player_token("ABC123", 7, SECRET, ttl_seconds=3600)
     claims = verify_player_token(token, SECRET)
@@ -95,7 +328,8 @@ def test_default_participant_fields_t1mer():
     assert pf["instagram"]["required"] is False
 
 
-def test_web_assign_requires_email():
+@patch.object(assign_mod, "_get_game_meta", return_value={"gameType": "EMPAREJA2"})
+def test_web_assign_requires_email(_mock_meta):
     out = assign_mod._handle_web_assign({"source": "web", "game_id": "ABC123", "email": ""})
     assert out["ok"] is False
     assert out["reason"] == "missing_email"
@@ -107,6 +341,7 @@ def test_web_assign_game_not_found(mock_meta):
     assert out["reason"] == "game_not_found"
 
 
+@pytest.mark.usefixtures("verified_web_assignment")
 @patch.object(assign_mod, "_find_existing_player_by_email", return_value=None)
 @patch.object(assign_mod, "_empareja2_web_assignment", return_value={"characterName": "Alice", "validationCode": 1234, "validated": False})
 @patch.object(assign_mod, "_put_player")
@@ -143,6 +378,7 @@ def test_web_assign_creates_player(mock_meta, mock_assigners, *_mocks):
     assert out["assignment"]["characterName"] == "Alice"
 
 
+@pytest.mark.usefixtures("verified_web_assignment")
 @patch.object(assign_mod, "_find_existing_player_by_email", return_value=None)
 @patch.object(assign_mod, "_put_player")
 @patch.object(assign_mod, "_reserve_player_slot", return_value=True)
@@ -175,7 +411,7 @@ def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
 @patch.object(assign_mod, "_empareja2_web_assignment", return_value={"characterName": "X", "validationCode": 1234, "validated": False})
 @patch.object(assign_mod, "_find_existing_player_by_email")
 @patch.object(assign_mod, "_get_game_meta")
-def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment):
+def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment, verified_web_assignment):
     mock_meta.return_value = {
         "gameId": "ABC123",
         "gameType": "EMPAREJA2",

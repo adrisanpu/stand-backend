@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Shared Stand SES sender identity; deploy once in us-east-1, not per environment
+
+Parameters:
+  EmailIdentityName:
+    Type: String
+    Default: playstand.app
+    Description: Domain owned by Stand whose DNS records the operator can manage
+
+Resources:
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EmailIdentity: !Ref EmailIdentityName
+      DkimAttributes:
+        SigningEnabled: true
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+      FeedbackAttributes:
+        EmailForwardingEnabled: true
+
+Outputs:
+  EmailIdentityName:
+    Value: !Ref EmailIdentity
+  EmailIdentityArn:
+    Value: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${EmailIdentityName}"
+  DkimDNSTokenName1:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName1
+  DkimDNSTokenValue1:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue1
+  DkimDNSTokenName2:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName2
+  DkimDNSTokenValue2:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue2
+  DkimDNSTokenName3:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenName3
+  DkimDNSTokenValue3:
+    Value: !GetAtt EmailIdentity.DkimDNSTokenValue3

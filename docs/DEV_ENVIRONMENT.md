@@ -1,6 +1,6 @@
 # Dev environment setup
 
-This guide covers one-time AWS setup and deploy for the **dev** stack (`stand-backend-dev`). Production uses `sam deploy --config-env prod` unchanged.
+This guide covers one-time AWS setup and deploy for the **dev** stack (`stand-backend-dev`). Production uses `sam deploy --config-env prod` with its own authorized signing-secret configuration.
 
 ## Prerequisites
 
@@ -41,6 +41,27 @@ Create secrets (Stripe **test mode** keys recommended for dev):
 
 Same JSON shape as the prod secrets under `stand/prod/*`.
 
+### Participant signing and personal links
+
+The SAM `PlayerTokenSecret` parameter is required and has no default. Supply a
+private key of at least 32 characters using the approved deployment mechanism,
+not a committed `samconfig.toml` value. Assignment, quiz and public session
+exchange use the same parameter through the SAM Globals environment.
+
+Reuse an existing sufficiently strong key where possible. If the previous
+environment used the old development default or a short key, coordinate key
+provisioning/rotation before enabling Instagram-to-mobile access: changing the
+key invalidates existing participant/prize tokens. This development change does
+not provision or rotate secrets.
+
+The dev/prod `PublicAppOrigin` values are set in `samconfig.toml`, so personal
+links point to the corresponding frontend. If deploying from CI, arrange secure
+injection or reuse of the required CloudFormation parameter in the deployment
+configuration before pushing to the auto-deploy `dev` branch; the repository
+does not contain its value. Deploy the backend before publishing the new
+frontend, and verify the Instagram button/quiz journey in an authorized test
+event (including its in-app browser).
+
 ## 2. Cognito App Client (dev)
 
 In the **same** User Pool as prod (`us-east-1_54eXBuNq1`):
@@ -70,6 +91,38 @@ Cognito returns this when the app client has a **client secret** but the fronten
 Both stacks use `StageName: prod` (literal) on HTTP APIs so CloudFormation keeps `GameApiprodStage` on prod updates. Dev is isolated by **API Gateway id** (`stand-dev-game-api`) and **DynamoDB** (`stand-dev-*`), not by a `/dev` URL path. Frontend `VITE_API_BASE_URL` must end with `/prod` for both environments.
 
 ## 3. Deploy backend dev stack
+
+### Email verification prerequisite and rollout
+
+Follow [EMAIL_SETUP.md](EMAIL_SETUP.md) to provision the **single shared**
+`playstand.app` SES identity in **us-east-1**, publish its DNS records, verify
+`no-reply@playstand.app`, and prepare sending/monitoring. No transactional
+provider is currently configured; adding parameters alone does not enable
+delivery. Do not create duplicate domain identities in dev/prod stacks.
+`samconfig.toml` explicitly supplies `EmailSenderAddress=no-reply@playstand.app`
+and `EmailIdentityName=playstand.app` for both environments.
+
+The backend adds `stand-dev-email-verification-table` (and the corresponding
+prod table), with string key `id` and numeric epoch-seconds `expiresAt` TTL for
+pending challenges and rate counters. Only public/assign receive its table name.
+Permanent HMAC-keyed identity-to-player mappings in this table omit `expiresAt`;
+they must survive challenge expiry to prevent concurrent duplicate registration.
+Public request limits are 5/email/hour, 3000/IP/hour and 20000/environment/hour;
+SES sending quotas and reputation remain account/region-wide across dev/prod.
+Keep the existing strong `PlayerTokenSecret`; verification derives its own
+purpose-separated key, so no extra secret is committed or provisioned.
+
+Before publishing email-enabled forms, verify a controlled mailbox end-to-end
+in dev: request an email in Spanish/English, honor the resend timestamp, submit
+`challengeId` + `code` to join, and check expiration/rate-limit handling,
+idempotent retries returning the same participant before original expiry, and
+rejection when a challenge is reused for different registration data.
+Use a verified recipient while SES is in its sandbox; do not test arbitrary
+participants. Deploy backend before UI in a coordinated window: older email
+forms cannot satisfy the new join contract. Refresh cached clients and avoid
+live email-enabled campaigns during the transition. Valid sessions, Instagram
+and no-email registration remain supported. Production requires explicit
+approval, SES production access and manual deployment; nothing here deploys it.
 
 ```bash
 sam build
@@ -122,6 +175,9 @@ python scripts/upload_user_media_defaults.py --bucket stand-dev-user-media-<AWS_
 - [ ] Login at `http://localhost:5173` hits dev API (check Network tab: dev API host, path `/prod`)
 - [ ] Login at `https://dev.playstand.app` works
 - [ ] Create a test game; prod tables unchanged
+- [ ] Shared SES identity is verified in us-east-1; controlled-mailbox OTP request/join succeeds
+- [ ] Sender reputation/quota alarms and bounce/complaint handling are operational before public sending
+- [ ] Email-enabled form rollout is coordinated; existing sessions, Instagram and no-email joins still work
 - [ ] `sam deploy --config-env prod` changeset has no resource replacements (only metadata or empty)
 
 ## Tear down dev stack

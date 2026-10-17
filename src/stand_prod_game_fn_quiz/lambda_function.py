@@ -8,11 +8,19 @@ import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob
+from stand_common.game_access import resolve_game_access
+from stand_common.player_access import (
+    ACCESS_LINK_FAILED_TEXT,
+    access_link_message,
+    access_link_ttl_seconds,
+    issue_access_link,
+)
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
 IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
+PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
 # ==================================
 
 dynamo_r = boto3.resource("dynamodb")
@@ -119,6 +127,24 @@ def _send_validation_code_then_raffle(psid: str, code, meta: dict) -> None:
     messages = [{"psid": psid, "text": f"🎟️ Tu código es: {code}"}]
     messages.extend(_raffle_follow_messages(psid, meta))
     _invoke_instagram_sender(messages)
+
+
+def _send_access_link_then_raffle(psid: str, game_id: str, player_id: int, meta: dict, intro_text: str | None = None) -> bool:
+    """Mobile play: personal one-use link for the existing PSID player, then raffle follows."""
+    messages = [{"psid": psid, "text": intro_text}] if intro_text else []
+    ttl = access_link_ttl_seconds()
+    try:
+        url = issue_access_link(gp_table, game_id, int(player_id), PLAYER_TOKEN_SECRET, ttl_seconds=ttl)
+    except Exception as e:
+        # Never log the link/token itself.
+        log("quiz_access_link_failed", {"error": type(e).__name__, "gameId": game_id, "playerId": player_id})
+        messages.append({"psid": psid, "text": ACCESS_LINK_FAILED_TEXT})
+        _invoke_instagram_sender(messages)
+        return False
+    messages.append(access_link_message(psid, url, ttl))
+    messages.extend(_raffle_follow_messages(psid, meta))
+    _invoke_instagram_sender(messages)
+    return True
 
 
 def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> bool:
@@ -554,6 +580,12 @@ def lambda_handler(event, context):
                     results.append({"psid": psid, "started": False, "reason": "bad_playerId"})
                     continue
 
+                if (resolve_game_access(meta)["playMode"] == "mobile"
+                        and get_game_type_blob(player, game_type).get("quizCompleted")):
+                    sent = _send_access_link_then_raffle(psid, game_id, pid, meta)
+                    results.append({"psid": psid, "started": False, "completed": True, "accessSent": sent})
+                    continue
+
                 # Intro is sent in assign; here we only send the first question
                 first_q_msg = _build_quiz_question_message(psid, first_qid, quiz_questions)
                 if first_q_msg:
@@ -607,6 +639,10 @@ def lambda_handler(event, context):
         if pid is None:
             return {"ok": False, "error": "bad_playerId"}
 
+        if (resolve_game_access(meta)["playMode"] == "mobile"
+                and get_game_type_blob(player, game_type).get("quizCompleted")):
+            return {"ok": True, "completed": True, "gameId": game_id, "playerId": pid}
+
         _save_quiz_answer(game_id, pid, game_type, question_id, answer_id)
 
         next_qid = _next_question_id(question_id, quiz_order)
@@ -617,6 +653,10 @@ def lambda_handler(event, context):
             # Games can opt out of validation: send custom message instead of code
             type_blob = get_game_type_blob(meta, game_type)
             requires_validation = _requires_validation(meta, game_type)
+
+            if resolve_game_access(meta)["playMode"] == "mobile":
+                sent = _send_access_link_then_raffle(psid, game_id, pid, meta, intro_text="¡Gracias por responder! ✅")
+                return {"ok": sent, "completed": True, "accessSent": sent, "gameId": game_id, "playerId": pid}
 
             if not requires_validation:
                 msg = (type_blob.get("quizCompletedMessage") or "").strip()
