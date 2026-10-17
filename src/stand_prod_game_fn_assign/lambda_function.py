@@ -316,8 +316,8 @@ def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
     try:
         kwargs = {
             "KeyConditionExpression": Key("gameId").eq(game_id),
-            "ProjectionExpression": "gameId, playerId, email, instagramUsername, instagramProfilePicUrl, instagramPSID, joinedAt, validated, validationCode, #type",
-            "ExpressionAttributeNames": {"#type": "type"},
+            "ProjectionExpression": "gameId, playerId, email, #username, instagramUsername, instagramProfilePicUrl, instagramPSID, joinedAt, validated, validationCode, #type",
+            "ExpressionAttributeNames": {"#type": "type", "#username": "username"},
             "ConsistentRead": True,
         }
         while True:
@@ -358,7 +358,7 @@ def _empareja2_web_assignment(player: dict) -> dict:
 
 def _t1mer_web_assignment(player: dict) -> dict:
     code = player.get("validationCode")
-    display = (player.get("instagramUsername") or "").strip()
+    display = (player.get("instagramUsername") or player.get("username") or "").strip()
     if not display:
         email = (player.get("email") or "").strip()
         display = email.split("@", 1)[0] if email else f"Jugador {player.get('playerId', '')}"
@@ -525,6 +525,7 @@ def _handle_web_assign(event: dict) -> dict:
     email = values.get("email", "")
     ig_handle = values.get("instagram")
     phone = values.get("phone")
+    username = values.get("username")
 
     verified_table, verified_record = _verified_email(event, game_id, values) if email else (None, None)
     existing = _find_verified_player(verified_table, game_id, email) if email else None
@@ -544,7 +545,7 @@ def _handle_web_assign(event: dict) -> dict:
 
     for _ in range(6):
         new_pid = int(_get_last_player_id(game_id)) + 1
-        display_name = f"@{ig_handle}" if ig_handle else (email.split("@", 1)[0] if email else f"Jugador {new_pid}")
+        display_name = f"@{ig_handle}" if ig_handle else (username or (email.split("@", 1)[0] if email else f"Jugador {new_pid}"))
         base_item = {
             "gameId": game_id,
             "playerId": new_pid,
@@ -563,6 +564,8 @@ def _handle_web_assign(event: dict) -> dict:
             base_item["instagramUsername"] = f"@{ig_handle}"
         if phone:
             base_item["phone"] = phone
+        if username:
+            base_item["username"] = username
 
         assigner = ASSIGNERS.get(game_type, assign_generic)
         patch, _, _ = assigner({

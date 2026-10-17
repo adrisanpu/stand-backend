@@ -174,7 +174,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
 
         ranking.append({
             "playerId": pid,
-            "username": it.get("instagramUsername", ""),
+            "username": it.get("instagramUsername") or it.get("username", ""),
             "timer": timer_float,
             "score": score_float,
         })
@@ -190,7 +190,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         "ok": True,
         "gameId": game_id,
         "playerId": player_id,
-        "username": item.get("instagramUsername", ""),
+        "username": item.get("instagramUsername") or item.get("username", ""),
         "timer": timer_float,
         "score": score_int,
         "scoreUpdatedAt": now,
@@ -198,7 +198,8 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
     }
 
 
-def get_ranking(game_id: str, game_type_upper: str, gp_table, limit: int, log_fn):
+def get_ranking(game_id: str, game_type_upper: str, gp_table, limit: int, log_fn,
+                profile_pic_url_fn=None):
     """
     Ranking T1MER: score ASC (menor mejor)
     Lee todos los players del game (partition pequeña), filtra los que tengan score+timer en type.T1MER.*
@@ -242,8 +243,11 @@ def get_ranking(game_id: str, game_type_upper: str, gp_table, limit: int, log_fn
 
         ranking.append({
             "playerId": pid,
-            "username": it.get("instagramUsername", ""),
-            "profilePicUrl": (it.get("instagramProfilePicUrl") or "").strip(),
+            "username": it.get("instagramUsername") or it.get("username", ""),
+            "profilePicUrl": (
+                profile_pic_url_fn(it) if profile_pic_url_fn
+                else (it.get("instagramProfilePicUrl") or "").strip()
+            ),
             "timer": timer_float,
             "score": score_float,
         })

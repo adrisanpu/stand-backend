@@ -588,12 +588,15 @@ def test_web_registration_assigns_code_for_either_gameplay_mode(gt, pm, verified
          patch.object(assign_mod, "_put_player") as create, \
          patch.object(assign_mod, "ASSIGNERS", {
              gt: lambda ctx: ({"type": player["type"]}, "", [])}):
-        result = assign_mod._handle_web_assign({"source": "web", "game_id": "ABCDEF", "email": "player@example.test"})
+        result = assign_mod._handle_web_assign({
+            "source": "web", "game_id": "ABCDEF", "email": "player@example.test", "username": "Player",
+        })
     assert result["ok"]
     assert result["assignment"]["validationCode"]
     assert result["assignment"]["playerId"] == 7
     assert result["playerToken"]
     create.assert_called_once()
+    assert create.call_args.args[0]["username"] == "Player"
     assert "instagramPSID" not in create.call_args.args[0]
 
 

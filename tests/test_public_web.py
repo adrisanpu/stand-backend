@@ -224,6 +224,138 @@ def test_all_mobile_games_publish_owner_appearance(game_type):
     assert json.loads(response["body"])["prizeCatalog"][slot]["imageUrl"] is None
 
 
+def test_web_participant_can_request_a_scoped_photo_upload(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    token = issue_player_token("ABC123", 7, SECRET)
+    s3 = MagicMock()
+    s3.generate_presigned_post.return_value = {
+        "url": "signed:post",
+        "fields": {"key": "players/ABC123/7/profile-photo.png", "policy": "signed"},
+    }
+    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._handle_player_photo({"body": json.dumps({
+            "action": "upload-url",
+            "playerToken": token,
+            "contentType": "image/png",
+            "sizeBytes": 1024,
+        })})
+
+    payload = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert payload["uploadUrl"] == "signed:post"
+    assert payload["uploadFields"]["policy"] == "signed"
+    assert payload["photoKey"].startswith("players/ABC123/7/profile-")
+    s3.generate_presigned_post.assert_called_once_with(
+        Bucket="media",
+        Key=payload["photoKey"],
+        Fields={"Content-Type": "image/png"},
+        Conditions=[
+            {"Content-Type": "image/png"},
+            ["content-length-range", 1, 5 * 1024 * 1024],
+        ],
+        ExpiresIn=300,
+    )
+
+
+@pytest.mark.parametrize(("image_type", "size", "error"), [
+    ("image/gif", 100, "UnsupportedPhotoType"),
+    ("image/png", 0, "InvalidPhotoSize"),
+    ("image/png", 5 * 1024 * 1024 + 1, "InvalidPhotoSize"),
+])
+def test_photo_upload_rejects_unsupported_or_oversized_images(monkeypatch, image_type, size, error):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    token = issue_player_token("ABC123", 7, SECRET)
+    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}):
+        response = public_mod._handle_player_photo({"body": json.dumps({
+            "action": "upload-url", "playerToken": token,
+            "contentType": image_type, "sizeBytes": size,
+        })})
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"])["error"] == error
+
+
+def test_only_web_participants_can_upload_profile_photos():
+    token = issue_player_token("ABC123", 7, SECRET)
+    with patch.object(public_mod, "_get_player", return_value={"instagramPSID": "psid"}):
+        response = public_mod._handle_player_photo({"body": json.dumps({
+            "action": "upload-url", "playerToken": token,
+            "contentType": "image/png", "sizeBytes": 10,
+        })})
+    assert response["statusCode"] == 403
+    assert json.loads(response["body"])["error"] == "WebPhotoUploadOnly"
+
+
+def test_photo_completion_validates_image_and_persists_s3_key(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    token = issue_player_token("ABC123", 7, SECRET)
+    photo_key = "players/ABC123/7/profile-01234567-89ab-cdef-0123-456789abcdef.png"
+    s3 = MagicMock()
+    s3.head_object.return_value = {"ContentType": "image/png", "ContentLength": 12}
+    s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"\x89PNG\r\n\x1a\nxxxx"))}
+    s3.generate_presigned_url.return_value = "signed:get"
+    update_item = MagicMock()
+    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}), \
+         patch.object(public_mod.boto3, "client", return_value=s3), \
+         patch.object(public_mod.gp_table, "update_item", update_item):
+        response = public_mod._handle_player_photo({"body": json.dumps({
+            "action": "complete", "playerToken": token, "photoKey": photo_key,
+        })})
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["profilePicUrl"] == "signed:get"
+    update_item.assert_called_once_with(
+        Key={"gameId": "ABC123", "playerId": 7},
+        UpdateExpression="SET participantPhotoKey = :key",
+        ConditionExpression="attribute_exists(playerId) AND attribute_not_exists(participantPhotoKey)",
+        ExpressionAttributeValues={":key": photo_key},
+    )
+    s3.get_object.assert_called_once_with(Bucket="media", Key=photo_key, Range="bytes=0-11")
+
+
+def test_photo_completion_rejects_non_image_bytes(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    token = issue_player_token("ABC123", 7, SECRET)
+    photo_key = "players/ABC123/7/profile-01234567-89ab-cdef-0123-456789abcdef.png"
+    s3 = MagicMock()
+    s3.head_object.return_value = {"ContentType": "image/png", "ContentLength": 12}
+    s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"not-an-image"))}
+    update_item = MagicMock()
+    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}), \
+         patch.object(public_mod.boto3, "client", return_value=s3), \
+         patch.object(public_mod.gp_table, "update_item", update_item):
+        response = public_mod._handle_player_photo({"body": json.dumps({
+            "action": "complete", "playerToken": token, "photoKey": photo_key,
+        })})
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"])["error"] == "InvalidPhoto"
+    update_item.assert_not_called()
+
+
+def test_player_response_returns_signed_photo_for_play(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    player = {
+        "playerId": 7,
+        "joinSource": "web",
+        "participantPhotoKey": "players/ABC123/7/profile-photo.png",
+        "type": {"T1MER": {}},
+    }
+    s3 = MagicMock()
+    s3.generate_presigned_url.return_value = "signed:profile-photo"
+    with patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._player_response(
+            {"gameType": "T1MER"}, player, "ABC123", 7, "player-token",
+        )
+    payload = json.loads(response["body"])
+    assert response["statusCode"] == 200
+    assert payload["assignment"]["profilePicUrl"] == "signed:profile-photo"
+    s3.generate_presigned_url.assert_called_once_with(
+        "get_object",
+        Params={"Bucket": "media", "Key": player["participantPhotoKey"]},
+        ExpiresIn=3600,
+    )
+
+
 @pytest.mark.parametrize("partner", ["Bob", None])
 def test_web_assignment_includes_partner_image(partner):
     player = {
@@ -371,6 +503,7 @@ def test_web_assign_creates_player(mock_meta, mock_assigners, *_mocks):
         "source": "web",
         "game_id": "ABC123",
         "email": "player@example.com",
+        "username": "Player",
     })
     assert out["ok"] is True
     assert out["created_new"] is True
@@ -400,11 +533,12 @@ def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
         "source": "web",
         "game_id": "TMR001",
         "email": "timer@example.com",
+        "username": "Timer player",
     })
     assert out["ok"] is True
     assert out["gameType"] == "T1MER"
     assert out["playerToken"]
-    assert out["assignment"]["displayName"] == "timer"
+    assert out["assignment"]["displayName"] == "Timer player"
     assert "playerId" in out["assignment"]
 
 
@@ -429,6 +563,7 @@ def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment, verified
             "source": "web",
             "game_id": "ABC123",
             "email": "player@example.com",
+            "username": "Player",
         })
     assert out["ok"] is True
     assert out["already_joined"] is True

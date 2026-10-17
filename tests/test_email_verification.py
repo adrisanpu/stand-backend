@@ -110,7 +110,7 @@ def response_body(response):
 
 
 def request_code(email=EMAIL, game_id=GAME_ID, ip="203.0.113.8", **overrides):
-    body = {"gameId": game_id, "email": email, "consent": True, **overrides}
+    body = {"gameId": game_id, "email": email, "username": "Player", "consent": True, **overrides}
     return api_call("email/request", body, ip)
 
 
@@ -123,12 +123,17 @@ def join(rig, challenge_id, code, game_id=GAME_ID):
     return api_call("join", {"gameId": game_id, "challengeId": challenge_id, "code": code})
 
 
-def test_request_issues_six_digit_code_including_leading_zero_and_needs_no_identity(rig, monkeypatch, capsys):
+@pytest.mark.parametrize("sender", ["contact@playstand.app", "no-reply@playstand.app"])
+def test_request_issues_six_digit_code_including_leading_zero_and_needs_no_identity(
+    rig, monkeypatch, capsys, sender,
+):
+    monkeypatch.setenv("EMAIL_SENDER_ADDRESS", sender)
     monkeypatch.setattr(verification.secrets, "randbelow", lambda _limit: 42)
     response = request_code()
     body = response_body(response)
 
     assert response["statusCode"] == 200
+    assert rig["ses"].sent[0]["Source"] == sender
     assert sent_code(rig) == "000042"
     assert len(body["challengeId"]) >= 32
     assert body["emailMasked"] != EMAIL
@@ -163,7 +168,7 @@ def test_request_rejects_invalid_registration_before_sending(
         game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
         game.update(game_change)
         rig["dynamo"].seed("games", game)
-    response = api_call("email/request", {"gameId": GAME_ID, "email": EMAIL, "consent": True, **body_change})
+    response = api_call("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "consent": True, **body_change})
     assert response["statusCode"] == expected_status
     assert response_body(response)["error"] == expected_error
     assert rig["ses"].sent == []
@@ -174,9 +179,9 @@ def test_request_rejects_invalid_registration_before_sending(
 def test_request_requires_source_ip_and_configured_sender(rig, monkeypatch, missing):
     if missing == "sender":
         monkeypatch.delenv("EMAIL_SENDER_ADDRESS")
-        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "consent": True})
+        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "consent": True})
     else:
-        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "consent": True})
+        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "consent": True})
         event["requestContext"]["http"].pop("sourceIp")
     response = public_mod.lambda_handler(event, None)
     assert response["statusCode"] == 503
@@ -315,6 +320,7 @@ def test_assign_rejects_forged_or_misbound_receipts_before_email_recovery(rig, t
         )
         result = assign_mod.lambda_handler({
             "source": "web", "game_id": game_id, "email": email,
+            "username": "Player",
             "email_verification": receipt,
         }, None)
     finally:
@@ -333,6 +339,7 @@ def test_direct_web_assign_without_receipt_cannot_recover_existing_player(rig, m
     )
     result = assign_mod.lambda_handler({
         "source": "web", "game_id": GAME_ID, "email": EMAIL,
+        "username": "Player",
     }, None)
     assert result == {"ok": False, "reason": "VerificationRequired"}
     assert rig["dynamo"].rows("players")[0]["playerId"] == 7
@@ -353,7 +360,7 @@ def test_email_optional_join_remains_available_without_verification(rig):
     game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
     game["participantFields"] = {"email": {"required": False}, "instagram": {"required": False}}
     rig["dynamo"].seed("games", game)
-    response = api_call("join", {"gameId": GAME_ID, "consent": True})
+    response = api_call("join", {"gameId": GAME_ID, "username": "Player", "consent": True})
     assert response["statusCode"] == 200
     assert response_body(response)["ok"] is True
     player = rig["dynamo"].rows("players")[0]
@@ -390,6 +397,129 @@ def test_verified_join_atomically_creates_player_count_and_identity(rig):
     )["Item"]
     assert record["state"] == "completed"
     assert record["playerId"] == player["playerId"]
+
+
+@pytest.mark.parametrize("game_type", ["T1MER", "STACK", "EMPAREJA2"])
+def test_username_is_bound_persisted_recovered_and_used_for_display(rig, monkeypatch, game_type):
+    from stand_common import stack
+
+    monkeypatch.setattr(public_mod, "Key", FakeKeyExpression)
+    monkeypatch.setattr(stack, "Key", FakeKeyExpression)
+    game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
+    game["gameType"] = game_type
+    rig["dynamo"].seed("games", game)
+    monkeypatch.setattr(assign_mod, "ASSIGNERS", {
+        game_type: lambda _event: ({"type": {game_type: {}}}, "", []),
+    })
+    challenge = response_body(request_code(username="  Ana 🌟  "))
+    record = rig["dynamo"].Table("verification").get_item(
+        Key={"id": f"challenge:{challenge['challengeId']}"}
+    )["Item"]
+    assert record["registration"] == {"email": EMAIL, "username": "Ana 🌟"}
+    assert "username" not in challenge
+
+    response = api_call("join", {
+        "gameId": GAME_ID, "challengeId": challenge["challengeId"], "code": sent_code(rig),
+        "username": "untrusted replacement",
+    })
+    assert response["statusCode"] == 200
+    result = response_body(response)
+    player = rig["dynamo"].rows("players")[0]
+    assert player["username"] == "Ana 🌟"
+    assert "instagramUsername" not in player
+    assert "participantPhotoKey" not in player
+    name_key = "participantName" if game_type == "EMPAREJA2" else "displayName"
+    assert result["assignment"][name_key] == "Ana 🌟"
+    invoke_payload = json.loads(rig["invoke"].calls[0]["Payload"].decode("utf-8"))
+    assert invoke_payload["username"] == "Ana 🌟"
+
+    recovered = public_mod._handle_get_player({
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({"gameId": GAME_ID, "playerToken": result["playerToken"]}),
+    })
+    assert recovered["statusCode"] == 200
+    assert response_body(recovered)["assignment"][name_key] == "Ana 🌟"
+    retry = join(rig, challenge["challengeId"], sent_code(rig))
+    assert response_body(retry)["assignment"][name_key] == "Ana 🌟"
+    assert len(rig["dynamo"].rows("players")) == 1
+
+    if game_type in ("T1MER", "STACK"):
+        player["type"][game_type].update(score=3, timer=3, attempt={
+            "status": "finished", "finishedAt": "2026-10-17T12:00:00Z",
+        })
+        rig["dynamo"].seed("players", player)
+        ranking = public_mod._t1mer_ranking(GAME_ID) if game_type == "T1MER" else (
+            stack.get_ranking(GAME_ID, rig["dynamo"].Table("players"))["results"]
+        )
+        assert ranking[0]["username"] == "Ana 🌟"
+
+
+@pytest.mark.parametrize("username", [None, "", "   "])
+def test_empty_username_is_rejected_before_sending(rig, username):
+    response = request_code(username=username)
+    assert response["statusCode"] == 400
+    assert response_body(response)["error"] == "missing_username"
+    assert rig["ses"].sent == []
+
+
+def test_new_verified_registration_recovers_existing_name_without_renaming(rig, monkeypatch):
+    challenge = response_body(request_code(username="Original"))
+    first = response_body(join(rig, challenge["challengeId"], sent_code(rig)))
+    later = verification.time.time() + 61
+    monkeypatch.setattr(verification.time, "time", lambda: later)
+    challenge = response_body(request_code(username="Replacement"))
+    recovered = response_body(join(rig, challenge["challengeId"], sent_code(rig)))
+    assert recovered["alreadyJoined"] is True
+    assert recovered["assignment"]["playerId"] == first["assignment"]["playerId"]
+    assert recovered["assignment"]["displayName"] == "Original"
+    assert rig["dynamo"].rows("players")[0]["username"] == "Original"
+
+
+def test_verified_registration_recovers_legacy_player_without_requiring_stored_name(rig):
+    rig["dynamo"].seed("players", {
+        "gameId": GAME_ID, "playerId": 7, "email": EMAIL, "type": {"T1MER": {}},
+    })
+    challenge = response_body(request_code(username="New registration name"))
+    result = response_body(join(rig, challenge["challengeId"], sent_code(rig)))
+    assert result["alreadyJoined"] is True
+    assert result["assignment"]["displayName"] == EMAIL.split("@", 1)[0]
+    assert "username" not in rig["dynamo"].rows("players")[0]
+    recovered = public_mod._handle_get_player({
+        "requestContext": {"http": {"method": "POST"}},
+        "body": json.dumps({"gameId": GAME_ID, "playerToken": result["playerToken"]}),
+    })
+    assert recovered["statusCode"] == 200
+    assert response_body(recovered)["assignment"]["displayName"] == verification.mask_email(EMAIL)
+
+
+@pytest.mark.parametrize("username", [123, False, [], {}, "a" * 101, "Ana\x00", "Ana\x85B"])
+def test_invalid_username_is_rejected_before_sending(rig, username):
+    response = request_code(username=username)
+    assert response["statusCode"] == 400
+    assert response_body(response)["error"] == "invalid_username"
+    assert rig["ses"].sent == []
+    assert rig["dynamo"].rows("verification") == []
+
+
+@pytest.mark.parametrize("username", ["a" * 100, "🌟" * 100, "Ana María"])
+def test_valid_username_accepts_unicode_and_length_boundary(rig, username):
+    challenge = response_body(request_code(username=username))
+    result = response_body(join(rig, challenge["challengeId"], sent_code(rig)))
+    assert result["assignment"]["displayName"] == username
+
+
+@pytest.mark.parametrize("tampered", ["replacement", None])
+def test_server_receipt_binds_username_against_assignment_tampering(rig, tampered):
+    challenge = response_body(request_code(username="Original"))
+    _, receipt = verification.confirm_code(
+        rig["dynamo"].Table("verification"), SECRET, GAME_ID, challenge["challengeId"], sent_code(rig),
+    )
+    result = assign_mod.lambda_handler({
+        "source": "web", "game_id": GAME_ID, "email": EMAIL,
+        "username": tampered, "email_verification": receipt,
+    }, None)
+    assert result == {"ok": False, "reason": "missing_username" if tampered is None else "VerificationRequired"}
+    assert rig["dynamo"].rows("players") == []
 
 
 def test_same_challenge_retry_is_idempotent_and_preserves_stack_attempts_and_progress(rig, monkeypatch):
@@ -521,6 +651,7 @@ def test_malformed_receipt_signatures_are_rejected_not_internal_errors(rig, sign
     result = assign_mod.lambda_handler({
         "source": "web", "game_id": GAME_ID, "email": EMAIL,
         "email_verification": challenge["challengeId"] + "." + signature,
+        "username": "Player",
     }, None)
     assert result == {"ok": False, "reason": "VerificationRequired"}
     assert rig["dynamo"].rows("players") == []

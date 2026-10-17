@@ -1,7 +1,7 @@
 # Participant email sender setup (manual)
 
 The participant email-code provider is Amazon SES in **us-east-1**, sending from
-**no-reply@playstand.app**. No transactional provider is currently configured.
+**contact@playstand.app** in dev and **no-reply@playstand.app** in prod.
 This runbook requires an authorized AWS operator and the owner of
 `playstand.app` DNS. Repository changes do not provision, verify or deploy
 anything automatically. Production remains a manual, approved release.
@@ -33,7 +33,8 @@ aws sesv2 get-email-identity --email-identity playstand.app --region us-east-1 -
 ```
 
 Require `VerifiedForSendingStatus=true` and successful DKIM status before
-testing. A verified domain covers `no-reply@playstand.app`; no separate
+testing. A verified domain covers both `contact@playstand.app` and
+`no-reply@playstand.app`; no separate
 per-environment or per-mailbox identity is necessary. The shared template retains
 the identity on deletion/replacement; deleting its stack does not remove it.
 Do not delete the identity or its DNS records during backend dev teardown.
@@ -93,8 +94,13 @@ data. These operational alarms/destinations are not created by the templates.
 
 ## 4. Backend configuration and release gate
 
-`samconfig.toml` supplies `EmailSenderAddress=no-reply@playstand.app` and
-`EmailIdentityName=playstand.app` for dev/prod. The backend constructs the IAM
+`samconfig.toml` supplies `EmailSenderAddress=contact@playstand.app` for dev,
+`EmailSenderAddress=no-reply@playstand.app` for prod, and
+`EmailIdentityName=playstand.app` for both. Deploying a sender change must update
+both the public Lambda environment and its IAM `ses:FromAddress` condition;
+changing only the environment leaves sending unauthorized. Changing the sender
+does not remove sandbox recipient restrictions or establish the cause of an
+existing `AccessDenied` error. The backend constructs the IAM
 identity ARN for us-east-1 in its own AWS account; no cross-account sending
 authorization is configured. Only the dedicated public Lambda role receives
 `ses:SendEmail`, limited to that identity and `ses:FromAddress`. Assignment has

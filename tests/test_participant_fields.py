@@ -52,6 +52,7 @@ def web(monkeypatch, verified_web_assignment):
 def assign_body(values):
     return {
         "source": "web", "game_id": "ABCDEF",
+        "username": "Player",
         **{("instagram_username" if name == "instagram" else name): value for name, value in values.items()},
     }
 
@@ -88,8 +89,10 @@ def test_enabled_only_join_and_persistence(web, gt, config):
         find.assert_called_once_with("ABCDEF", "ana@example.com")
     else:
         find.assert_not_called()
+    if not config["instagram"]["required"]:
+        assert item["username"] == "Player"
     if gt == "T1MER" and not submitted:
-        assert result["assignment"]["displayName"] == "Jugador 1"
+        assert result["assignment"]["displayName"] == "Player"
     assert item["type"][gt]["raffleEligible"] is False
 
 
@@ -129,6 +132,48 @@ def test_disabled_values_are_ignored_even_if_malformed(web, gt):
     find.assert_not_called()
 
 
+@pytest.mark.parametrize("config", [config for config in CONFIGS if config["instagram"]["required"]])
+def test_alternate_username_is_ignored_when_instagram_requested(web, config):
+    meta, put, _, _ = web
+    meta["participantFields"] = config
+    values = {name: VALUES[name] for name in FIELDS if config[name]["required"]}
+    result = assign_mod.lambda_handler(assign_body({**values, "username": {"invalid": True}}), None)
+    assert result["ok"] is True
+    assert "username" not in put.call_args.args[0]
+
+
+@pytest.mark.parametrize("config", [config for config in CONFIGS if not config["instagram"]["required"]])
+@pytest.mark.parametrize("username,reason", [
+    (None, "missing_username"), ("", "missing_username"), ("  ", "missing_username"),
+    (False, "invalid_username"), ({}, "invalid_username"), ("a" * 101, "invalid_username"),
+    ("Ana\x7f", "invalid_username"), ("Ana\x85B", "invalid_username"),
+])
+def test_username_is_required_and_validated_before_any_write(web, config, username, reason):
+    meta, put, _, reserve = web
+    meta["participantFields"] = config
+    values = {name: VALUES[name] for name in FIELDS if config[name]["required"]}
+    result = assign_mod.lambda_handler(assign_body({**values, "username": username}), None)
+    assert result == {"ok": False, "reason": reason}
+    put.assert_not_called()
+    reserve.assert_not_called()
+
+
+@pytest.mark.parametrize("config", CONFIGS)
+def test_missing_username_is_required_only_without_instagram(web, config):
+    meta, put, _, _ = web
+    meta["participantFields"] = config
+    values = {name: VALUES[name] for name in FIELDS if config[name]["required"]}
+    body = assign_body(values)
+    body.pop("username")
+    result = assign_mod.lambda_handler(body, None)
+    if config["instagram"]["required"]:
+        assert result["ok"] is True
+        assert "username" not in put.call_args.args[0]
+    else:
+        assert result == {"ok": False, "reason": "missing_username"}
+        put.assert_not_called()
+
+
 def test_legacy_required_email_and_dedup_are_preserved(web):
     _, put, find, reserve = web
     assert assign_mod.lambda_handler(assign_body({}), None)["reason"] == "missing_email"
@@ -157,12 +202,14 @@ def test_public_metadata_and_join_match_assignment_config(web, config, monkeypat
         result = assign_mod.lambda_handler(payload, None)
         return {"Payload": io.BytesIO(json.dumps(result).encode())}
 
-    body = {"gameId": "ABCDEF", "consent": True}
+    body = {"gameId": "ABCDEF", "consent": True, "username": "Player"}
     body.update({name: VALUES[name] for name in FIELDS if config[name]["required"]})
     pending = {name: STORED[{"instagram": "instagramUsername"}.get(name, name)]
                for name in FIELDS if config[name]["required"]}
     if "instagram" in pending:
         pending["instagram"] = pending["instagram"].lstrip("@")
+    else:
+        pending["username"] = "Player"
     with patch.object(public_mod, "verification_table"), \
          patch.object(public_mod, "confirm_code", return_value=({"registration": pending}, "server-receipt")), \
          patch.object(public_mod.lambda_client, "invoke", side_effect=invoke):
@@ -188,8 +235,8 @@ def test_public_required_phone_error_is_400(web, monkeypatch):
     meta["participantFields"] = {"email": {"required": False}, "phone": {"required": True}}
     monkeypatch.setattr(public_mod, "ASSIGN_LAMBDA", "assign")
     monkeypatch.setattr(public_mod, "_get_game", lambda _: meta)
-    with patch.object(public_mod, "_invoke_assign_web", side_effect=lambda gid, email, ig, phone:
-                      assign_mod.lambda_handler(assign_body({"email": email, "instagram": ig, "phone": phone}), None)):
+    with patch.object(public_mod, "_invoke_assign_web", side_effect=lambda gid, email, ig, phone, **kwargs:
+                      assign_mod.lambda_handler(assign_body({"email": email, "instagram": ig, "phone": phone, **kwargs}), None)):
         response = public_mod._handle_join({"body": json.dumps({"gameId": "ABCDEF", "consent": True})})
     assert response["statusCode"] == 400
     assert json.loads(response["body"])["error"] == "missing_phone"

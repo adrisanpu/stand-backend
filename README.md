@@ -155,6 +155,24 @@ not from the previous configuration. Only these three field names and boolean
 Operator game responses and `GET /v1/public/game?gameId=...` expose the resolved
 configuration, including phone.
 
+When **Instagram is not requested**, web registration requires a `username`,
+including email-only, phone-only, email+phone, and no-contact-field forms.
+When Instagram is requested, it serves as the username; the form hides the
+separate name and ignores alternate client usernames, even malformed ones.
+Username is a display name, not an Instagram handle or identity key: it is
+trimmed, limited to 100 Unicode characters and cannot contain control characters
+(U+0000–001F, U+007F–009F). Missing, null, empty or whitespace-only names return
+`missing_username`; malformed names return `invalid_username` (HTTP 400).
+`POST /v1/public/email/request` captures the normalized name in the server-side
+challenge and signed registration binding. Verification submits only the challenge
+ID and code, never a replacement name. New players store it as top-level `username`;
+assignments, player recovery and rankings use it after Instagram, before existing
+fallbacks (STACK rankings still never use email). Repeat email registrations
+recover the existing player without renaming it, including legacy players without
+names. Existing session/access recovery does not require a new name and retains
+legacy fallbacks. Usernames are not unique. Photo upload remains optional in every
+mode and separate from email verification.
+
 `POST /v1/public/join` accepts `gameId`, `consent: true`, and only enabled fields:
 `email`, `instagram` (legacy alias `instagramUsername` accepted), and `phone`.
 Required fields must be non-empty strings. Email retains its format validation and
@@ -196,7 +214,8 @@ session can be issued; the successful join response is unchanged. Resending uses
 the request endpoint again after `resendAvailableAt`. Do not log codes, full
 email addresses, participant tokens or request bodies.
 
-Verification uses SES in `us-east-1`, from `no-reply@playstand.app`, and
+Verification uses SES in `us-east-1`, from `contact@playstand.app` in dev
+and `no-reply@playstand.app` in prod, and
 `stand-{prod|dev}-email-verification-table` (string PK `id`, on-demand billing).
 Pending challenges and rate counters use numeric epoch-seconds `expiresAt` TTL;
 TTL cleanup is asynchronous, so expiry must also be enforced by application code.
@@ -291,8 +310,9 @@ optional top-level `prizeCatalog` only after it has been explicitly saved. Each
 configured prize contains its stored fields and an `imageUrl` (a fresh signed
 read URL, or `null` when no image is associated); URLs are never stored as
 catalog data. The player response continues to include all already-awarded
-prizes, including raffle wins. Prize display configuration does not change
-award eligibility, validation, ranking, raffle selection or delivery semantics.
+prizes, including raffle wins. For existing validation/raffle prizes, display
+configuration does not change award eligibility or delivery semantics. STACK
+ranking claims use the configured ranking prize as described below.
 
 ### STACK: mobile `/play` validated finish and ranking (Phase 3)
 
@@ -301,6 +321,23 @@ game/player tables, Lambdas and endpoints. This phase supports one explicit
 start, validated atomic finish, finished assignment recovery and descending
 rankings. There is no automatic start or gameplay resume on reload. This backend
 change does not add frontend changes, TV controls, infrastructure or deployment.
+
+#### Ranking prize collection
+
+For STACK, `POST /v1/public/player` returns a `kind: "ranking"` prize claim only
+after a finished, server-scored attempt ranks within `prizeCatalog.ranking.topX`
+and the ranking prize's `limit` (when non-null). The prize must have a name or
+image; zero limit, no Top X, no prize or no confirmed rank grants no claim.
+Ranking tokens use the distinct signed kind `k`, never a player/session token.
+
+The mobile result generates the QR locally, without sending the claim to an
+external QR service. `POST /v1/public/redeem` accepts its usual
+`{"prizeToken":"..."}` payload, rechecks the active game's current ranking and
+prize configuration, then conditionally sets
+`type.STACK.rankingPrizeDelivered = true`. Duplicate/concurrent scans return
+409 `AlreadyDelivered`; ineligible claims return 400 `NotEligible`. A claim
+does not reserve a future rank: eligibility is checked again at collection.
+Player responses retain delivered claims even if the rank later changes.
 
 #### Configuration
 
@@ -479,7 +516,7 @@ public `GET /v1/public/game` embeds the same results in `ranking`. Both use
 including only nonnegative integer scores with finished status and timestamp.
 Ordering is score **DESC**, finished timestamp ASC, then numeric playerId ASC;
 ranks are ordinal (1,2,3 even on tied scores). Rows expose playerId, username
-(Instagram username or `Jugador <id>`, never an email fallback), existing
+(Instagram username, web username, or `Jugador <id>`, never an email fallback), existing
 profilePicUrl or null, score, finishedAt and rank. No PII identity fields are
 copied. Rankings default to 10 with a maximum response limit of 100, but finish
 and assignment calculate the participant rank across all finished players.

@@ -165,10 +165,11 @@ def test_web_join_creates_identity_but_no_attempt_and_dedup_recovers(verified_we
          patch.object(assign_mod, "PLAYER_TOKEN_SECRET", SECRET):
         result = assign_mod._handle_web_assign({
             "game_id": "ABCDEF", "email": "ana@example.com", "source": "web",
+            "username": "Ana",
         })
     assert result["ok"] is True
     assert result["assignment"] == {
-        "gameType": "STACK", "playerId": 1, "displayName": "a***@example.com", "attempt": None,
+        "gameType": "STACK", "playerId": 1, "displayName": "Ana", "attempt": None,
     }
     assert captured["type"]["STACK"]
     assert "attempt" not in captured["type"]["STACK"]
@@ -181,9 +182,12 @@ def test_web_join_creates_identity_but_no_attempt_and_dedup_recovers(verified_we
     with patch.object(assign_mod, "_get_game_meta", return_value=META), \
          patch.object(assign_mod, "_find_existing_player_by_email", return_value=captured), \
          patch.object(assign_mod, "_put_player") as put_mock:
-        recovered = assign_mod._handle_web_assign({"game_id": "ABCDEF", "email": "ana@example.com"})
+        recovered = assign_mod._handle_web_assign({
+            "game_id": "ABCDEF", "email": "ana@example.com", "username": "Different registration name",
+        })
     assert recovered["already_joined"] is True
     assert recovered["assignment"]["attempt"]["attemptId"] == "old-start"
+    assert recovered["assignment"]["displayName"] == "Ana"
     put_mock.assert_not_called()
 
 
@@ -193,7 +197,9 @@ def test_public_join_forwards_stack_assignment():
     with patch.object(public_mod, "ASSIGN_LAMBDA", "assign"), \
          patch.object(public_mod, "_get_game", return_value=META), \
          patch.object(public_mod, "verification_table"), \
-         patch.object(public_mod, "confirm_code", return_value=({"registration": {"email": "ana@example.com"}}, "receipt")), \
+         patch.object(public_mod, "confirm_code", return_value=({
+             "registration": {"email": "ana@example.com", "username": "Ana"},
+         }, "receipt")), \
          patch.object(public_mod, "_invoke_assign_web", return_value=result):
         response = public_mod._handle_join({"body": json.dumps({
             "gameId": "ABCDEF", "email": "ana@example.com", "consent": True,
@@ -292,7 +298,9 @@ def test_public_score_dispatcher_and_recover_end_to_end_offline(monkeypatch, ver
              patch.object(assign_mod, "_find_existing_player_by_email", return_value=table.player), \
              patch.object(assign_mod, "gp_table", table), \
              patch.object(assign_mod, "_put_player") as put:
-            rejoin = assign_mod._handle_web_assign({"game_id": "ABCDEF", "email": "ana@example.com"})
+            rejoin = assign_mod._handle_web_assign({
+                "game_id": "ABCDEF", "email": "ana@example.com", "username": "Ana",
+            })
         assert rejoin["assignment"] == recovered
         put.assert_not_called()
         assert table.writes == 2
