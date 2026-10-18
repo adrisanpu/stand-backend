@@ -3,40 +3,19 @@ import os
 import json
 import base64
 import random
-import urllib.request
-import urllib.parse
-import urllib.error
 from decimal import Decimal
-from datetime import datetime, timezone
-from collections import defaultdict
 
 import boto3
 from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Key, Attr
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob, game_display_name
+from boto3.dynamodb.conditions import Key
+from stand_common.utils import log, _resp, _iso_now, _as_int, get_game_type_blob
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
-IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
-IG_GRAPH_VERSION = os.environ.get("IG_GRAPH_VERSION", "v24.0")
-INSTAGRAM_SECRET_NAME = os.environ.get("INSTAGRAM_SECRET_NAME", "").strip()
 # =================================
 
-# Load Instagram page token for User Profile API (is_user_follow_business)
-IG_PAGE_TOKEN = ""
-if INSTAGRAM_SECRET_NAME:
-    try:
-        sm = boto3.client("secretsmanager")
-        raw = sm.get_secret_value(SecretId=INSTAGRAM_SECRET_NAME)
-        data = json.loads(raw.get("SecretString", "{}"))
-        if data:
-            IG_PAGE_TOKEN = (data.get("PAGE_TOKEN") or data.get("IG_PAGE_TOKEN") or "").strip()
-    except Exception as e:
-        log("raffle_instagram_secret_load_failed", {"error": repr(e)})
-
 dynamo_r = boto3.resource("dynamodb")
-lambda_client = boto3.client("lambda")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
@@ -104,57 +83,11 @@ def _parse_event(event):
     return method, game_id, n_winners, bool(only_validated)
 
 
-# ----------------- IG sender -----------------
-
-def _graph_get_raffle(path: str, params: dict) -> dict | None:
-    """GET request to Instagram Graph API for User Profile (is_user_follow_business)."""
-    if not IG_PAGE_TOKEN:
-        return None
-    base = f"https://graph.facebook.com/{IG_GRAPH_VERSION}/{path}"
-    q = dict(params)
-    q["access_token"] = IG_PAGE_TOKEN
-    url = base + "?" + urllib.parse.urlencode(q)
-    try:
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=8) as r:
-            raw = r.read().decode("utf-8")
-            return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8")
-        except Exception:
-            err_body = ""
-        log("raffle_graph_get_error", {"status": e.code, "path": path, "body": err_body[:300]})
-        return None
-    except Exception as e:
-        log("raffle_graph_get_error", {"error": repr(e), "path": path})
-        return None
-
-
-def _is_user_following_business(psid: str) -> bool:
-    """True if the user (psid) follows the business Instagram account (Stand)."""
-    if not psid or psid == "#":
-        return False
-    data = _graph_get_raffle(psid, {"fields": "is_user_follow_business"})
-    if not data or not isinstance(data, dict):
-        return False
-    return data.get("is_user_follow_business") is True
-
-
-def _send_bulk_dms(messages):
-    """
-    messages: list of { psid, text }
-    """
-    if not messages:
-        return
-    try:
-        lambda_client.invoke(
-            FunctionName=IG_SENDER_LAMBDA,
-            InvocationType="Event",
-            Payload=json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8"),
-        )
-    except Exception as e:
-        log("igsender_invoke_error", {"error": repr(e), "count": len(messages)})
+def _player_display_name(it: dict, player_id: int) -> str:
+    username = it.get("username")
+    if isinstance(username, str) and username.strip():
+        return username.strip()
+    return f"Jugador {player_id}"
 
 
 # ----------------- Dynamo helpers -----------------
@@ -167,7 +100,7 @@ def _get_game(game_id: str):
 def _save_raffle_winners_to_game(game_id: str, winners: list[dict], only_validated: bool, win_ts: str):
     """
     Persiste en games_table:
-      raffleWinners: [{playerId, instagramUsername, instagramPSID, validationCode?, wonAt}]
+      raffleWinners: [{playerId, username, validationCode?, wonAt}]
       raffleLastRunAt: ISO
       raffleOnlyValidated: bool
     """
@@ -199,8 +132,7 @@ def _save_raffle_winners_to_game(game_id: str, winners: list[dict], only_validat
 
         row = {
             "playerId": pid,
-            "instagramUsername": w.get("instagramUsername"),
-            "instagramPSID": w.get("instagramPSID"),
+            "username": w.get("username"),
             "wonAt": win_ts,
         }
         if val_code is not None:
@@ -261,11 +193,6 @@ def _is_quiz_completed(it: dict, game_type_upper: str) -> bool:
     return bool(tb.get("quizCompleted", False))
 
 
-def _has_psid(it: dict) -> bool:
-    psid = it.get("instagramPSID")
-    return bool(psid and psid != "#")
-
-
 def _mark_winner(game_id: str, player_id: int, game_type_upper: str, win_ts: str):
     """
     Escribe en type.<g>:
@@ -313,16 +240,6 @@ def _mark_winner(game_id: str, player_id: int, game_type_upper: str, win_ts: str
 
 # ----------------- business logic -----------------
 
-def _build_winner_message(game_type_upper: str, username: str) -> str:
-    label = game_display_name(game_type_upper)
-    name = username or "ganador/a"
-    return (
-        f"🥁 Sorteo de {label}\n"
-        f"🎉 ¡Felicidades, {name}! Has ganado el sorteo.\n"
-        "Pasa por el stand para recoger el premio."
-    )
-
-
 def lambda_handler(event, context):
     try:
         method, game_id, n_winners, only_validated = _parse_event(event)
@@ -353,13 +270,11 @@ def lambda_handler(event, context):
         quiz_configured = bool(game.get("quizOrder"))
         use_validation_filter = _requires_validation(game, game_type)
 
-        # 2) build pool of possible candidates (players with psid and raffleEligible == true by default)
+        # 2) build pool of possible candidates (raffleEligible == true by default)
         base_candidates = []
         for it in all_items:
             pid = _as_int(it.get("playerId"))
             if pid is None or pid <= 0:
-                continue
-            if not _has_psid(it):
                 continue
             # raffleEligible check: read type.<gameType>.raffleEligible; default True if missing
             t = it.get("type") or {}
@@ -375,36 +290,19 @@ def lambda_handler(event, context):
                 continue
             base_candidates.append({
                 "playerId": pid,
-                "instagramPSID": it.get("instagramPSID"),
-                "instagramUsername": it.get("instagramUsername"),
+                "username": _player_display_name(it, pid),
                 "validationCode": it.get("validationCode"),
                 "item": it,
             })
 
-        # raffleRequiredFollows: ensure it is always a list
-        raw_raffle_required_follows = game.get("raffleRequiredFollows")
-        if isinstance(raw_raffle_required_follows, list):
-            raffle_required_follows = list(raw_raffle_required_follows)
-        elif raw_raffle_required_follows:
-            raffle_required_follows = [str(raw_raffle_required_follows)]
-        else:
-            raffle_required_follows = []
-
         # 3) randomly select winners with post-selection eligibility checks
         def _is_candidate_eligible(candidate: dict) -> bool:
             it = candidate.get("item") or {}
-            ok_validated = True
-            if only_validated:
-                if use_validation_filter:
-                    ok_validated = _is_validated(it)
-                else:
-                    ok_validated = not quiz_configured or _is_quiz_completed(it, game_type)
-            ok_follow = True
-            if isinstance(raffle_required_follows, list) and len(raffle_required_follows) > 0:
-                ok_follow = _is_user_following_business(candidate.get("instagramPSID") or "")
-            eligible = ok_validated and ok_follow
-            log("raffle_eligible_check_dev", {"playerId": candidate.get("playerId"), "eligible": eligible, "ok_validated": ok_validated, "ok_follow": ok_follow})  # dev: remove
-            return eligible
+            if not only_validated:
+                return True
+            if use_validation_filter:
+                return _is_validated(it)
+            return not quiz_configured or _is_quiz_completed(it, game_type)
 
         winners = []
         tried_indices: set[int] = set()
@@ -425,13 +323,9 @@ def lambda_handler(event, context):
                 "gameId": game_id,
                 "winners": [],
                 "candidates": len(base_candidates),
-                "raffleRequiredFollows": raffle_required_follows if isinstance(raffle_required_follows, list) else [],
             })
 
-        winner_usernames = [
-            (w.get("instagramUsername") or f"Jugador {w['playerId']}")
-            for w in winners
-        ]
+        winner_usernames = [w["username"] for w in winners]
 
         win_ts = _iso_now()
         # Persistimos winners a nivel game para polling del frontend
@@ -440,31 +334,13 @@ def lambda_handler(event, context):
         except Exception as e:
             log("raffle_save_to_game_error", {"error": repr(e), "gameId": game_id})
 
-        # 4) enviar DM solo a ganadores
-        per_psid_msgs = defaultdict(list)
-        for w in winners:
-            psid = w.get("instagramPSID")
-            if not psid or psid == "#":
-                continue
-            username = w.get("instagramUsername") or f"Jugador {w['playerId']}"
-            per_psid_msgs[psid].append(_build_winner_message(game_type.upper(), username))
-
-        # 5) persistimos win individual por jugador
-        win_ts = _iso_now()
+        # 4) persistimos win individual por jugador
         for w in winners:
             pid = int(w["playerId"])
             try:
                 _mark_winner(game_id, pid, game_type, win_ts)
             except Exception as e:
                 log("raffle_update_error", {"error": repr(e), "gameId": game_id, "playerId": pid})
-
-        # Flatten para instagram-sender
-        messages = []
-        for psid, texts in per_psid_msgs.items():
-            for text in texts:
-                messages.append({"psid": psid, "text": text})
-
-        _send_bulk_dms(messages)
 
         k = len(winners)
         candidates_count = len(base_candidates)
@@ -477,9 +353,7 @@ def lambda_handler(event, context):
             "requestedWinners": n_winners,
             "selectedWinners": k,
             "winners": winner_usernames,
-            "notifiedPlayers": len(messages),
             "candidatePlayers": candidates_count,
-            "raffleRequiredFollows": raffle_required_follows if isinstance(raffle_required_follows, list) else [],
         })
 
     except ClientError as e:

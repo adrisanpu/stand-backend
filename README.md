@@ -6,7 +6,7 @@ Backend for the Stand project: AWS Serverless Application Model (SAM) app with P
 
 - **Runtime:** Python 3.13
 - **Infrastructure:** AWS SAM (API Gateway HTTP APIs, Lambda)
-- **Features:** Webhooks (Instagram, Stripe), game logic, user and billing flows
+- **Features:** Stripe webhooks, game logic, user and billing flows
 
 ## Prerequisites
 
@@ -56,44 +56,21 @@ The game table (`stand-prod-game-table` in prod, `stand-dev-game-table` in dev) 
 
 ## Adding a new backend game (lean checklist)
 
-### Independent gameplay and participant access
+### Participant gameplay and access
 
-Game CRUD and public metadata expose `playMode: "master" | "mobile"` independently
-of `joinChannel: "instagram" | "web"`. The former selects where gameplay/validation
-happens; the latter selects the QR destination (Instagram DM or the web form).
-Updates validate compatibility before writing and persist the two access fields
-together in one conditional update. Other game settings can be saved without
-overwriting either access field.
+Every game uses `playMode: "mobile"` and `joinChannel: "web"`: gameplay and
+validation happen on participant phones, reached through the Web registration
+form and its QR. Game create/update APIs reject other mode/channel values and
+persist both fields together. Existing records are exposed as mobile/Web without
+a table migration; configured participant and plan limits are unchanged.
 
-| Games | Allowed play modes | Allowed join channels |
-| --- | --- | --- |
-| EMPAREJA2, T1MER | master, mobile | instagram, web (all four combinations) |
-| STACK | mobile | instagram, web |
-| L3TRAS, RULET4, CUPIDO, SEMAFORO, INFOCARDS, IMPOSTOR | master | instagram |
+Instagram is not a participant registration field or game access channel.
+Participant registration uses a required display username and configured
+email/phone fields. Existing Instagram values remain in stored records but are
+not requested or used by the public registration contract.
 
-Legacy records without `playMode` retain the previous behavior: EMPAREJA2/T1MER
-infer mobile from web access and master from Instagram; missing channels default
-to web for these games and STACK, and Instagram for the remaining games. No table
-migration is necessary. Explicit saves persist both fields. Public mobile score
-and validation actions reject master-mode campaigns; authenticated operator
-endpoints remain available for master gameplay.
-
-For Instagram/mobile campaigns, the existing assignment and optional quiz flow
-sends a personal **Jugar ahora** button for the same PSID/player. Repeating the
-game code reissues a link without registering a second player or resetting a
-STACK attempt. The link has a 15-minute default lifetime (bounded to 1–60 minutes
-through `ACCESS_LINK_TTL_SECONDS`) and contains a purpose-separated signed
-credential in its URL fragment, never in a public QR. Only a random nonce hash
-and issuance timestamp are retained on the existing player record.
-
-`POST /v1/public/access` accepts `{ "gameId": "...", "accessToken": "..." }`.
-It checks the signature, expiration, game/player, mobile configuration and PSID identity
-and quiz completion, then conditionally consumes the nonce exactly once and
-returns the existing `PlayerResponse` session/assignment/prizes shape. Superseded
-or used links return 409, expired links 410, and invalid/mismatched credentials
-403. `POST /v1/public/player` accepts `{ "gameId": "...", "playerToken": "..." }`
-for session recovery without query-string credentials; the old GET remains for
-compatibility. Opening or exchanging a link never starts an attempt.
+`POST /v1/public/player` accepts `{ "gameId": "...", "playerToken": "..." }`
+for participant session recovery without query-string credentials.
 
 EMPAREJA2 assignments returned by web registration, session recovery and personal
 access exchange include nullable `characterImageUrl` and `partnerCharacterImageUrl`.
@@ -118,21 +95,17 @@ stores the selection; GET media and EMPAREJA2/T1MER/STACK public game metadata r
 `appearance`. Old events without a saved appearance return default dark/game
 colors. Existing browser-only palettes need one new save to publish them.
 
-**Deployment configuration:** provide a private `PlayerTokenSecret` of at least
-32 characters through the authorized deployment configuration; it has no public
-default in SAM and is shared by assignment, quiz and public API through Globals.
-Personal access fails closed with 503 if the signing configuration is missing
-or too short. Do not commit a secret to `samconfig.toml`. Reuse a sufficiently
-strong existing secret where available; rotating a key invalidates existing
-participant/prize sessions and requires coordinated rollout. `PublicAppOrigin`
-must point to the matching frontend environment (`samconfig.toml` distinguishes
-dev and prod); personal links require HTTPS except localhost development.
-
-Publish the compatible backend before the frontend. Automated tests cover the
-contracts and DM payloads offline; actual Instagram button delivery, fragment
-preservation in its in-app browser and the quiz-to-mobile journey still require
-an authorized test event before release. This change does not itself deploy
-either application or modify any configured secrets.
+Participant and prize token secrets remain private deployment configuration;
+do not commit secrets to `samconfig.toml`. Instagram registration, assignment,
+webhook, DM sender, raffle follow requirements and quiz/impostor/raffle DMs are
+removed. Validation, score, raffle and impostor responses use only the Web
+`username` and signed `participantPhotoKey` photo. Raffle winners are stored as
+`{playerId, username, wonAt, validationCode?}`; the operator game API shows a
+legacy winner's stored historical name when it has no Web `username`, without
+exposing Instagram ids. Impostor participants read their own role, word (crew
+only), turn and result from `POST /v1/public/player` with their player token.
+The legacy `gsi-instagramPSID` index and stored Instagram attributes are kept
+for history but are not used for gameplay.
 
 ### Configurable web registration fields (`/play`)
 
@@ -141,7 +114,6 @@ For EMPAREJA2, T1MER and STACK, game POST/PUT accepts `participantFields`:
 ```json
 {
   "email": { "required": true },
-  "instagram": { "required": false },
   "phone": { "required": false }
 }
 ```
@@ -149,52 +121,45 @@ For EMPAREJA2, T1MER and STACK, game POST/PUT accepts `participantFields`:
 `required: true` means **request and require** the field; `false` means **do not
 request or store** it. There is no optional-but-requested state. Missing
 configuration/keys use the defaults shown above (including legacy records without
-phone). PUT replaces the field configuration, filling omitted keys from defaults,
-not from the previous configuration. Only these three field names and boolean
-`required` values are accepted; malformed configuration returns 400 before writes.
-Operator game responses and `GET /v1/public/game?gameId=...` expose the resolved
-configuration, including phone.
+phone). The public registration endpoint and participant form expose only email
+and phone; the game configuration Lambda temporarily tolerates a legacy
+`instagram` field, but the public endpoint hides and ignores it. PUT replaces the
+field configuration, filling omitted keys from defaults, not from the previous
+configuration. Malformed configuration returns 400 before writes.
 
-When **Instagram is not requested**, web registration requires a `username`,
-including email-only, phone-only, email+phone, and no-contact-field forms.
-When Instagram is requested, it serves as the username; the form hides the
-separate name and ignores alternate client usernames, even malformed ones.
-Username is a display name, not an Instagram handle or identity key: it is
+Web registration always requires a `username`, including email-only, phone-only,
+email+phone, and no-contact-field forms. Username is a display name and is
 trimmed, limited to 100 Unicode characters and cannot contain control characters
 (U+0000–001F, U+007F–009F). Missing, null, empty or whitespace-only names return
 `missing_username`; malformed names return `invalid_username` (HTTP 400).
 `POST /v1/public/email/request` captures the normalized name in the server-side
 challenge and signed registration binding. Verification submits only the challenge
 ID and code, never a replacement name. New players store it as top-level `username`;
-assignments, player recovery and rankings use it after Instagram, before existing
-fallbacks (STACK rankings still never use email). Repeat email registrations
+assignments, player recovery and rankings use it before existing fallbacks
+(STACK rankings still never use email). Repeat email registrations
 recover the existing player without renaming it, including legacy players without
 names. Existing session/access recovery does not require a new name and retains
 legacy fallbacks. Usernames are not unique. Photo upload remains optional in every
 mode and separate from email verification.
 
-`POST /v1/public/join` accepts `gameId`, `consent: true`, and only enabled fields:
-`email`, `instagram` (legacy alias `instagramUsername` accepted), and `phone`.
+`POST /v1/public/join` accepts `gameId`, `username`, `consent: true`, and only
+enabled contact fields: `email` and `phone`.
 Required fields must be non-empty strings. Email retains its format validation and
-is lowercased; Instagram is trimmed and stored with one leading `@`; phone is
-trimmed and stored as the top-level player `phone` string, preserving `+`, spacing
+is lowercased; phone is trimmed and stored as the top-level player `phone` string, preserving `+`, spacing
 and punctuation (no country-specific format restriction). Disabled incoming values
 are ignored, including malformed values, and never persisted. Errors include
-`missing_email`, `invalid_email`, `missing_instagram`, `invalid_instagram`,
-`missing_phone` and `invalid_phone` (HTTP 400).
+`missing_email`, `invalid_email`, `missing_phone` and `invalid_phone` (HTTP 400).
 
 An enabled email retains existing duplicate-registration recovery after email
 verification (see below). Without email,
-joins create distinct players; Instagram/phone are not substitute deduplication
-keys. Keep the returned `playerToken` for session recovery. All fields may be
-disabled. Existing stored contact data is not retroactively removed by config
-changes. Instagram DM registration remains PSID-based and does not require these
-web form fields; Instagram-only campaigns still reject public web joins.
+joins create distinct players; phone is not a substitute deduplication key. Keep
+the returned `playerToken` for session recovery. Contact fields may be disabled.
+Existing stored contact data is not retroactively removed by config changes.
 
 ### Email verification for web registration
 
 When email is requested, first call `POST /v1/public/email/request` with the same
-registration fields (`gameId`, `consent: true`, enabled contact fields), plus
+registration fields (`gameId`, `username`, `consent: true`, enabled contact fields), plus
 `language: "es" | "en"`. Its response is:
 
 ```json
@@ -234,8 +199,8 @@ new verification-table or SES permissions.
 Public limits default to `EMAIL_MAX_PER_HOUR=5` per email,
 `EMAIL_IP_MAX_PER_HOUR=3000` per source IP, and
 `EMAIL_GLOBAL_MAX_PER_HOUR=20000` per environment. These abuse controls do not
-replace SES account quotas (shared by dev/prod). Existing valid sessions,
-Instagram registration and no-email web registration do not require an email
+replace SES account quotas (shared by dev/prod). Existing valid sessions and
+no-email Web registration do not require an email
 challenge. The existing private `PlayerTokenSecret` also derives a
 purpose-separated verification key; no new committed secret is needed.
 
@@ -350,9 +315,9 @@ Player responses retain delivered claims even if the rank later changes.
 configuration; operator GET by gameId/gameName returns `game.type.STACK`
 (not `settings.STACK` or `settings.stack`).
 The complete configuration is stored directly in game `type.STACK`, not a
-new table. `playMode` is always `mobile`; `joinChannel` supports `web` and
-`instagram`. Web registration defaults to required email with Instagram/phone disabled;
-Instagram registration uses the existing PSID identity and personal access flow.
+new table. `playMode` is always `mobile` and `joinChannel` is always `web`.
+Web registration defaults to required email and a required display username;
+phone is optional and Instagram is not collected as participant data.
 
 `GET /v1/public/game?gameId=...` returns **`stackConfig`**:
 
@@ -520,7 +485,7 @@ public `GET /v1/public/game` embeds the same results in `ranking`. Both use
 including only nonnegative integer scores with finished status and timestamp.
 Ordering is score **DESC**, finished timestamp ASC, then numeric playerId ASC;
 ranks are ordinal (1,2,3 even on tied scores). Rows expose playerId, username
-(Instagram username, web username, or `Jugador <id>`, never an email fallback), existing
+(web username or `Jugador <id>`, never an email fallback), existing
 profilePicUrl or null, score, finishedAt and rank. No PII identity fields are
 copied. Rankings default to 10 with a maximum response limit of 100, but finish
 and assignment calculate the participant rank across all finished players.

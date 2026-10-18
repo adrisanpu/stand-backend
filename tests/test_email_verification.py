@@ -77,7 +77,7 @@ def rig(monkeypatch):
     monkeypatch.setattr(assign_mod, "Key", FakeKeyExpression)
     monkeypatch.setattr(assign_mod, "ClientError", FakeDynamoError)
     monkeypatch.setattr(assign_mod, "ASSIGNERS", {
-        "T1MER": lambda _event: ({"type": {"T1MER": {}}}, "", []),
+        "T1MER": lambda _event: {"type": {"T1MER": {}}},
     })
     monkeypatch.setattr(public_mod, "ASSIGN_LAMBDA", "assign-web")
     monkeypatch.setattr(public_mod, "lambda_client", invoke)
@@ -158,7 +158,6 @@ def test_request_issues_six_digit_code_including_leading_zero_and_needs_no_ident
         ({"language": "fr"}, {}, 400, "InvalidLanguage"),
         ({}, {"isActive": False}, 403, "GameInactive"),
         ({}, {"gameType": "IMPOSTOR"}, 400, "unsupported_game_type"),
-        ({}, {"joinChannel": "instagram"}, 403, "web_join_disabled"),
     ],
 )
 def test_request_rejects_invalid_registration_before_sending(
@@ -173,6 +172,34 @@ def test_request_rejects_invalid_registration_before_sending(
     assert response_body(response)["error"] == expected_error
     assert rig["ses"].sent == []
     assert rig["dynamo"].rows("verification") == []
+
+
+def test_email_registration_ignores_legacy_instagram_participant_field(rig):
+    game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
+    game.update({
+        "playMode": "master", "joinChannel": "instagram",
+        "participantFields": {
+            "email": {"required": True},
+            "instagram": {"required": True},
+            "phone": {"required": False},
+        },
+    })
+    rig["dynamo"].seed("games", game)
+    response = api_call(
+        "email/request",
+        {
+            "gameId": GAME_ID, "email": EMAIL, "username": "Player",
+            "instagram": "@legacy", "consent": True,
+        },
+    )
+    assert response["statusCode"] == 200
+    assert response_body(response)["ok"] is True
+    assert len(rig["ses"].sent) == 1
+    challenge = next(
+        item for item in rig["dynamo"].rows("verification")
+        if item.get("id", "").startswith("challenge:")
+    )
+    assert challenge["registration"] == {"email": EMAIL, "username": "Player"}
 
 
 @pytest.mark.parametrize("missing", ["sourceIp", "sender"])
@@ -360,12 +387,17 @@ def test_email_optional_join_remains_available_without_verification(rig):
     game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
     game["participantFields"] = {"email": {"required": False}, "instagram": {"required": False}}
     rig["dynamo"].seed("games", game)
-    response = api_call("join", {"gameId": GAME_ID, "username": "Player", "consent": True})
+    response = api_call("join", {
+        "gameId": GAME_ID, "username": "Player", "instagram": "@legacy", "consent": True,
+    })
     assert response["statusCode"] == 200
     assert response_body(response)["ok"] is True
     player = rig["dynamo"].rows("players")[0]
     assert "email" not in player
     assert "emailVerifiedAt" not in player
+    assert "instagramUsername" not in player
+    invoke_payload = json.loads(rig["invoke"].calls[0]["Payload"].decode("utf-8"))
+    assert "instagram_username" not in invoke_payload
     assert rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]["playersCount"] == 1
     assert rig["invoke"].calls[0]["Payload"]
 
@@ -407,9 +439,13 @@ def test_username_is_bound_persisted_recovered_and_used_for_display(rig, monkeyp
     monkeypatch.setattr(stack, "Key", FakeKeyExpression)
     game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
     game["gameType"] = game_type
+    game["participantFields"] = {
+        "email": {"required": True}, "instagram": {"required": True},
+        "phone": {"required": False},
+    }
     rig["dynamo"].seed("games", game)
     monkeypatch.setattr(assign_mod, "ASSIGNERS", {
-        game_type: lambda _event: ({"type": {game_type: {}}}, "", []),
+        game_type: lambda _event: {"type": {game_type: {}}},
     })
     challenge = response_body(request_code(username="  Ana 🌟  "))
     record = rig["dynamo"].Table("verification").get_item(
@@ -432,6 +468,7 @@ def test_username_is_bound_persisted_recovered_and_used_for_display(rig, monkeyp
     assert result["assignment"][name_key] == "Ana 🌟"
     invoke_payload = json.loads(rig["invoke"].calls[0]["Payload"].decode("utf-8"))
     assert invoke_payload["username"] == "Ana 🌟"
+    assert "instagram_username" not in invoke_payload
 
     recovered = public_mod._handle_get_player({
         "requestContext": {"http": {"method": "POST"}},
@@ -530,9 +567,9 @@ def test_same_challenge_retry_is_idempotent_and_preserves_stack_attempts_and_pro
     game["participantFields"] = default_participant_fields("STACK")
     rig["dynamo"].seed("games", game)
     monkeypatch.setattr(assign_mod, "ASSIGNERS", {
-        "STACK": lambda _event: ({
+        "STACK": lambda _event: {
             "type": {"STACK": {"attempts": 0, "progress": {"level": 0, "score": 0}}},
-        }, "", []),
+        },
     })
     monkeypatch.setattr(stack, "public_assignment", lambda *_args: {"score": 0})
     challenge = response_body(request_code())

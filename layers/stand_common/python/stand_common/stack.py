@@ -82,10 +82,6 @@ def game_config(game: dict) -> dict:
 
 
 def display_name(player: dict) -> str:
-    username = player.get("instagramUsername")
-    if isinstance(username, str) and username.strip() and "@" not in username.strip().lstrip("@"):
-        username = username.strip()
-        return username if username.startswith("@") else f"@{username}"
     name = (player.get("username") or "").strip()
     if name:
         return name
@@ -95,9 +91,8 @@ def display_name(player: dict) -> str:
 def public_assignment(player: dict, gp_table=None, profile_pic_url_fn=None) -> dict:
     blob = get_game_type_blob(player, "STACK")
     attempt = blob.get("attempt")
-    ig = (player.get("instagramUsername") or "").strip()
     email = (player.get("email") or "").strip()
-    display = (ig if ig.startswith("@") else f"@{ig}") if ig else (player.get("username") or "").strip() or (
+    display = (player.get("username") or "").strip() or (
         mask_email(email) if email else f"Jugador {player.get('playerId', '')}"
     )
     result = {
@@ -106,10 +101,7 @@ def public_assignment(player: dict, gp_table=None, profile_pic_url_fn=None) -> d
         "displayName": display,
         "attempt": None,
     }
-    pic = (
-        profile_pic_url_fn(player) if profile_pic_url_fn
-        else (player.get("instagramProfilePicUrl") or "").strip()
-    )
+    pic = profile_pic_url_fn(player) if profile_pic_url_fn else None
     if pic:
         result["profilePicUrl"] = pic
     if attempt:
@@ -198,10 +190,7 @@ def get_ranking(game_id: str, gp_table, limit: int | None = 10,
                 continue
             entries.append((finished, {
                 "playerId": int(pid), "username": display_name(player),
-                "profilePicUrl": (
-                    profile_pic_url_fn(player) if profile_pic_url_fn
-                    else (player.get("instagramProfilePicUrl") or "").strip() or None
-                ),
+                "profilePicUrl": profile_pic_url_fn(player) if profile_pic_url_fn else None,
                 "score": int(score), "finishedAt": attempt["finishedAt"],
             }))
         last = page.get("LastEvaluatedKey")

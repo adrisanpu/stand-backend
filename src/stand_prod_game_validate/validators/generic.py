@@ -71,15 +71,16 @@ def _validate_single_code(ctx: dict, game_label: str):
                 except Exception as e:
                     _log("validatedCount_update_failed", {"error": repr(e), "gameId": game_id})
 
-            pic = it.get("instagramProfilePicUrl") or ""
-            pic = pic.strip() if isinstance(pic, str) else ""
+            profile_pic_url = ctx.get("player_profile_pic_url")
+            pic = profile_pic_url(it) if profile_pic_url else ""
+            username = it.get("username")
 
             return {
                 "valid": True,
                 "gameId": game_id,
                 "playerId": pid,
-                "username": it.get("instagramUsername", ""),
-                "profilePicUrl": pic,
+                "username": username.strip() if isinstance(username, str) else "",
+                "profilePicUrl": pic or "",
                 "validatedAt": _iso_now(),
                 "message": f"✅ Validación correcta ({game_label})."
             }

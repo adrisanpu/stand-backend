@@ -35,13 +35,7 @@ Parameters:
     Type: String
     MinLength: 32
     NoEcho: true
-    Description: Required private HMAC secret (at least 32 characters) for participant sessions and personal access links
-
-  PublicAppOrigin:
-    Type: String
-    Default: https://playstand.app
-    AllowedPattern: "^https?://[^/#?]+$"
-    Description: Public frontend origin used to build personal participant access links (no trailing slash)
+    Description: Required private HMAC secret (at least 32 characters) for participant sessions
 
   EmailSenderAddress:
     Type: String
@@ -68,7 +62,6 @@ Globals:
         USERS_TABLE: !Ref StandProdUserTable
         GAMEPLAYER_TABLE: !Ref StandProdGameplayerTable
         CATALOG_TABLE: !Ref StandProdCatalogTable
-        INSTAGRAM_SECRET_NAME: !Sub "stand/${Environment}/instagram"
         STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
         PLAYER_TOKEN_SECRET: !Ref PlayerTokenSecret
 
@@ -136,22 +129,11 @@ Resources:
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdGameplayerTable
               - !Sub
-                - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-instagramPSID"
-                - TableName: !Ref StandProdGameplayerTable
-              - !Sub
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-raffleEligible"
                 - TableName: !Ref StandProdGameplayerTable
               - !Sub
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdCatalogTable
-          - Sid: SQSQuizQueue
-            Effect: Allow
-            Action:
-              - sqs:SendMessage
-              - sqs:ReceiveMessage
-              - sqs:DeleteMessage
-              - sqs:GetQueueAttributes
-            Resource: !GetAtt StandProdQuizQueue.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -191,12 +173,6 @@ Resources:
               - s3:PutObjectTagging
               - s3:DeleteObjectTagging
             Resource: !Sub "${UserMediaBucket.Arn}/games/staged/*"
-          # Raffle Lambda needs Instagram PAGE_TOKEN to check is_user_follow_business
-          - Sid: InstagramSecretRaffle
-            Effect: Allow
-            Action: secretsmanager:GetSecretValue
-            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
-          # Game functions invoke the sender Lambda for all IG/Stripe calls — no secret access needed here.
 
   StandPublicRole:
     Type: AWS::IAM::Role
@@ -269,43 +245,6 @@ Resources:
                   - dynamodb:ConditionCheckItem
                 Resource: !GetAtt StandEmailVerificationTable.Arn
 
-# ----- Webhook role (Instagram webhook dispatcher) -----
-
-  StandProdWebhookRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "stand-${Environment}-webhook-role"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: !Sub "stand-${Environment}-webhook-policy"
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: CloudWatchLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
-              - Sid: LambdaInvoke
-                Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource:
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-game-fn-assign"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-game-fn-quiz"
-                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-messaging-fn-instagram-sender"
-              - Sid: SecretsManager
-                Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
-
 # ----- Billing role (Stripe webhook + checkout + user) -----
 
   StandProdBillingRole:
@@ -354,36 +293,6 @@ Resources:
                   - s3:PutObject
                   - s3:DeleteObject
                 Resource: !Sub "arn:aws:s3:::stand-${Environment}-user-media-${AWS::AccountId}/*"
-
-# ----- Sender role (Instagram DM sender — no DB, just calls Graph API) -----
-
-  StandProdSenderRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "stand-${Environment}-sender-role"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: !Sub "stand-${Environment}-sender-policy"
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: CloudWatchLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
-              - Sid: SecretsManager
-                Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/instagram*"
 
 # =========================
 # LAMBDA LAYERS
@@ -513,24 +422,6 @@ Resources:
           KeyType: RANGE
 
 # =========================
-# SQS
-# =========================
-
-  StandProdQuizDLQ:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub "stand-${Environment}-quiz-dlq"
-      MessageRetentionPeriod: 86400  # 1 day
-
-  StandProdQuizQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      QueueName: !Sub "stand-${Environment}-quiz-queue"
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt StandProdQuizDLQ.Arn
-        maxReceiveCount: 3
-
-# =========================
 # S3
 # =========================
 
@@ -625,35 +516,6 @@ Resources:
 # WEBHOOK LAMBDAS
 # =========================
 
-  StandProdWebhookFnInstagram:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "stand-${Environment}-webhook-fn-instagram"
-      Description: Receives and dispatches Instagram webhook events to the appropriate internal game and messaging services.
-      CodeUri: src/stand_prod_webhook_fn_instagram/
-      Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdWebhookRole.Arn
-      Layers:
-        - !Ref StandCommonLayer
-      Environment:
-        Variables:
-          ASSIGN_LAMBDA: !Ref StandProdGameFnAssign
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          QUIZ_LAMBDA: !Ref StandProdGameFnQuiz
-      Events:
-        InstagramGet:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref WebhooksApi
-            Path: /webhook/instagram
-            Method: GET
-        InstagramPost:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref WebhooksApi
-            Path: /webhook/instagram
-            Method: POST
-
   StandProdWebhookFnStripe:
     Type: AWS::Serverless::Function
     Properties:
@@ -734,11 +596,7 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          QUIZ_QUEUE_URL: !Ref StandProdQuizQueue
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
-          PUBLIC_APP_ORIGIN: !Ref PublicAppOrigin
-          ACCESS_LINK_TTL_SECONDS: "900"
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
       Events:
         AssignPost:
@@ -760,9 +618,8 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          QUIZ_LAMBDA_NAME: !Ref StandProdGameFnQuiz
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Events:
         ValidatePost:
           Type: HttpApi
@@ -852,14 +709,6 @@ Resources:
             Method: POST
             Auth:
               Authorizer: NONE
-        PublicAccessPost:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/public/access
-            Method: POST
-            Auth:
-              Authorizer: NONE
         PublicRedeemPost:
           Type: HttpApi
           Properties:
@@ -893,7 +742,6 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Events:
         ScoreGet:
@@ -919,11 +767,6 @@ Resources:
       Role: !GetAtt StandProdGameRole.Arn
       Layers:
         - !Ref StandCommonLayer
-      Environment:
-        Variables:
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          PUBLIC_APP_ORIGIN: !Ref PublicAppOrigin
-          ACCESS_LINK_TTL_SECONDS: "900"
       Events:
         QuizGet:
           Type: HttpApi
@@ -937,27 +780,17 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/quiz
             Method: POST
-        QuizSQS:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt StandProdQuizQueue.Arn
-            BatchSize: 1
 
   StandProdGameFnRaffle:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "stand-${Environment}-game-fn-raffle"
-      Description: Executes game raffles, selects eligible winners, persists raffle results, and notifies participants.
+      Description: Executes game raffles, selects eligible winners, and persists raffle results.
       CodeUri: src/stand_prod_game_fn_raffle/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
       Layers:
         - !Ref StandCommonLayer
-      Environment:
-        Variables:
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
-          INSTAGRAM_SECRET_NAME: !Sub "stand/${Environment}/instagram"
-          IG_GRAPH_VERSION: v24.0
       Events:
         RafflePost:
           Type: HttpApi
@@ -978,7 +811,7 @@ Resources:
         - !Ref StandCommonLayer
       Environment:
         Variables:
-          IG_SENDER_LAMBDA: !Ref StandProdMessagingInstagramSender
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Events:
         ImpostorGet:
           Type: HttpApi
@@ -1052,7 +885,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "stand-${Environment}-user-fn-media"
-      Description: Manages per-user media library (logos and avatar videos) with S3-backed storage.
+      Description: Manages per-user logo media with S3-backed storage.
       CodeUri: src/stand_prod_user_fn_media/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdBillingRole.Arn
@@ -1063,9 +896,6 @@ Resources:
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
           DEFAULT_STAND_LOGO_DARK_KEY: defaults/logo/logo_stand_letters_white.png
           DEFAULT_STAND_LOGO_LIGHT_KEY: defaults/logo/logo_stand_letters_black.png
-          DEFAULT_STAND_AVATAR_IDLE_KEY: defaults/avatar/stand-idle.mp4
-          DEFAULT_STAND_AVATAR_WIN_KEY: defaults/avatar/stand-win.mp4
-          DEFAULT_STAND_AVATAR_LOSE_KEY: defaults/avatar/stand-lose.mp4
       Events:
         UserMediaGet:
           Type: HttpApi
@@ -1091,17 +921,6 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/user/media
             Method: DELETE
-
-  StandProdMessagingInstagramSender:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "stand-${Environment}-messaging-fn-instagram-sender"
-      Description: Sends text messages, quick replies, and media to Instagram users via the Instagram Graph API.
-      CodeUri: src/stand_prod_messaging_fn_instagram_sender/
-      Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdSenderRole.Arn
-      Layers:
-        - !Ref StandCommonLayer
 
 # =========================
 # INFOCARDS

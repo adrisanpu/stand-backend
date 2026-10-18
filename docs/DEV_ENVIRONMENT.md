@@ -37,30 +37,25 @@ Create secrets (Stripe **test mode** keys recommended for dev):
 | Secret name | Contents |
 |-------------|----------|
 | `stand/dev/stripe` | Stripe secret key (test) |
-| `stand/dev/instagram` | Instagram page token (optional; only if testing webhooks/DMs) |
 
 Same JSON shape as the prod secrets under `stand/prod/*`.
 
-### Participant signing and personal links
+### Participant signing
 
 The SAM `PlayerTokenSecret` parameter is required and has no default. Supply a
 private key of at least 32 characters using the approved deployment mechanism,
-not a committed `samconfig.toml` value. Assignment, quiz and public session
-exchange use the same parameter through the SAM Globals environment.
+not a committed `samconfig.toml` value. Assignment and public session recovery
+use the same parameter through the SAM Globals environment.
 
 Reuse an existing sufficiently strong key where possible. If the previous
 environment used the old development default or a short key, coordinate key
-provisioning/rotation before enabling Instagram-to-mobile access: changing the
-key invalidates existing participant/prize tokens. This development change does
-not provision or rotate secrets.
+provisioning/rotation before deployment: changing the key invalidates existing
+participant/prize tokens. This development change does not provision or rotate
+secrets.
 
-The dev/prod `PublicAppOrigin` values are set in `samconfig.toml`, so personal
-links point to the corresponding frontend. If deploying from CI, arrange secure
-injection or reuse of the required CloudFormation parameter in the deployment
-configuration before pushing to the auto-deploy `dev` branch; the repository
-does not contain its value. Deploy the backend before publishing the new
-frontend, and verify the Instagram button/quiz journey in an authorized test
-event (including its in-app browser).
+If deploying from CI, arrange secure injection or reuse of the required
+CloudFormation parameter in the deployment configuration before pushing to the
+auto-deploy `dev` branch; the repository does not contain its value.
 
 ## 2. Cognito App Client (dev)
 
@@ -121,8 +116,8 @@ rejection when a challenge is reused for different registration data.
 Use a verified recipient while SES is in its sandbox; do not test arbitrary
 participants. Deploy backend before UI in a coordinated window: older email
 forms cannot satisfy the new join contract. Refresh cached clients and avoid
-live email-enabled campaigns during the transition. Valid sessions, Instagram
-and no-email registration remain supported. Production requires explicit
+live email-enabled campaigns during the transition. Valid sessions and
+no-email Web registration remain supported. Production requires explicit
 approval, SES production access and manual deployment; nothing here deploys it.
 
 ```bash
@@ -168,7 +163,6 @@ python scripts/upload_user_media_defaults.py --bucket stand-dev-user-media-<AWS_
 ## 7. Webhooks (optional)
 
 - **Stripe (test):** point webhook to `{WebhooksApiUrl}/webhook/stripe`.
-- **Instagram:** point to `{WebhooksApiUrl}/webhook/instagram` only if using `stand/dev/instagram`.
 
 ## Validation checklist
 
@@ -178,7 +172,7 @@ python scripts/upload_user_media_defaults.py --bucket stand-dev-user-media-<AWS_
 - [ ] Create a test game; prod tables unchanged
 - [ ] Shared SES identity is verified in us-east-1; controlled-mailbox OTP request/join succeeds
 - [ ] Sender reputation/quota alarms and bounce/complaint handling are operational before public sending
-- [ ] Email-enabled form rollout is coordinated; existing sessions, Instagram and no-email joins still work
+- [ ] Email-enabled form rollout is coordinated; existing sessions and no-email joins still work
 - [ ] `sam deploy --config-env prod` changeset has no resource replacements (only metadata or empty)
 
 ## Tear down dev stack

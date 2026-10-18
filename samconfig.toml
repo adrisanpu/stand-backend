@@ -8,7 +8,7 @@ capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 confirm_changeset = true
 fail_on_empty_changeset = false
 region = "us-east-1"
-parameter_overrides = "Environment=prod PublicAppOrigin=https://playstand.app EmailSenderAddress=no-reply@playstand.app EmailIdentityName=playstand.app"
+parameter_overrides = "Environment=prod EmailSenderAddress=no-reply@playstand.app EmailIdentityName=playstand.app"
 
 [dev.deploy.parameters]
 stack_name = "stand-backend-dev"
@@ -18,4 +18,4 @@ capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 confirm_changeset = false
 fail_on_empty_changeset = false
 region = "us-east-1"
-parameter_overrides = "Environment=dev CognitoAppClientId=5qh9cbsgtmriggl76740o0f5qa StripeSuccessUrl=https://dev.playstand.app/home StripeCancelUrl=https://dev.playstand.app/home PublicAppOrigin=https://dev.playstand.app EmailSenderAddress=contact@playstand.app EmailIdentityName=playstand.app"
+parameter_overrides = "Environment=dev CognitoAppClientId=5qh9cbsgtmriggl76740o0f5qa StripeSuccessUrl=https://dev.playstand.app/home StripeCancelUrl=https://dev.playstand.app/home EmailSenderAddress=contact@playstand.app EmailIdentityName=playstand.app"

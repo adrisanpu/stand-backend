@@ -14,15 +14,12 @@ GAMES_TABLE = os.environ.get("GAMES_TABLE", "")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "")
 GAME_TABLE = os.environ.get("GAME_TABLE", "")
 
-QUIZ_LAMBDA_NAME = os.environ.get("QUIZ_LAMBDA_NAME", "")  # optional
-IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "")
-
 # S3 (private bucket + presigned urls)
 CHAR_BUCKET = os.environ.get("CHAR_BUCKET", "")            # e.g. "empareja2-characters"
 CHAR_URL_TTL = int(os.environ.get("CHAR_URL_TTL", "120"))  # seconds
+USER_MEDIA_BUCKET = os.environ.get("USER_MEDIA_BUCKET", "")
 
 dynamo_r = boto3.resource("dynamodb")
-lambda_client = boto3.client("lambda")
 s3 = boto3.client("s3")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
@@ -99,35 +96,19 @@ def presign_character_png(character_name: str) -> str | None:
         log("presign_error", {"error": repr(e), "bucket": CHAR_BUCKET, "key": key})
         return None
 
-# ===== Side-effects (IG, Quiz) =====
-
-def send_bulk(messages):
-    if not messages:
-        return
-    if not IG_SENDER_LAMBDA:
-        log("send_bulk_skipped_missing_IG_SENDER_LAMBDA", {"count": len(messages)})
-        return
+def player_profile_pic_url(player: dict) -> str:
+    photo_key = player.get("participantPhotoKey")
+    if not USER_MEDIA_BUCKET or not photo_key:
+        return ""
     try:
-        lambda_client.invoke(
-            FunctionName=IG_SENDER_LAMBDA,
-            InvocationType="Event",
-            Payload=json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8"),
+        return s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": USER_MEDIA_BUCKET, "Key": photo_key},
+            ExpiresIn=3600,
         )
     except Exception as e:
-        log("send_bulk_error", {"error": repr(e), "count": len(messages)})
-
-def invoke_quiz(game_id: str, psids: list[str]):
-    if not QUIZ_LAMBDA_NAME or not psids:
-        return
-    try:
-        payload = {"kind": "quiz_start", "gameId": game_id, "psid": psids}
-        lambda_client.invoke(
-            FunctionName=QUIZ_LAMBDA_NAME,
-            InvocationType="Event",
-            Payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-    except Exception as e:
-        log("quiz_invoke_error", {"error": repr(e), "target": QUIZ_LAMBDA_NAME})
+        log("participant_photo_presign_error", {"error": repr(e)})
+        return ""
 
 # ===== Dynamo helpers =====
 
@@ -243,14 +224,12 @@ def lambda_handler(event, context):
 
             # s3
             "presign_character_png": presign_character_png,
+            "player_profile_pic_url": player_profile_pic_url,
 
             # feature gating via type.<game>
             "is_quiz_required": is_quiz_required,
             "is_quiz_completed": is_quiz_completed,
 
-            # side effects
-            "send_bulk": send_bulk,
-            "invoke_quiz": invoke_quiz,
             "inc_validated_count": inc_validated_count,
         }
 

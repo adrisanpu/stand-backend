@@ -1,27 +1,17 @@
-"""Per-game play mode / join channel capabilities.
+"""Supported games use mobile gameplay and web enrollment exclusively."""
 
-Mirror of stand-frontend core/settings/gameAccess.ts (keep both matrices in sync;
-tests/test_game_access.py asserts the backend matrix).
+PLAY_MODES = ("mobile",)
+JOIN_CHANNELS = ("web",)
 
-- playMode: where the game is played/validated after access ("master" screen or "mobile" clients).
-- joinChannel: how participants register/access ("instagram" DM or "web" form); decides the QR target.
-"""
-
-PLAY_MODES = ("master", "mobile")
-JOIN_CHANNELS = ("instagram", "web")
-
+_MOBILE_WEB = {"playModes": PLAY_MODES, "joinChannels": JOIN_CHANNELS}
 GAME_ACCESS_CAPABILITIES = {
-    "EMPAREJA2": {"playModes": ("master", "mobile"), "joinChannels": ("instagram", "web")},
-    "T1MER": {"playModes": ("master", "mobile"), "joinChannels": ("instagram", "web")},
-    "STACK": {"playModes": ("mobile",), "joinChannels": ("instagram", "web")},
-    "L3TRAS": {"playModes": ("master",), "joinChannels": ("instagram",)},
-    "RULET4": {"playModes": ("master",), "joinChannels": ("instagram",)},
-    "CUPIDO": {"playModes": ("master",), "joinChannels": ("instagram",)},
-    "SEMAFORO": {"playModes": ("master",), "joinChannels": ("instagram",)},
-    "INFOCARDS": {"playModes": ("master",), "joinChannels": ("instagram",)},
-    "IMPOSTOR": {"playModes": ("master",), "joinChannels": ("instagram",)},
+    game_type: _MOBILE_WEB
+    for game_type in (
+        "EMPAREJA2", "T1MER", "STACK", "L3TRAS", "RULET4", "CUPIDO",
+        "SEMAFORO", "INFOCARDS", "IMPOSTOR",
+    )
 }
-_DEFAULT_CAPABILITIES = {"playModes": ("master",), "joinChannels": ("instagram",)}
+_DEFAULT_CAPABILITIES = _MOBILE_WEB
 
 
 class GameAccessError(ValueError):
@@ -37,34 +27,25 @@ def _norm(value):
 
 
 def _legacy_channel(game_type: str) -> str:
-    return "web" if "web" in capabilities(game_type)["joinChannels"] else "instagram"
+    return "web"
 
 
 def _legacy_mode(game_type: str, join_channel: str) -> str:
-    gt = (game_type or "").upper()
-    if gt == "STACK":
-        return "mobile"
-    if gt in ("EMPAREJA2", "T1MER"):
-        return "mobile" if join_channel == "web" else "master"
-    return "master"
+    return "mobile"
 
 
 def resolve_game_access(item: dict | None) -> dict:
-    """Resolve missing legacy fields without hiding an invalid explicit configuration."""
-    item = item or {}
-    gt = (item.get("gameType") or "").upper()
-    join_channel = _legacy_channel(gt) if item.get("joinChannel") is None else _norm(item["joinChannel"])
-    play_mode = _legacy_mode(gt, join_channel) if item.get("playMode") is None else _norm(item["playMode"])
-    return validate_game_access(gt, play_mode, join_channel)
+    """Return the approved policy, ignoring stale or malformed stored legacy values."""
+    return {"playMode": "mobile", "joinChannel": "web"}
 
 
 def validate_game_access(game_type: str, play_mode, join_channel) -> dict:
     """Strict check used before any write."""
     pm, jc = _norm(play_mode), _norm(join_channel)
     if pm not in PLAY_MODES:
-        raise GameAccessError("playMode must be 'master' or 'mobile'.")
+        raise GameAccessError("playMode must be 'mobile'.")
     if jc not in JOIN_CHANNELS:
-        raise GameAccessError("joinChannel must be 'web' or 'instagram'.")
+        raise GameAccessError("joinChannel must be 'web'.")
     caps = capabilities(game_type)
     if pm not in caps["playModes"] or jc not in caps["joinChannels"]:
         raise GameAccessError(
@@ -74,8 +55,8 @@ def validate_game_access(game_type: str, play_mode, join_channel) -> dict:
 
 
 def access_for_create(game_type: str, play_mode=None, join_channel=None) -> dict:
-    jc = _legacy_channel(game_type) if join_channel is None else join_channel
-    pm = _legacy_mode(game_type, _norm(jc)) if play_mode is None else play_mode
+    jc = "web" if join_channel is None else join_channel
+    pm = "mobile" if play_mode is None else play_mode
     return validate_game_access(game_type, pm, jc)
 
 
@@ -84,11 +65,5 @@ def access_for_update(item: dict, play_mode=None, join_channel=None) -> dict:
     gt = (item.get("gameType") or "").upper()
     current = resolve_game_access(item)
     jc = current["joinChannel"] if join_channel is None else join_channel
-    if play_mode is not None:
-        pm = play_mode
-    elif _norm(item.get("playMode")) in PLAY_MODES:
-        pm = current["playMode"]
-    else:
-        # Legacy games coupled mode to channel; keep that behaviour until playMode is saved.
-        pm = _legacy_mode(gt, _norm(jc))
+    pm = current["playMode"] if play_mode is None else play_mode
     return validate_game_access(gt, pm, jc)

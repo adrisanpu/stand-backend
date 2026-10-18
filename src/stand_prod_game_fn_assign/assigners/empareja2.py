@@ -104,15 +104,6 @@ def _character_image_url(character_name: str) -> str | None:
 
 
 def assign_empareja2(ctx: dict):
-    """
-    New contract:
-      returns (patch, welcome_header, extra_messages)
-
-    - welcome_header: bienvenida + te toca/busca (sin código ni mención al quiz); lambda añade aviso quiz o código.
-    - extra_messages: imagen del personaje (lambda envía primero).
-    """
-    psid = ctx.get("psid")
-    username_at = ctx.get("username_at") or ctx.get("display_name") or "jugador"
     dynamo_r = ctx["dynamo_r"]
 
     catalog_items = _query_empareja2_catalog(dynamo_r)
@@ -159,16 +150,4 @@ def assign_empareja2(ctx: dict):
         }
     }
 
-    extra_messages = []
-    img = _character_image_url(cname)
-    if img and psid:
-        extra_messages.append({"psid": psid, "image_url": img})
-
-    # Lambda sends: image first, then welcome_header + tail (quiz notice or code)
-    welcome_header = (
-        f"¡Hola {username_at}! 👋\n\n"
-        f"Te toca: {cname}.\n"
-        f"Tu misión es encontrar a: {partner}."
-    )
-
-    return (patch, welcome_header, extra_messages)
+    return patch

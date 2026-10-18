@@ -13,7 +13,7 @@ from decimal import Decimal
 
 HEADERS = {"Content-Type": "application/json"}
 
-# gameId format from game create; Instagram webhook accepts same token as plain text
+# gameId format from game create
 JOIN_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTUVWXYZ"
 JOIN_CODE_LENGTH = 6
 _JOIN_CODE_CHARS = frozenset(JOIN_CODE_ALPHABET)
@@ -277,62 +277,6 @@ def verify_player_token(token: str, secret: str) -> dict | None:
 
 # Prize kinds: "v" = validation, "r" = raffle, "k" = ranking
 PRIZE_KINDS = frozenset({"v", "r", "k"})
-
-
-# ---------- Personal access links (Instagram -> mobile) ----------
-# Separate purpose: signed with a key derived from the shared secret, so an access
-# token can never verify as a player/prize token (those use the raw secret).
-ACCESS_TOKEN_PURPOSE = "access"
-_ACCESS_KEY_LABEL = b"stand:player-access:v1"
-
-
-def _access_key(secret: str) -> bytes:
-    return hmac.new(secret.encode("utf-8"), _ACCESS_KEY_LABEL, hashlib.sha256).digest()
-
-
-def hash_access_nonce(nonce: str) -> str:
-    return hashlib.sha256((nonce or "").encode("utf-8")).hexdigest()
-
-
-def issue_access_token(game_id: str, player_id: int, nonce: str, secret: str, ttl_seconds: int = 900) -> str:
-    """Short-lived personal access credential; one-use via the nonce hash stored on the player."""
-    if not secret or not nonce:
-        raise ValueError("secret and nonce are required")
-    payload = {
-        "pur": ACCESS_TOKEN_PURPOSE,
-        "gid": game_id,
-        "pid": int(player_id),
-        "n": nonce,
-        "exp": int(time.time()) + int(ttl_seconds),
-    }
-    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
-    sig = hmac.new(_access_key(secret), body.encode("utf-8"), hashlib.sha256).hexdigest()
-    return f"{body}.{sig}"
-
-
-def verify_access_token(token, secret: str) -> tuple[dict | None, str | None]:
-    """Return (claims, None) or (None, "InvalidAccessToken" | "AccessTokenExpired")."""
-    if not isinstance(token, str) or not secret or token.count(".") != 1 or len(token) > 1024:
-        return None, "InvalidAccessToken"
-    body, sig = token.split(".", 1)
-    if len(sig) != 64 or any(c not in "0123456789abcdef" for c in sig):
-        return None, "InvalidAccessToken"
-    expected = hmac.new(_access_key(secret), body.encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None, "InvalidAccessToken"
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
-    except Exception:
-        return None, "InvalidAccessToken"
-    if not isinstance(payload, dict) or payload.get("pur") != ACCESS_TOKEN_PURPOSE:
-        return None, "InvalidAccessToken"
-    gid, pid, nonce, exp = payload.get("gid"), payload.get("pid"), payload.get("n"), payload.get("exp")
-    if (not isinstance(gid, str) or not gid or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
-            or not isinstance(nonce, str) or not nonce or isinstance(exp, bool) or not isinstance(exp, int)):
-        return None, "InvalidAccessToken"
-    if exp <= int(time.time()):
-        return None, "AccessTokenExpired"
-    return {"gameId": gid, "playerId": pid, "nonce": nonce}, None
 
 
 def issue_prize_token(
