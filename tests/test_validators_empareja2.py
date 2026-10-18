@@ -11,12 +11,11 @@ from validators.empareja2 import validate_empareja2
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _player(pid, code, pair_id, char_id, char_name="CharA", validated=False, instagram_profile_pic_url=None):
+def _player(pid, code, pair_id, char_id, char_name="CharA", validated=False, photo_key=None):
     item = {
         "playerId": pid,
         "validationCode": code,
-        "instagramUsername": f"user{pid}",
-        "instagramPSID": f"psid{pid}",
+        "username": f"user{pid}",
         "validated": validated,
         "type": {
             "EMPAREJA2": {
@@ -26,8 +25,8 @@ def _player(pid, code, pair_id, char_id, char_name="CharA", validated=False, ins
             }
         },
     }
-    if instagram_profile_pic_url is not None:
-        item["instagramProfilePicUrl"] = instagram_profile_pic_url
+    if photo_key is not None:
+        item["participantPhotoKey"] = photo_key
     return item
 
 
@@ -51,22 +50,18 @@ def _ctx(players, codes):
         validated_set.add(pid)
         return True
 
-    sent = []
-    quizzed = []
-
     return {
         "gameId": "GAME01",
         "codes": codes,
         "to_int_code": to_int,
         "query_players_by_code": query,
         "set_validated": set_val,
-        "send_bulk": lambda msgs: sent.extend(msgs),
-        "invoke_quiz": lambda gid, psids: quizzed.extend(psids),
         "presign_character_png": lambda name: f"https://cdn.example.com/{name}.png",
+        "player_profile_pic_url": lambda p: (
+            f"https://media.example.com/{p['participantPhotoKey']}" if p.get("participantPhotoKey") else ""
+        ),
         "inc_validated_count": None,
         "log": lambda msg, data=None: None,
-        "_sent": sent,
-        "_quizzed": quizzed,
     }
 
 
@@ -135,22 +130,27 @@ def test_happy_path():
     assert pids == {1, 2}
     for pl in result["players"]:
         assert pl.get("profilePicUrl") == ""
-    # No message or quiz on validate (quiz is launched at assign)
-    assert len(ctx["_sent"]) == 0
-    assert len(ctx["_quizzed"]) == 0
+        assert pl["username"] == f"user{pl['playerId']}"
+        assert "instagramUsername" not in pl
 
 
 def test_profile_pic_url_in_players():
-    url1 = "https://cdn.example.com/u1.jpg"
-    url2 = "https://cdn.example.com/u2.jpg"
-    p1 = _player(1, 1111, "P1", "C1", char_name="Romeo", instagram_profile_pic_url=url1)
-    p2 = _player(2, 2222, "P1", "C2", char_name="Juliet", instagram_profile_pic_url=url2)
+    p1 = _player(1, 1111, "P1", "C1", char_name="Romeo", photo_key="players/u1.jpg")
+    p2 = _player(2, 2222, "P1", "C2", char_name="Juliet", photo_key="players/u2.jpg")
     ctx = _ctx([p1, p2], ["1111", "2222"])
     result = validate_empareja2(ctx)
     assert result["valid"] is True
     by_id = {pl["playerId"]: pl for pl in result["players"]}
-    assert by_id[1]["profilePicUrl"] == url1
-    assert by_id[2]["profilePicUrl"] == url2
+    assert by_id[1]["profilePicUrl"] == "https://media.example.com/players/u1.jpg"
+    assert by_id[2]["profilePicUrl"] == "https://media.example.com/players/u2.jpg"
+
+
+def test_legacy_instagram_photo_is_ignored():
+    p1 = _player(1, 1111, "P1", "C1", char_name="Romeo")
+    p2 = _player(2, 2222, "P1", "C2", char_name="Juliet")
+    p1["instagramProfilePicUrl"] = "https://legacy.example.com/u1.jpg"
+    result = validate_empareja2(_ctx([p1, p2], ["1111", "2222"]))
+    assert all(pl["profilePicUrl"] == "" for pl in result["players"])
 
 
 def test_presign_url_in_response():

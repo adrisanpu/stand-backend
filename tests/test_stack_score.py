@@ -484,28 +484,30 @@ def test_ranking_all_pages_descending_deterministic_ties_safe_display():
         {"Items": [ranked_player(7, 4, email="secret@example.com"), ranked_player(3),
                    ranked_player(1, 100, status="started"), ranked_player(2, True)],
          "LastEvaluatedKey": {"gameId": "ABCDEF", "playerId": 7}},
-        {"Items": [ranked_player(9, 10, instagramUsername="ana", instagramProfilePicUrl="https://avatar"),
+        {"Items": [ranked_player(9, 10, username="ana"),
                    ranked_player(4), ranked_player(5, timestamp="2026-01-01T00:00:00Z"),
                    ranked_player(6, 0), ranked_player(8, -1), ranked_player(10, 3.5),
                    ranked_player(11, timestamp="bad"), ranked_player(12, Decimal("NaN")),
-                   ranked_player(13, 1, instagramUsername="secret@example.com")]},
+                   ranked_player(13, 1, instagramUsername="legacy", instagramProfilePicUrl="https://avatar")]},
     ]
     table.query.side_effect = deepcopy(pages)
     result = get_ranking("ABCDEF", table, 4)["results"]
     assert [p["playerId"] for p in result] == [9, 7, 5, 3]
     assert [p["rank"] for p in result] == [1, 2, 3, 4]
-    assert result[0]["username"] == "@ana" and result[0]["profilePicUrl"] == "https://avatar"
+    assert result[0]["username"] == "ana" and result[0]["profilePicUrl"] is None
     assert result[1]["username"] == "Jugador 7"
     assert "secret" not in str(result)
     assert table.query.call_args.kwargs["ExclusiveStartKey"] == pages[0]["LastEvaluatedKey"]
     table.query.side_effect = deepcopy(pages)
     all_results = get_ranking("ABCDEF", table, None)["results"]
     assert [p["playerId"] for p in all_results] == [9, 7, 5, 3, 4, 13, 6]
+    legacy = next(p for p in all_results if p["playerId"] == 13)
+    assert legacy["username"] == "Jugador 13" and legacy["profilePicUrl"] is None
 
 
 def test_ranking_uses_profile_photo_resolver():
     table = MagicMock()
-    player = ranked_player(9, 10, instagramUsername="ana")
+    player = ranked_player(9, 10, username="ana")
     player["participantPhotoKey"] = "players/ABCDEF/9/profile.png"
     table.query.return_value = {"Items": [player]}
     result = get_ranking(

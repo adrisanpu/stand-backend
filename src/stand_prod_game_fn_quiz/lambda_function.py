@@ -2,29 +2,18 @@ import os
 import json
 import base64
 from datetime import datetime, timezone
-from decimal import Decimal
 
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, get_game_type_blob
-from stand_common.game_access import resolve_game_access
-from stand_common.player_access import (
-    ACCESS_LINK_FAILED_TEXT,
-    access_link_message,
-    access_link_ttl_seconds,
-    issue_access_link,
-)
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
-IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "instagram-sender")
-PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
 # ==================================
 
 dynamo_r = boto3.resource("dynamodb")
-lambda_client = boto3.client("lambda")
 
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
@@ -58,120 +47,6 @@ def _parse_http_event(event: dict):
 
     qs = (event or {}).get("queryStringParameters") or {}
     return method, body, qs
-
-
-# ----------------- IG sender -----------------
-
-def _invoke_instagram_sender(messages):
-    if not messages:
-        return
-    if not IG_SENDER_LAMBDA:
-        log("igsender_missing_env", {"count": len(messages)})
-        return
-    try:
-        lambda_client.invoke(
-            FunctionName=IG_SENDER_LAMBDA,
-            InvocationType="Event",
-            Payload=json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8"),
-        )
-    except Exception as e:
-        log("igsender_invoke_error", {"error": repr(e), "count": len(messages)})
-
-
-def _send_dm(psid: str, text: str) -> bool:
-    if not psid or psid == "#":
-        return False
-    _invoke_instagram_sender([{"psid": psid, "text": text}])
-    return True
-
-
-def _raffle_required_follows(meta: dict) -> list:
-    """List of handles (no @) for raffle follow requirement."""
-    follows = meta.get("raffleRequiredFollows") or []
-    if not isinstance(follows, list):
-        follows = []
-    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
-
-
-def _raffle_follow_messages(psid: str, meta: dict) -> list:
-    handles = _raffle_required_follows(meta)
-    if not handles or not psid:
-        return []
-    return [
-        {"psid": psid, "text": "⚠️ Para participar en el sorteo, sigue estas cuentas:"},
-        {"psid": psid, "template": "follow_accounts", "handles": handles},
-    ]
-
-
-def _requires_validation(meta: dict, game_type: str) -> bool:
-    """True if game requires validation code; False for no-validation games (e.g. INFOCARDS)."""
-    if "requiresValidation" in (meta or {}):
-        val = meta.get("requiresValidation")
-    else:
-        val = None
-    if val is None:
-        val = False if (game_type or "").upper() == "INFOCARDS" else True
-    if isinstance(val, str):
-        return val.strip().lower() in ("1", "true", "yes")
-    return bool(val)
-
-
-def _send_raffle_follow_requirement(psid: str, meta: dict):
-    """If game has raffleRequiredFollows, send intro text + Generic Template with accounts."""
-    msgs = _raffle_follow_messages(psid, meta)
-    if msgs:
-        _invoke_instagram_sender(msgs)
-
-
-def _send_validation_code_then_raffle(psid: str, code, meta: dict) -> None:
-    messages = [{"psid": psid, "text": f"🎟️ Tu código es: {code}"}]
-    messages.extend(_raffle_follow_messages(psid, meta))
-    _invoke_instagram_sender(messages)
-
-
-def _send_access_link_then_raffle(psid: str, game_id: str, player_id: int, meta: dict, intro_text: str | None = None) -> bool:
-    """Mobile play: personal one-use link for the existing PSID player, then raffle follows."""
-    messages = [{"psid": psid, "text": intro_text}] if intro_text else []
-    ttl = access_link_ttl_seconds()
-    try:
-        url = issue_access_link(gp_table, game_id, int(player_id), PLAYER_TOKEN_SECRET, ttl_seconds=ttl)
-    except Exception as e:
-        # Never log the link/token itself.
-        log("quiz_access_link_failed", {"error": type(e).__name__, "gameId": game_id, "playerId": player_id})
-        messages.append({"psid": psid, "text": ACCESS_LINK_FAILED_TEXT})
-        _invoke_instagram_sender(messages)
-        return False
-    messages.append(access_link_message(psid, url, ttl))
-    messages.extend(_raffle_follow_messages(psid, meta))
-    _invoke_instagram_sender(messages)
-    return True
-
-
-def _send_quiz_question(psid: str, question_id: str, questions_cfg: dict) -> bool:
-    msg = _build_quiz_question_message(psid, question_id, questions_cfg)
-    if not msg:
-        return False
-    _invoke_instagram_sender([msg])
-    return True
-
-
-def _build_quiz_question_message(psid: str, question_id: str, questions_cfg: dict) -> dict | None:
-    """Build a single message dict for a quiz question."""
-    q = questions_cfg.get(question_id) or {}
-    text = (q.get("text") or "").strip()
-    options = q.get("options", []) or []
-
-    quick_replies = []
-    for opt in options:
-        title = (opt.get("title") or "").strip()
-        payload = (opt.get("payload") or "").strip()
-        if not title or not payload:
-            continue
-        quick_replies.append({"content_type": "text", "title": title, "payload": payload})
-
-    if not quick_replies:
-        return {"psid": psid, "text": text} if text else None
-    return {"psid": psid, "text": text, "quick_replies": quick_replies}
 
 
 # ----------------- Quiz meta (game-table) -----------------
@@ -290,22 +165,6 @@ def _prepare_quiz_for_existing_players(game_id: str, game_type_upper: str):
     return {"playersSeen": len(items), "playersUpdated": updated}
 
 
-# ----------------- Player access (GSI gsi-instagramPSID) -----------------
-
-def _get_player_by_psid_and_game(psid: str, game_id: str):
-    """
-    Usa GSI gsi-instagramPSID:
-      PK=instagramPSID, SK=gameId
-    """
-    resp = gp_table.query(
-        IndexName="gsi-instagramPSID",
-        KeyConditionExpression=Key("instagramPSID").eq(psid) & Key("gameId").eq(game_id),
-        Limit=1,
-    )
-    items = resp.get("Items") or []
-    return items[0] if items else None
-
-
 def _scan_players_in_game(game_id: str):
     out = []
     last = None
@@ -323,62 +182,12 @@ def _scan_players_in_game(game_id: str):
 
 # ----------------- Quiz state en type.<GAME_TYPE_UPPER> -----------------
 
-def _get_type_blob(player_item: dict, game_type_upper: str) -> dict:
-    t = player_item.get("type") or {}
-    return t.get((game_type_upper or "").upper()) or {}
 
 
-def _set_quiz_state(game_id: str, player_id: int, game_type_upper: str, next_question_id, completed: bool):
-    """
-    SET type.<g>.quizCurrentQuestion, type.<g>.quizCompleted
-    """
-    gk = (game_type_upper or "").upper()
-    if not gk:
-        raise ValueError("Missing gameType")
-
-    now = _iso_now()
-
-    gp_table.update_item(
-        Key={"gameId": game_id, "playerId": int(player_id)},
-        UpdateExpression=(
-            "SET #type.#g.quizCurrentQuestion = :next, "
-            "#type.#g.quizCompleted = :done, "
-            "#type.#g.quizUpdatedAt = :t"
-        ),
-        ExpressionAttributeNames={"#type": "type", "#g": gk},
-        ExpressionAttributeValues={":next": next_question_id, ":done": bool(completed), ":t": now},
-    )
-    return now
 
 
-def _save_quiz_answer(game_id: str, player_id: int, game_type_upper: str, question_id: str, answer_id: str):
-    gk = (game_type_upper or "").upper()
-    if not gk:
-        raise ValueError("Missing gameType")
-
-    now = _iso_now()
-
-    gp_table.update_item(
-        Key={"gameId": game_id, "playerId": int(player_id)},
-        UpdateExpression="SET #type.#g.#qa.#qid = :ans, #type.#g.quizUpdatedAt = :t",
-        ExpressionAttributeNames={
-            "#type": "type",
-            "#g": gk,
-            "#qa": "quizAnswers",
-            "#qid": str(question_id),
-        },
-        ExpressionAttributeValues={":ans": str(answer_id), ":t": now},
-    )
-    return now
 
 
-def _next_question_id(current_qid: str, quiz_order: list[str]):
-    if not quiz_order:
-        return None
-    if current_qid not in quiz_order:
-        return quiz_order[0]
-    idx = quiz_order.index(current_qid)
-    return quiz_order[idx + 1] if idx + 1 < len(quiz_order) else None
 
 
 # ----------------- Payload parsing -----------------
@@ -409,19 +218,6 @@ def _parse_quiz_payload(payload: str):
 # ----------------- MAIN handler -----------------
 
 def lambda_handler(event, context):
-    # ========== SQS MODE ==========
-    # Triggered by StandProdQuizQueue; each record carries a quiz_start payload.
-    if isinstance(event, dict) and "Records" in event:
-        results = []
-        for record in event["Records"]:
-            try:
-                inner = json.loads(record.get("body") or "{}")
-                results.append(lambda_handler(inner, context))
-            except Exception as e:
-                log("sqs_record_error", {"error": repr(e)})
-                results.append({"ok": False, "error": repr(e)})
-        return {"ok": True, "processed": len(event["Records"]), "results": results}
-
     # ========== HTTP MODE ==========
     if isinstance(event, dict) and ("httpMethod" in event or "requestContext" in event):
         method, body, qs = _parse_http_event(event)
@@ -452,8 +248,6 @@ def lambda_handler(event, context):
                         continue
                     players_out.append({
                         "playerId": pid,
-                        "instagramPSID": it.get("instagramPSID"),
-                        "instagramUsername": it.get("instagramUsername"),
                         "quizRequired": False,
                         "quizCompleted": False,
                         "quizCurrentQuestion": None,
@@ -495,8 +289,6 @@ def lambda_handler(event, context):
                 tb = ((it.get("type") or {}).get(gk) or {})
                 players_out.append({
                     "playerId": pid,
-                    "instagramPSID": it.get("instagramPSID"),
-                    "instagramUsername": it.get("instagramUsername"),
                     "quizCompleted": bool(tb.get("quizCompleted", False)),
                     "quizCurrentQuestion": tb.get("quizCurrentQuestion"),
                     "quizAnswers": tb.get("quizAnswers") or {},
@@ -540,148 +332,4 @@ def lambda_handler(event, context):
 
         return _resp(405, {"ok": False, "error": "method_not_allowed", "method": method})
 
-    # ========== INTERNAL EVENT MODE ==========
-    try:
-        kind = (event or {}).get("kind")
-
-        # ---- quiz_start ----
-        if kind == "quiz_start":
-            game_id = (event.get("gameId") or event.get("game_id") or "").strip()
-            raw_psids = event.get("psid") or []
-
-            psids = [p.strip() for p in raw_psids if isinstance(p, str) and p.strip()]
-            if not game_id or not psids:
-                log("bad_quiz_start_event", event)
-                return {"ok": False, "error": "missing_gameId_or_psids"}
-
-            quiz_order, quiz_questions, meta = _get_quiz_meta(game_id)
-            if not meta:
-                for p in psids:
-                    _send_dm(p, "Esa partida no existe. 🙈")
-                return {"ok": False, "error": "game_not_found"}
-
-            if not quiz_order:
-                # IMPORTANT: do NOT send intro text here (no quiz)
-                return {"ok": False, "error": "no_quiz_config"}
-
-            game_type = (meta.get("gameType") or "").upper()
-            first_qid = quiz_order[0]
-            results = []
-
-            for psid in psids:
-                player = _get_player_by_psid_and_game(psid, game_id)
-                if not player:
-                    _send_dm(psid, "No he encontrado tu participación en la partida. ¿Has usado el código correcto?")
-                    results.append({"psid": psid, "started": False, "reason": "player_not_found"})
-                    continue
-
-                pid = _as_int(player.get("playerId"))
-                if pid is None:
-                    results.append({"psid": psid, "started": False, "reason": "bad_playerId"})
-                    continue
-
-                if (resolve_game_access(meta)["playMode"] == "mobile"
-                        and get_game_type_blob(player, game_type).get("quizCompleted")):
-                    sent = _send_access_link_then_raffle(psid, game_id, pid, meta)
-                    results.append({"psid": psid, "started": False, "completed": True, "accessSent": sent})
-                    continue
-
-                # Intro is sent in assign; here we only send the first question
-                first_q_msg = _build_quiz_question_message(psid, first_qid, quiz_questions)
-                if first_q_msg:
-                    _invoke_instagram_sender([first_q_msg])
-
-                _set_quiz_state(game_id, pid, game_type, first_qid, completed=False)
-
-                results.append({"psid": psid, "started": True, "playerId": pid, "firstQuestion": first_qid})
-
-            return {"ok": True, "gameId": game_id, "results": results}
-
-
-        # ---- quiz_answer ----
-        if kind != "quiz_answer":
-            log("ignored_event", {"kind": kind})
-            return {"ok": True, "ignored": True}
-
-        psid = event.get("psid")
-        quiz_payload = (event.get("quizPayload") or "").strip()
-
-        if not psid or not quiz_payload:
-            log("bad_quiz_event", event)
-            return {"ok": False, "error": "missing_psid_or_payload"}
-
-        game_id, question_id, answer_id = _parse_quiz_payload(quiz_payload)
-
-        # controles QR_*
-        if game_id is None and question_id is None and answer_id and answer_id.startswith("QR_"):
-            _send_dm(psid, "Cuestionario cerrado. Gracias igualmente 🙌")
-            return {"ok": True, "closed": True}
-
-        if not game_id or not question_id or not answer_id:
-            return {"ok": False, "error": "invalid_quiz_payload"}
-
-        quiz_order, quiz_questions, meta = _get_quiz_meta(game_id)
-        if not meta:
-            return {"ok": False, "error": "game_not_found"}
-
-        game_type = (meta.get("gameType") or "").upper()
-        if not game_type or game_type == "UNKNOWN":
-            return {"ok": False, "error": "missing_gameType"}
-
-        if not quiz_order:
-            return {"ok": False, "error": "no_quiz_config"}
-
-        player = _get_player_by_psid_and_game(psid, game_id)
-        if not player:
-            return {"ok": False, "error": "player_not_found"}
-
-        pid = _as_int(player.get("playerId"))
-        if pid is None:
-            return {"ok": False, "error": "bad_playerId"}
-
-        if (resolve_game_access(meta)["playMode"] == "mobile"
-                and get_game_type_blob(player, game_type).get("quizCompleted")):
-            return {"ok": True, "completed": True, "gameId": game_id, "playerId": pid}
-
-        _save_quiz_answer(game_id, pid, game_type, question_id, answer_id)
-
-        next_qid = _next_question_id(question_id, quiz_order)
-
-        if not next_qid:
-            _set_quiz_state(game_id, pid, game_type, None, completed=True)
-
-            # Games can opt out of validation: send custom message instead of code
-            type_blob = get_game_type_blob(meta, game_type)
-            requires_validation = _requires_validation(meta, game_type)
-
-            if resolve_game_access(meta)["playMode"] == "mobile":
-                sent = _send_access_link_then_raffle(psid, game_id, pid, meta, intro_text="¡Gracias por responder! ✅")
-                return {"ok": sent, "completed": True, "accessSent": sent, "gameId": game_id, "playerId": pid}
-
-            if not requires_validation:
-                msg = (type_blob.get("quizCompletedMessage") or "").strip()
-                if not msg:
-                    msg = "¡Gracias! Ya estás participando en el sorteo."
-                _send_dm(psid, msg)
-            else:
-                code = player.get("validationCode")
-                if code:
-                    _send_validation_code_then_raffle(psid, code, meta)
-                else:
-                    _send_dm(psid, "He tenido un problema generando tu código. Escribe 'AYUDA' y te lo soluciono.")
-
-            # INFOCARDS and similar: follow after quizCompletedMessage (no validation code)
-            if not requires_validation:
-                _send_raffle_follow_requirement(psid, meta)
-            return {"ok": True, "completed": True, "gameId": game_id, "playerId": pid}
-
-        _set_quiz_state(game_id, pid, game_type, next_qid, completed=False)
-        _send_quiz_question(psid, next_qid, quiz_questions)
-        return {"ok": True, "nextQuestion": next_qid, "gameId": game_id, "playerId": pid}
-
-    except ClientError as e:
-        log("quiz_dynamo_error", {"error": str(e)})
-        return {"ok": False, "error": "DynamoError", "detail": str(e)}
-    except Exception as e:
-        log("quiz_processor_error", {"error": repr(e)})
-        return {"ok": False, "error": "internal_error", "message": str(e)}
+    return {"ok": True, "ignored": True}

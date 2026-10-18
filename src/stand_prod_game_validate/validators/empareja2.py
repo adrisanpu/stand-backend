@@ -16,9 +16,14 @@ def _norm_char_id(x):
         return None
 
 
-def _profile_pic_url(player_item: dict) -> str:
-    pic = player_item.get("instagramProfilePicUrl") or ""
-    return pic.strip() if isinstance(pic, str) else ""
+def _profile_pic_url(ctx: dict, player_item: dict) -> str:
+    profile_pic_url = ctx.get("player_profile_pic_url")
+    return (profile_pic_url(player_item) if profile_pic_url else "") or ""
+
+
+def _username(player_item: dict) -> str:
+    username = player_item.get("username")
+    return username.strip() if isinstance(username, str) else ""
 
 
 def _pair_group_id_from_player(t: dict) -> str:
@@ -128,19 +133,19 @@ def validate_empareja2(ctx: dict):
         "players": [
             {
                 "playerId": pid1,
-                "instagramUsername": p1.get("instagramUsername"),
+                "username": _username(p1),
                 "characterId": t1.get("characterId"),
                 "characterName": c1_name,
                 "characterImageUrl": presign(c1_name) if presign else None,
-                "profilePicUrl": _profile_pic_url(p1),
+                "profilePicUrl": _profile_pic_url(ctx, p1),
             },
             {
                 "playerId": pid2,
-                "instagramUsername": p2.get("instagramUsername"),
+                "username": _username(p2),
                 "characterId": t2.get("characterId"),
                 "characterName": c2_name,
                 "characterImageUrl": presign(c2_name) if presign else None,
-                "profilePicUrl": _profile_pic_url(p2),
+                "profilePicUrl": _profile_pic_url(ctx, p2),
             },
         ]
     }

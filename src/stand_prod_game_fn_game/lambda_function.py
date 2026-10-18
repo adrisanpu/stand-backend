@@ -207,18 +207,28 @@ def _quiz_enabled_from_game(game_item: dict) -> bool:
     order = game_item.get("quizOrder") or []
     return isinstance(order, list) and len(order) > 0
 
+def _raffle_winner_row(winner) -> dict | None:
+    if not isinstance(winner, dict):
+        return None
+    username = winner.get("username")
+    if not (isinstance(username, str) and username.strip()):
+        # Winners stored before the Web-only migration only kept their historical display name here.
+        username = winner.get("instagramUsername")
+    row = {
+        "playerId": winner.get("playerId"),
+        "username": username.strip() if isinstance(username, str) and username.strip() else None,
+        "wonAt": winner.get("wonAt"),
+    }
+    if winner.get("validationCode") is not None:
+        row["validationCode"] = winner.get("validationCode")
+    return row
+
+
 def _raffle_winners_from_game(game_item: dict) -> list:
-    # si lo guardas en games_table, ideal.
     winners = game_item.get("raffleWinners") or []
-    return winners if isinstance(winners, list) else []
-
-
-def _raffle_required_follows_from_game(game_item: dict) -> list:
-    """List of Instagram handles (no @) required to participate in raffle."""
-    follows = game_item.get("raffleRequiredFollows") or []
-    if not isinstance(follows, list):
+    if not isinstance(winners, list):
         return []
-    return [str(h).strip().lower().lstrip("@") for h in follows if h and str(h).strip()]
+    return [row for row in (_raffle_winner_row(w) for w in winners) if row is not None]
 
 
 def _get_player_prize_delivered(game_id: str, player_id: int, game_type: str) -> bool:
@@ -439,7 +449,6 @@ def _handle_get(event):
             "playerCount": player_count,
             "validatedCount": validated_count,
             "raffleWinners": _raffle_winners_from_game(item),
-            "raffleRequiredFollows": _raffle_required_follows_from_game(item),
             "quiz": {
                 "enabled": _quiz_enabled_from_game(item),
                 "questionsCount": len(item.get("quizOrder") or []) if _quiz_enabled_from_game(item) else 0
@@ -534,6 +543,10 @@ def _handle_post(event):
             "supportedGameTypes": sorted(SUPPORTED_GAME_TYPES),
         })
 
+    if ("playMode" in body and body["playMode"] is None) or (
+        "joinChannel" in body and body["joinChannel"] is None
+    ):
+        return _resp(400, {"error": "playMode must be 'mobile' and joinChannel must be 'web'."})
     try:
         access = access_for_create(game_type, body.get("playMode"), body.get("joinChannel"))
     except GameAccessError as exc:
@@ -688,7 +701,6 @@ def _handle_put(event):
     if "stack" in settings and not isinstance(settings["stack"], dict):
         return _resp(400, {"error": "settings.stack must be an object."})
     empareja2_settings = settings.get("empareja2")
-    raffle_settings = settings.get("raffle")
     prize_update = settings.get("prizeDelivered")
     l3tras_settings = settings.get("l3tras")
     impostor_settings = settings.get("impostor")
@@ -697,11 +709,15 @@ def _handle_put(event):
     join_channel = body.get("joinChannel")
     play_mode = body.get("playMode")
 
+    if ("playMode" in body and play_mode is None) or (
+        "joinChannel" in body and join_channel is None
+    ):
+        return _resp(400, {"error": "playMode must be 'mobile' and joinChannel must be 'web'."})
+
     # At least one update
     if (
         is_active is None
         and not empareja2_settings
-        and not raffle_settings
         and not prize_update
         and not l3tras_settings
         and not impostor_settings
@@ -989,35 +1005,6 @@ def _handle_put(event):
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
             log("Update type.IMPOSTOR failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
-
-    if raffle_settings is not None and isinstance(raffle_settings, dict):
-        required_follows = raffle_settings.get("requiredFollows")
-        if required_follows is not None:
-            if not isinstance(required_follows, list):
-                return _resp(400, {"error": "settings.raffle.requiredFollows must be an array of strings or omitted."})
-            normalized = []
-            for h in required_follows:
-                if h is None:
-                    continue
-                s = str(h).strip().lower().lstrip("@")
-                if s and s not in normalized:
-                    normalized.append(s)
-            try:
-                games_table.update_item(
-                    Key={"gameId": game_id},
-                    UpdateExpression="SET raffleRequiredFollows = :r, updatedAt = :u",
-                    ExpressionAttributeValues={
-                        ":r": normalized,
-                        ":u": now,
-                        ":owner": owner_user_id,
-                    },
-                    ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
-                )
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                    return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
-                log("Update raffleRequiredFollows failed", {"error": str(e)})
-                return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
     # settings.prizeDelivered: { gameType, playerId, delivered: bool }
     if prize_update is not None and isinstance(prize_update, dict):

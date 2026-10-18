@@ -30,7 +30,7 @@ def _player_profile_pic_url(player: dict) -> str | None:
         return s3.generate_presigned_url(
             "get_object", Params={"Bucket": USER_MEDIA_BUCKET, "Key": photo_key}, ExpiresIn=3600,
         )
-    return (player.get("instagramProfilePicUrl") or "").strip() or None
+    return None
 
 
 def _parse_body(event):

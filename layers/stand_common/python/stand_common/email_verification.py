@@ -32,7 +32,7 @@ class RegistrationError(ValueError):
 def registration_values(meta, body):
     fields = normalize_participant_fields(meta.get("gameType") or "", meta.get("participantFields"))
     values = {}
-    for name, limit in (("email", 254), ("instagram", 100), ("phone", 64)):
+    for name, limit in (("email", 254), ("phone", 64)):
         if not fields[name]["required"]:
             continue
         raw = body.get(name)
@@ -47,21 +47,16 @@ def registration_values(meta, body):
             value = normalize_email(value)
             if not is_valid_email(value):
                 raise RegistrationError("invalid_email")
-        elif name == "instagram":
-            value = value.lstrip("@")
-            if not value:
-                raise RegistrationError("missing_instagram")
         values[name] = value
-    if not fields["instagram"]["required"]:
-        raw = body.get("username")
-        if raw is not None and not isinstance(raw, str):
-            raise RegistrationError("invalid_username")
-        username = (raw or "").strip()
-        if not username:
-            raise RegistrationError("missing_username")
-        if len(username) > 100 or re.search(r"[\x00-\x1f\x7f-\x9f]", username):
-            raise RegistrationError("invalid_username")
-        values["username"] = username
+    raw = body.get("username")
+    if raw is not None and not isinstance(raw, str):
+        raise RegistrationError("invalid_username")
+    username = (raw or "").strip()
+    if not username:
+        raise RegistrationError("missing_username")
+    if len(username) > 100 or re.search(r"[\x00-\x1f\x7f-\x9f]", username):
+        raise RegistrationError("invalid_username")
+    values["username"] = username
     return values
 
 

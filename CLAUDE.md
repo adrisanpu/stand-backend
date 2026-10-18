@@ -43,4 +43,4 @@ def lambda_handler(event, context):
 - Never serialize DynamoDB Decimals directly — always use `_as_int()` or `_json_sanitize()`
 - `set_game_type_blob` does two update_item calls — do NOT collapse into one
 - CORS: cors-fn handles OPTIONS without auth — never add auth to OPTIONS routes
-- IAM roles: StandProdGameRole | StandProdBillingRole | StandProdWebhookRole | StandProdSenderRole | StandProdInfocardsRole
+- IAM roles: StandProdGameRole | StandProdBillingRole | StandProdSenderRole | StandProdInfocardsRole

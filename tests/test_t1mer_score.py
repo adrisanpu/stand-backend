@@ -22,7 +22,7 @@ def test_store_score_rejects_already_scored():
         "Item": {
             "gameId": "ABCDEF",
             "playerId": 1,
-            "instagramUsername": "@ana",
+            "username": "Ana",
             "type": {"T1MER": {"timer": Decimal("10.1"), "score": Decimal("100")}},
         }
     }
@@ -38,7 +38,7 @@ def test_store_score_writes_when_no_prior_score():
         "Item": {
             "gameId": "ABCDEF",
             "playerId": 1,
-            "instagramUsername": "@ana",
+            "username": "Ana",
             "type": {"T1MER": {}},
         }
     }
@@ -48,7 +48,7 @@ def test_store_score_writes_when_no_prior_score():
             {
                 "gameId": "ABCDEF",
                 "playerId": 1,
-                "instagramUsername": "@ana",
+                "username": "Ana",
                 "type": {"T1MER": {"timer": Decimal("10.05"), "score": Decimal("50")}},
             }
         ]
@@ -74,8 +74,9 @@ def test_ranking_uses_profile_photo_resolver():
     assert result["results"][0]["profilePicUrl"] == "signed:players/ABCDEF/1/profile.png"
 
 
-@pytest.mark.parametrize("instagram,expected", [(None, "Ana 🌟"), ("@ana", "@ana")])
-def test_score_and_operator_ranking_use_optional_username_after_instagram(instagram, expected):
+@pytest.mark.parametrize("instagram", [None, "@ana"])
+def test_score_and_operator_ranking_use_web_username_only(instagram):
+    expected = "Ana 🌟"
     gp = MagicMock()
     player = {
         "gameId": "ABCDEF", "playerId": 1, "username": "Ana 🌟",

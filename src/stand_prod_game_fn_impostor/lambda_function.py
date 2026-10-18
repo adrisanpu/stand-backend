@@ -1,4 +1,3 @@
-import json
 import os
 import random
 
@@ -10,14 +9,28 @@ from stand_common.utils import _get_claims, _iso_now, _read_json_body, _resp, ge
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
-IG_SENDER_LAMBDA = os.environ.get("IG_SENDER_LAMBDA", "")
+USER_MEDIA_BUCKET = os.environ.get("USER_MEDIA_BUCKET", "")
 
 dynamo_r = boto3.resource("dynamodb")
-lambda_client = boto3.client("lambda")
+s3 = boto3.client("s3")
 games_table = dynamo_r.Table(GAMES_TABLE)
 gp_table = dynamo_r.Table(GAMEPLAYER_TABLE)
 
 DEFAULT_WORDS = ["playa", "montana", "pizza", "cine", "futbol", "musica"]
+
+
+def _player_profile_pic_url(player: dict) -> str | None:
+    photo_key = player.get("participantPhotoKey")
+    if not photo_key or not USER_MEDIA_BUCKET:
+        return None
+    return s3.generate_presigned_url(
+        "get_object", Params={"Bucket": USER_MEDIA_BUCKET, "Key": photo_key}, ExpiresIn=3600,
+    )
+
+
+def _player_username(player: dict) -> str | None:
+    username = player.get("username")
+    return username.strip() if isinstance(username, str) and username.strip() else None
 
 
 def _method(event):
@@ -46,19 +59,6 @@ def _query_players(game_id: str):
     return items
 
 
-def _send_bulk(messages):
-    if not messages or not IG_SENDER_LAMBDA:
-        return
-    try:
-        lambda_client.invoke(
-            FunctionName=IG_SENDER_LAMBDA,
-            InvocationType="Event",
-            Payload=json.dumps({"messages": messages}, ensure_ascii=False).encode("utf-8"),
-        )
-    except Exception as e:
-        log("impostor_dm_send_error", {"error": repr(e), "count": len(messages)})
-
-
 def _get_state_payload(game_id: str):
     game = _get_game(game_id)
     if not game:
@@ -72,8 +72,8 @@ def _get_state_payload(game_id: str):
         out_players.append(
             {
                 "playerId": int(p.get("playerId")),
-                "instagramUsername": p.get("instagramUsername"),
-                "instagramProfilePicUrl": p.get("instagramProfilePicUrl"),
+                "username": _player_username(p),
+                "profilePicUrl": _player_profile_pic_url(p),
             }
         )
     out_players.sort(key=lambda p: p["playerId"])
@@ -122,18 +122,6 @@ def _handle_start_round(game_id: str):
         "startedAt": _iso_now(),
     }
     set_game_type_blob(games_table, game_id, "IMPOSTOR", new_blob, updated_at=_iso_now())
-
-    messages = []
-    for p in players:
-        psid = (p.get("instagramPSID") or "").strip()
-        if not psid:
-            continue
-        if int(p["playerId"]) == int(impostor["playerId"]):
-            txt = "Tu rol es IMPOSTOR. Intenta mezclarte sin revelar que no sabes la palabra."
-        else:
-            txt = f"Palabra secreta: {selected_word}"
-        messages.append({"psid": psid, "text": txt})
-    _send_bulk(messages)
     return _resp(200, {"ok": True, "started": True})
 
 

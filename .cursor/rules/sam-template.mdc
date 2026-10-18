@@ -12,7 +12,7 @@ Follow workspace [infrastructure-rule.md](../../infrastructure-rule.md) for all 
 - Parameter `Environment`: `prod` | `dev` (default `prod`)
 - Physical names: `!Sub "stand-${Environment}-..."` (tables, Lambdas, APIs, roles, buckets)
 - API stage: literal `prod` on HttpApi (`StageName: prod`) so prod stack keeps `GameApiprodStage`; URLs always end with `/prod` (dev stack uses a different API id, same `/prod` path)
-- Secrets: `stand/${Environment}/instagram`, `stand/${Environment}/stripe`
+- Secrets: `stand/${Environment}/stripe` (the legacy `stand/${Environment}/instagram` secret is no longer referenced)
 - Cognito JWT: parameters `CognitoUserPoolId`, `CognitoAppClientId`
 
 ## Naming conventions (logical IDs unchanged for stack compatibility)
@@ -22,10 +22,10 @@ Follow workspace [infrastructure-rule.md](../../infrastructure-rule.md) for all 
 - IAM role IDs: `StandProd<Component>Role`
 
 ## IAM Roles (existing — reuse, don't create new ones)
-- `StandProdGameRole` — game, assign, validate, score, quiz, raffle, infocards-get
+- `StandProdGameRole` — game, validate, score, quiz, raffle, impostor, infocards-get
+- `StandPublicRole` / `StandAssignRole` — public Web registration and assignment
 - `StandProdBillingRole` — billing, user
-- `StandProdWebhookRole` — webhook-instagram, webhook-stripe
-- `StandProdSenderRole` — instagram-sender
+- Stripe webhook reuses `StandProdBillingRole`
 - `StandProdInfocardsRole` — infocards-process, quiz-generate (needs Bedrock)
 
 ## Globals (already set — don't override per-function unless necessary)

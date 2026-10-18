@@ -27,11 +27,9 @@ from stand_common.utils import (
     normalize_participant_fields,
     is_valid_join_code,
     issue_player_token,
-    verify_access_token,
     get_game_type_blob,
 )
 from stand_common.game_access import resolve_game_access
-from stand_common.player_access import consume_access_nonce, require_access_secret
 from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
     request_code, confirm_code,
@@ -44,7 +42,6 @@ ASSIGN_LAMBDA = os.environ.get("ASSIGN_LAMBDA", "")
 VALIDATE_LAMBDA = os.environ.get("VALIDATE_LAMBDA", "")
 SCORE_LAMBDA = os.environ.get("SCORE_LAMBDA", "")
 PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
-INSTAGRAM_DM_HANDLE = os.environ.get("INSTAGRAM_DM_HANDLE", "playstand_")
 PARTICIPANT_PHOTO_MAX_SIZE = 5 * 1024 * 1024
 PARTICIPANT_PHOTO_TYPES = {
     "image/jpeg": ("jpg", b"\xff\xd8\xff"),
@@ -77,9 +74,6 @@ def _as_int(x) -> int:
 
 
 def _player_display_label(player: dict) -> str:
-    ig = (player.get("instagramUsername") or "").strip()
-    if ig:
-        return ig if ig.startswith("@") else f"@{ig}"
     username = (player.get("username") or "").strip()
     if username:
         return username
@@ -98,7 +92,7 @@ def _player_profile_pic_url(player: dict) -> str | None:
         return boto3.client("s3").generate_presigned_url(
             "get_object", Params={"Bucket": bucket, "Key": photo_key}, ExpiresIn=3600,
         )
-    return (player.get("instagramProfilePicUrl") or "").strip() or None
+    return None
 
 
 def _get_game(game_id: str) -> dict | None:
@@ -123,9 +117,7 @@ def _is_mobile_play(meta: dict) -> bool:
 
 
 def _public_join_url(game_id: str, join_channel: str) -> str:
-    """QR/link target: Instagram DM with the game code, or the web form."""
-    if join_channel == "instagram":
-        return f"https://ig.me/m/{INSTAGRAM_DM_HANDLE}?ref={game_id}"
+    """QR/link target for supported games."""
     return f"/play/{game_id}"
 
 
@@ -167,7 +159,7 @@ def _t1mer_ranking(game_id: str, limit: int = 10) -> list[dict]:
             continue
         ranking.append({
             "playerId": pid,
-            "username": it.get("instagramUsername") or _player_display_label(it),
+            "username": _player_display_label(it),
             "profilePicUrl": _player_profile_pic_url(it),
             "timer": timer_f,
             "score": score_f,
@@ -220,7 +212,8 @@ def _handle_get_game(event):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (item.get("gameType") or "").upper()
-    pf = normalize_participant_fields(game_type, item.get("participantFields"))
+    configured_fields = normalize_participant_fields(game_type, item.get("participantFields"))
+    pf = {name: configured_fields[name] for name in ("email", "phone")}
     recent = item.get("recentPairs") or []
     if not isinstance(recent, list):
         recent = []
@@ -260,13 +253,12 @@ def _handle_get_game(event):
     return _resp(200, _json_sanitize(payload))
 
 
-def _invoke_assign_web(game_id: str, email: str | None, instagram_username: str | None, phone: str | None = None,
+def _invoke_assign_web(game_id: str, email: str | None, phone: str | None = None,
                        verification: str | None = None, username: str | None = None) -> dict:
     payload = {
         "source": "web",
         "game_id": game_id,
         "email": email,
-        "instagram_username": instagram_username,
         "phone": phone,
     }
     if verification:
@@ -291,8 +283,6 @@ def _reason_to_status(reason: str) -> int:
     return {
         "missing_email": 400,
         "invalid_email": 400,
-        "missing_instagram": 400,
-        "invalid_instagram": 400,
         "missing_phone": 400,
         "invalid_phone": 400,
         "game_not_found": 404,
@@ -331,8 +321,6 @@ def _registration_game(game_id):
         raise VerificationError("GameInactive", 403)
     if (meta.get("gameType") or "").upper() not in {"EMPAREJA2", "T1MER", "STACK"}:
         raise VerificationError("unsupported_game_type", 400)
-    if resolve_game_access(meta)["joinChannel"] != "web":
-        raise VerificationError("web_join_disabled", 403)
     return meta
 
 
@@ -387,18 +375,16 @@ def _handle_join(event):
             if values != record["registration"]:
                 raise VerificationError("VerificationSuperseded", 409)
             result = _invoke_assign_web(
-                game_id, values.get("email"), values.get("instagram"), values.get("phone"),
+                game_id, values.get("email"), values.get("phone"),
                 verification=receipt,
                 username=values.get("username"),
             )
         else:
             if body.get("consent") is not True:
                 return _resp(400, {"ok": False, "error": "ConsentRequired"})
-            values = registration_values(meta, {
-                **body, "instagram": body.get("instagram") or body.get("instagramUsername"),
-            })
+            values = registration_values(meta, body)
             result = _invoke_assign_web(
-                game_id, values.get("email"), values.get("instagram"), values.get("phone"),
+                game_id, values.get("email"), values.get("phone"),
                 username=values.get("username"),
             )
     except RegistrationError as exc:
@@ -854,6 +840,49 @@ def _handle_player_photo(event):
     return _resp(200, {"ok": True, "profilePicUrl": _player_profile_pic_url({"participantPhotoKey": photo_key})})
 
 
+def _impostor_assignment_from_player(meta: dict, player: dict, game_id: str) -> dict:
+    """Per-player Impostor view: only the requesting player's own role, and the word only for the crew."""
+    player_id = _as_int(player.get("playerId"))
+    code = player.get("validationCode")
+    blob = get_game_type_blob(meta, "IMPOSTOR")
+    phase = blob.get("phase") or "lobby"
+    turn_order = [_as_int(pid) for pid in (blob.get("turnOrder") or [])]
+    in_round = phase != "lobby" and player_id in turn_order
+    impostor_id = blob.get("impostorPlayerId")
+    is_impostor = in_round and impostor_id is not None and _as_int(impostor_id) == player_id
+    role = ("impostor" if is_impostor else "crew") if in_round else None
+
+    current_turn = None
+    if phase == "word_round" and turn_order:
+        idx = _as_int(blob.get("wordRoundTurnIndex", 0))
+        if 0 <= idx < len(turn_order):
+            turn_id = turn_order[idx]
+            turn_player = player if turn_id == player_id else _get_player(game_id, turn_id)
+            current_turn = {
+                "isMine": turn_id == player_id,
+                "name": _player_display_label(turn_player or {"playerId": turn_id}),
+            }
+
+    winner = blob.get("winner") if phase in ("result", "finished") else None
+    state = {
+        "phase": phase,
+        "round": _as_int(blob.get("round", 0)),
+        "inRound": in_round,
+        "role": role,
+        "word": blob.get("selectedWord") if role == "crew" else None,
+        "currentTurn": current_turn,
+        "winner": winner,
+        "won": (winner == "impostor") == is_impostor if winner in ("impostor", "crew") and in_round else None,
+    }
+    return {
+        "playerId": player_id,
+        "displayName": _player_display_label(player),
+        "validationCode": int(code) if isinstance(code, Decimal) else code,
+        "validated": bool(player.get("validated")),
+        "impostor": state,
+    }
+
+
 def _player_response(meta: dict, player: dict, game_id: str, player_id: int, token: str):
     """Shared PlayerResponse: {ok, gameId, gameType, playerToken, assignment, prizes}."""
     game_type = (meta.get("gameType") or "").upper()
@@ -862,6 +891,9 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
         prizes = _empareja2_prizes(player, game_id, player_id)
     elif game_type == "T1MER":
         assignment = _t1mer_assignment_from_player(player)
+        prizes = []
+    elif game_type == "IMPOSTOR":
+        assignment = _impostor_assignment_from_player(meta, player, game_id)
         prizes = []
     elif game_type == "STACK":
         if not meta.get("isActive", True):
@@ -911,54 +943,6 @@ def _handle_get_player(event):
 
     meta = _get_game(claims["gameId"]) or {}
     return _player_response(meta, player, claims["gameId"], claims["playerId"], token)
-
-
-def _handle_access(event):
-    """POST {gameId, accessToken}: one-use personal link -> participant session (PlayerResponse)."""
-    try:
-        require_access_secret(PLAYER_TOKEN_SECRET)
-    except RuntimeError:
-        log("public_access_not_configured")
-        return _resp(503, {"ok": False, "error": "AccessNotConfigured"})
-    body = _read_json_body(event)
-    if not isinstance(body, dict):
-        return _resp(400, {"ok": False, "error": "InvalidJson"})
-    game_id = body.get("gameId")
-    access_token = body.get("accessToken")
-    game_id = game_id.strip() if isinstance(game_id, str) else ""
-    if not game_id or not is_valid_join_code(game_id):
-        return _resp(400, {"ok": False, "error": "InvalidGameId"})
-
-    claims, error = verify_access_token(access_token.strip() if isinstance(access_token, str) else None,
-                                        PLAYER_TOKEN_SECRET)
-    if error == "AccessTokenExpired":
-        return _resp(410, {"ok": False, "error": "AccessTokenExpired"})
-    if not claims:
-        return _resp(403, {"ok": False, "error": "InvalidAccessToken"})
-    if claims["gameId"] != game_id:
-        return _resp(403, {"ok": False, "error": "TokenGameMismatch"})
-
-    meta = _get_game(game_id)
-    if not meta:
-        return _resp(404, {"ok": False, "error": "GameNotFound"})
-    if not meta.get("isActive", True):
-        return _resp(403, {"ok": False, "error": "GameInactive"})
-    if not _is_mobile_play(meta):
-        return _resp(403, {"ok": False, "error": "MobilePlayDisabled"})
-    player_id = claims["playerId"]
-    player = _get_player(game_id, player_id)
-    if not player:
-        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
-    if not player.get("instagramPSID"):
-        return _resp(403, {"ok": False, "error": "InstagramPlayerRequired"})
-    if meta.get("quizOrder") and not get_game_type_blob(player, meta.get("gameType", "")).get("quizCompleted"):
-        return _resp(403, {"ok": False, "error": "QuizIncomplete"})
-    if not consume_access_nonce(gp_table, game_id, player_id, claims["nonce"]):
-        return _resp(409, {"ok": False, "error": "AccessTokenUsed"})
-
-    log("public_access_exchanged", {"gameId": game_id, "playerId": player_id})
-    player_token = issue_player_token(game_id, player_id, PLAYER_TOKEN_SECRET)
-    return _player_response(meta, player, game_id, player_id, player_token)
 
 
 def _handle_redeem(event):
@@ -1080,8 +1064,6 @@ def lambda_handler(event, context):
             return _handle_get_player(event)
         if path.endswith("/player/photo") and method == "POST":
             return _handle_player_photo(event)
-        if path.endswith("/access") and method == "POST":
-            return _handle_access(event)
         if path.endswith("/redeem") and method == "POST":
             return _handle_redeem(event)
         if path.endswith("/score") and method == "POST":

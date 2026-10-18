@@ -1,9 +1,9 @@
 from decimal import Decimal
 
 
-def _profile_pic_url(player_item: dict) -> str:
-    pic = player_item.get("instagramProfilePicUrl") or ""
-    return pic.strip() if isinstance(pic, str) else ""
+def _profile_pic_url(ctx: dict, player_item: dict) -> str:
+    profile_pic_url = ctx.get("player_profile_pic_url")
+    return (profile_pic_url(player_item) if profile_pic_url else "") or ""
 
 
 def validate_l3tras(ctx: dict):
@@ -74,9 +74,9 @@ def validate_l3tras(ctx: dict):
         "players": [
             {
                 "playerId": pid,
-                "instagramUsername": it.get("instagramUsername", ""),
+                "username": (it.get("username") or "").strip() if isinstance(it.get("username"), str) else "",
                 "letter": letter,
-                "profilePicUrl": _profile_pic_url(it),
+                "profilePicUrl": _profile_pic_url(ctx, it),
             }
         ],
         "results": [{"code": str(code_int), "letter": letter}],

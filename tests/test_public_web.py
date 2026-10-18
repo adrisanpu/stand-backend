@@ -16,6 +16,7 @@ from stand_common.utils import (  # noqa: E402
     issue_prize_token,
     verify_prize_token,
     is_valid_email,
+    is_valid_join_code,
     normalize_email,
     mask_email,
     default_participant_fields,
@@ -41,6 +42,16 @@ with patch("boto3.resource"), patch("boto3.client"):
 
 SECRET = "test-secret"
 public_mod.PLAYER_TOKEN_SECRET = SECRET
+
+
+@pytest.mark.parametrize("code", ["K9R4QM", "012345"])
+def test_valid_join_codes(code):
+    assert is_valid_join_code(code) is True
+
+
+@pytest.mark.parametrize("code", ["12345", "1234567", "I23456", "12345 ", ""])
+def test_invalid_join_codes(code):
+    assert is_valid_join_code(code) is False
 
 
 @pytest.mark.parametrize("selected,key,expected", [
@@ -85,6 +96,36 @@ def test_public_logo_without_owner_does_not_read_users(monkeypatch):
             "clientLogoUrl": None, "appearance": {"colors": None, "themeMode": "dark"},
         }
     table.assert_not_called()
+
+
+def test_public_game_hides_legacy_instagram_registration_field():
+    meta = {
+        "gameId": "ABC123",
+        "gameType": "OTHER",
+        "participantFields": {
+            "email": {"required": False},
+            "instagram": {"required": True},
+            "phone": {"required": True},
+        },
+    }
+    with patch.object(public_mod, "_get_game", return_value=meta):
+        response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["participantFields"] == {
+        "email": {"required": False},
+        "phone": {"required": True},
+    }
+
+
+def test_public_player_display_ignores_legacy_instagram_values():
+    player = {
+        "playerId": 7,
+        "username": "Web player",
+        "instagramUsername": "@legacy",
+        "instagramProfilePicUrl": "https://example.invalid/legacy.png",
+    }
+    assert public_mod._player_display_label(player) == "Web player"
+    assert public_mod._player_profile_pic_url(player) is None
 
 
 def test_public_appearance_uses_owner_colors_and_logo(monkeypatch):
@@ -490,13 +531,9 @@ def test_web_assign_creates_player(mock_meta, mock_assigners, *_mocks):
         "maxPlayers": 25,
         "participantFields": default_participant_fields("EMPAREJA2"),
     }
-    mock_assigner = MagicMock(
-        return_value=(
-            {"type": {"EMPAREJA2": {"characterName": "Alice", "partnerCharacterName": "Bob", "pairGroupId": "1", "characterId": 1}}},
-            "",
-            [],
-        )
-    )
+    mock_assigner = MagicMock(return_value={
+        "type": {"EMPAREJA2": {"characterName": "Alice", "partnerCharacterName": "Bob", "pairGroupId": "1", "characterId": 1}},
+    })
     mock_assigners.get.return_value = mock_assigner
 
     out = assign_mod._handle_web_assign({
@@ -527,7 +564,7 @@ def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
         "maxPlayers": 50,
         "participantFields": default_participant_fields("T1MER"),
     }
-    mock_assigners.get.return_value = MagicMock(return_value=({"type": {"T1MER": {}}}, "", []))
+    mock_assigners.get.return_value = MagicMock(return_value={"type": {"T1MER": {}}})
 
     out = assign_mod._handle_web_assign({
         "source": "web",

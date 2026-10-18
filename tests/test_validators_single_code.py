@@ -11,12 +11,11 @@ from validators.generic import validate_generic
 # Helpers to build a minimal ctx
 # ---------------------------------------------------------------------------
 
-def _player(pid, code, game_type="T1MER", validated=False, quiz_required=False, quiz_completed=False, profile_pic_url=None):
+def _player(pid, code, game_type="T1MER", validated=False, quiz_required=False, quiz_completed=False, photo_key=None):
     item = {
         "playerId": pid,
         "validationCode": code,
-        "instagramUsername": f"user{pid}",
-        "instagramPSID": f"psid{pid}",
+        "username": f"user{pid}",
         "validated": validated,
         "type": {
             game_type: {
@@ -25,8 +24,8 @@ def _player(pid, code, game_type="T1MER", validated=False, quiz_required=False, 
             }
         },
     }
-    if profile_pic_url is not None:
-        item["instagramProfilePicUrl"] = profile_pic_url
+    if photo_key is not None:
+        item["participantPhotoKey"] = photo_key
     return item
 
 
@@ -65,6 +64,9 @@ def _ctx(players, codes, game_type="T1MER"):
         "set_validated": set_val,
         "is_quiz_required": quiz_req,
         "is_quiz_completed": quiz_done,
+        "player_profile_pic_url": lambda p: (
+            f"https://media.example.com/{p['participantPhotoKey']}" if p.get("participantPhotoKey") else ""
+        ),
         "inc_validated_count": None,
     }
 
@@ -155,12 +157,20 @@ def test_rulet4_happy_path():
 
 
 def test_rulet4_profile_pic_url_passed_through():
-    url = "https://example.com/pic.jpg"
-    p = _player(1, 5678, game_type="RULET4", profile_pic_url=url)
+    p = _player(1, 5678, game_type="RULET4", photo_key="players/pic.jpg")
     ctx = _ctx([p], ["5678"], game_type="RULET4")
     result = validate_generic(ctx)
     assert result["valid"] is True
-    assert result["profilePicUrl"] == url
+    assert result["profilePicUrl"] == "https://media.example.com/players/pic.jpg"
+
+
+def test_legacy_instagram_identity_is_ignored():
+    p = _player(1, 5678, game_type="RULET4")
+    p.pop("username")
+    p.update({"instagramUsername": "@legacy", "instagramProfilePicUrl": "https://legacy.example.com/p.jpg"})
+    result = validate_generic(_ctx([p], ["5678"], game_type="RULET4"))
+    assert result["username"] == ""
+    assert result["profilePicUrl"] == ""
 
 
 def test_rulet4_no_match():

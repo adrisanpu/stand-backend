@@ -390,7 +390,7 @@ def test_public_and_operator_ranking_share_order_and_schema(_branding):
     games.get_item.return_value = {"Item": META}
     gp = MagicMock()
     gp.query.return_value = {"Items": [
-        ranked_player(2, 4), ranked_player(1, 9, instagramUsername="winner"),
+        ranked_player(2, 4), ranked_player(1, 9, username="winner"),
     ]}
     with patch.object(public_mod, "games_table", games), patch.object(public_mod, "gp_table", gp), \
          patch.object(dispatcher, "games_table", games), patch.object(dispatcher, "gp_table", gp):

@@ -133,14 +133,14 @@ purpose-separated derived key rather than a second committed secret.
    the same participant without another slot or attempt; it must not authorize
    another registration.
    Do not record OTPs, raw email addresses or participant tokens in logs.
-4. Regression-check existing participant sessions, Instagram assignment and
+4. Regression-check existing participant sessions, Web assignment and
    no-email forms. Check stack changesets for unexpected replacements and
    confirm prod tables are untouched by dev.
 5. Coordinate a release window before deploying production backend **before**
    the matching UI. Email-enabled `/join` now requires a challenge/code, so old
    forms are not compatible: pause those campaigns, release/refresh the UI and
-   cached clients, then reopen after a smoke test. Keep existing valid sessions,
-   Instagram and no-email flows available. Do not bypass verification to
+   cached clients, then reopen after a smoke test. Keep existing valid sessions
+   and no-email flows available. Do not bypass verification to
    accommodate stale clients. A rollback also requires coordinated backend/UI
    versions, not an unreviewed reopening of unverified email recovery.
 

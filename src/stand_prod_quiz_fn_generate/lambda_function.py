@@ -33,7 +33,7 @@ def _build_prompt(text: str, num_questions: int, num_options: int, use_emojis: b
     return f"""Genera exactamente {num_questions} pregunta(s) de quiz de opción múltiple, cada una con {num_options} opciones de respuesta, siguiendo las indicaciones del prompt que aparece más abajo.
 
 REGLAS CRÍTICAS PARA LAS OPCIONES DE RESPUESTA:
-- Las opciones se mostrarán como quick replies en Instagram, con un máximo de 20 caracteres por botón. Ninguna opción puede superar 20 caracteres (incluyendo espacios y emoji).
+- Las opciones se mostrarán como botones en la Web móvil, con un máximo de 20 caracteres por botón. Ninguna opción puede superar 20 caracteres (incluyendo espacios y emoji).
 - Escribe cada opción con 1, 2 o 3 palabras cortas. Ejemplos válidos: "Sales", "Glucosa", "En muñeca", "App móvil", "Sobre la piel".
 - Cada opción debe ser una respuesta completa y autocontenida. Prohibido frases incompletas o cortadas (mal: "Directamente sobre la"; bien: "Sobre la piel" o "En la muñeca"). Si no cabe en 20 caracteres, usa una forma más breve.
 - Es crítico que ninguna opción supere 20 caracteres. En caso de no cumplir, sustituye por una opción más corta.{emojis_instruction}

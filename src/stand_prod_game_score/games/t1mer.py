@@ -174,7 +174,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
 
         ranking.append({
             "playerId": pid,
-            "username": it.get("instagramUsername") or it.get("username", ""),
+            "username": it.get("username", ""),
             "timer": timer_float,
             "score": score_float,
         })
@@ -190,7 +190,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
         "ok": True,
         "gameId": game_id,
         "playerId": player_id,
-        "username": item.get("instagramUsername") or item.get("username", ""),
+        "username": item.get("username", ""),
         "timer": timer_float,
         "score": score_int,
         "scoreUpdatedAt": now,
@@ -243,11 +243,8 @@ def get_ranking(game_id: str, game_type_upper: str, gp_table, limit: int, log_fn
 
         ranking.append({
             "playerId": pid,
-            "username": it.get("instagramUsername") or it.get("username", ""),
-            "profilePicUrl": (
-                profile_pic_url_fn(it) if profile_pic_url_fn
-                else (it.get("instagramProfilePicUrl") or "").strip()
-            ),
+            "username": it.get("username", ""),
+            "profilePicUrl": profile_pic_url_fn(it) if profile_pic_url_fn else None,
             "timer": timer_float,
             "score": score_float,
         })

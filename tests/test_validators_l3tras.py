@@ -9,12 +9,11 @@ sys.path.insert(0, str(ROOT / "src" / "stand_prod_game_validate"))
 from validators.l3tras import validate_l3tras
 
 
-def _player(pid, code, letter, game_type="L3TRAS", quiz_required=False, quiz_completed=False, instagram_profile_pic_url=None):
+def _player(pid, code, letter, game_type="L3TRAS", quiz_required=False, quiz_completed=False, photo_key=None):
     item = {
         "playerId": pid,
         "validationCode": code,
-        "instagramUsername": f"user{pid}",
-        "instagramPSID": f"psid{pid}",
+        "username": f"user{pid}",
         "validated": False,
         "type": {
             game_type: {
@@ -24,8 +23,8 @@ def _player(pid, code, letter, game_type="L3TRAS", quiz_required=False, quiz_com
             }
         },
     }
-    if instagram_profile_pic_url is not None:
-        item["instagramProfilePicUrl"] = instagram_profile_pic_url
+    if photo_key is not None:
+        item["participantPhotoKey"] = photo_key
     return item
 
 
@@ -57,6 +56,9 @@ def _ctx(players, codes, game_meta=None, game_type="L3TRAS"):
         "set_validated": None,
         "is_quiz_required": quiz_req,
         "is_quiz_completed": quiz_done,
+        "player_profile_pic_url": lambda p: (
+            f"https://media.example.com/{p['participantPhotoKey']}" if p.get("participantPhotoKey") else ""
+        ),
         "inc_validated_count": None,
     }
 
@@ -68,17 +70,18 @@ def test_l3tras_single_code_ok():
     assert r["valid"] is True
     assert len(r["players"]) == 1
     assert r["players"][0]["letter"] == "S"
+    assert r["players"][0]["username"] == "user1"
+    assert "instagramUsername" not in r["players"][0]
     assert r["players"][0].get("profilePicUrl") == ""
     assert r["results"][0]["letter"] == "S"
 
 
 def test_l3tras_profile_pic_url():
-    url = "https://cdn.example.com/p.jpg"
-    players = [_player(1, 1001, "S", instagram_profile_pic_url=url)]
+    players = [_player(1, 1001, "S", photo_key="players/p.jpg")]
     ctx = _ctx(players, ["1001"])
     r = validate_l3tras(ctx)
     assert r["valid"] is True
-    assert r["players"][0]["profilePicUrl"] == url
+    assert r["players"][0]["profilePicUrl"] == "https://media.example.com/players/p.jpg"
 
 
 def test_l3tras_rejects_zero_or_many_codes():
