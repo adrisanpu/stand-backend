@@ -9,7 +9,8 @@ import time
 from datetime import datetime, timezone
 from botocore.exceptions import BotoCoreError, ClientError
 
-from stand_common.utils import is_valid_email, normalize_email, normalize_participant_fields, mask_email, log
+from stand_common.utils import is_valid_email, normalize_email, web_participant_fields, mask_email, log
+from stand_common.kivly_registration import consent_values, RegistrationError as KivlyRegistrationError
 
 CODE_TTL = 600
 RESEND_SECONDS = 60
@@ -30,18 +31,20 @@ class RegistrationError(ValueError):
 
 
 def registration_values(meta, body):
-    fields = normalize_participant_fields(meta.get("gameType") or "", meta.get("participantFields"))
+    fields = web_participant_fields(meta.get("gameType") or "", meta.get("participantFields"))
     values = {}
     for name, limit in (("email", 254), ("phone", 64)):
-        if not fields[name]["required"]:
+        if name == "phone" and not fields["phone"]["enabled"]:
             continue
         raw = body.get(name)
         if raw is not None and not isinstance(raw, str):
             raise RegistrationError(f"invalid_{name}")
         value = (raw or "").strip()
         if not value:
+            if name == "phone":
+                continue
             raise RegistrationError(f"missing_{name}")
-        if len(value) > limit:
+        if len(value) > limit or re.search(r"[\x00-\x1f\x7f-\x9f]", value):
             raise RegistrationError(f"invalid_{name}")
         if name == "email":
             value = normalize_email(value)
@@ -57,6 +60,10 @@ def registration_values(meta, body):
     if len(username) > 100 or re.search(r"[\x00-\x1f\x7f-\x9f]", username):
         raise RegistrationError("invalid_username")
     values["username"] = username
+    try:
+        values.update(consent_values(meta, body))
+    except KivlyRegistrationError as exc:
+        raise VerificationError(exc.code, exc.status) from None
     return values
 
 

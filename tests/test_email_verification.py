@@ -202,6 +202,21 @@ def test_email_registration_ignores_legacy_instagram_participant_field(rig):
     assert challenge["registration"] == {"email": EMAIL, "username": "Player"}
 
 
+def test_optional_phone_is_bound_to_the_verified_form_not_the_final_join_body(rig):
+    game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
+    game["participantFields"] = {"phone": {"required": False, "enabled": True}}
+    rig["dynamo"].seed("games", game)
+    requested = response_body(request_code(phone="+34 612345678", username="Full Name"))
+    response = api_call("join", {
+        "gameId": GAME_ID, "challengeId": requested["challengeId"], "code": sent_code(rig),
+        "phone": "+34 699999999", "username": "Changed Name",
+    })
+    assert response["statusCode"] == 200
+    player = rig["dynamo"].rows("players")[0]
+    assert player["phone"] == "+34 612345678"
+    assert player["username"] == "Full Name"
+
+
 @pytest.mark.parametrize("missing", ["sourceIp", "sender"])
 def test_request_requires_source_ip_and_configured_sender(rig, monkeypatch, missing):
     if missing == "sender":
@@ -383,23 +398,17 @@ def test_public_join_does_not_accept_email_as_a_verification_bypass(rig):
     assert rig["dynamo"].rows("players")[0]["playerId"] == 7
 
 
-def test_email_optional_join_remains_available_without_verification(rig):
+def test_legacy_optional_email_cannot_bypass_verification(rig):
     game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
     game["participantFields"] = {"email": {"required": False}, "instagram": {"required": False}}
     rig["dynamo"].seed("games", game)
     response = api_call("join", {
         "gameId": GAME_ID, "username": "Player", "instagram": "@legacy", "consent": True,
     })
-    assert response["statusCode"] == 200
-    assert response_body(response)["ok"] is True
-    player = rig["dynamo"].rows("players")[0]
-    assert "email" not in player
-    assert "emailVerifiedAt" not in player
-    assert "instagramUsername" not in player
-    invoke_payload = json.loads(rig["invoke"].calls[0]["Payload"].decode("utf-8"))
-    assert "instagram_username" not in invoke_payload
-    assert rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]["playersCount"] == 1
-    assert rig["invoke"].calls[0]["Payload"]
+    assert response["statusCode"] == 403
+    assert response_body(response)["error"] == "VerificationRequired"
+    assert rig["invoke"].calls == []
+    assert not rig["dynamo"].rows("players")
 
 
 def test_verified_join_atomically_creates_player_count_and_identity(rig):

@@ -24,7 +24,7 @@ from stand_common.utils import (
     issue_prize_token,
     verify_prize_token,
     mask_email,
-    normalize_participant_fields,
+    web_participant_fields,
     is_valid_join_code,
     issue_player_token,
     get_game_type_blob,
@@ -37,6 +37,7 @@ from stand_common.email_verification import (
 from stand_common.prizes import serialize_prize_catalog
 from stand_common.rulet4 import game_config as rulet4_game_config
 from stand_common.rulet4_gameplay import public_assignment as rulet4_assignment, spin as rulet4_spin
+from stand_common import kivly_registration
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -98,8 +99,8 @@ def _player_profile_pic_url(player: dict) -> str | None:
 
 
 def _get_game(game_id: str) -> dict | None:
-    resp = games_table.get_item(Key={"gameId": game_id})
-    return resp.get("Item")
+    resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
+    return kivly_registration.apply_account_settings(dynamo_r, resp.get("Item"))
 
 
 def _public_prize_catalog(meta: dict):
@@ -214,7 +215,7 @@ def _handle_get_game(event):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (item.get("gameType") or "").upper()
-    configured_fields = normalize_participant_fields(game_type, item.get("participantFields"))
+    configured_fields = web_participant_fields(game_type, item.get("participantFields"))
     pf = {name: configured_fields[name] for name in ("email", "phone")}
     recent = item.get("recentPairs") or []
     if not isinstance(recent, list):
@@ -235,6 +236,15 @@ def _handle_get_game(event):
         "recentPairs": recent[-10:],
         "joinUrl": _public_join_url(game_id, access["joinChannel"]),
     }
+    try:
+        loyalty = kivly_registration.game_settings(item)
+    except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:
+        status, error = kivly_registration.error_response(exc)
+        return _resp(status, error)
+    if loyalty["enabled"]:
+        payload["loyalty"] = {key: loyalty[key] for key in (
+            "clubName", "privacyUrl", "termsUrl", "consentVersion",
+        )}
     if "prizeCatalog" in item:
         payload["prizeCatalog"] = _public_prize_catalog(item)
     if game_type == "T1MER":
@@ -261,7 +271,8 @@ def _handle_get_game(event):
 
 
 def _invoke_assign_web(game_id: str, email: str | None, phone: str | None = None,
-                       verification: str | None = None, username: str | None = None) -> dict:
+                       verification: str | None = None, username: str | None = None,
+                       loyalty_consent_version: str | None = None) -> dict:
     payload = {
         "source": "web",
         "game_id": game_id,
@@ -272,6 +283,8 @@ def _invoke_assign_web(game_id: str, email: str | None, phone: str | None = None
         payload["email_verification"] = verification
     if username:
         payload["username"] = username
+    if loyalty_consent_version:
+        payload["loyaltyConsentVersion"] = loyalty_consent_version
     resp = lambda_client.invoke(
         FunctionName=ASSIGN_LAMBDA,
         InvocationType="RequestResponse",
@@ -372,34 +385,26 @@ def _handle_join(event):
     try:
         game_id = body.get("gameId")
         meta = _registration_game(game_id)
-        fields = normalize_participant_fields(meta["gameType"], meta.get("participantFields"))
-        if fields["email"]["required"]:
-            record, receipt = confirm_code(
-                verification_table(dynamo_r), PLAYER_TOKEN_SECRET, game_id,
-                body.get("challengeId"), body.get("code"),
-            )
-            values = registration_values(meta, record["registration"])
-            if values != record["registration"]:
-                raise VerificationError("VerificationSuperseded", 409)
-            result = _invoke_assign_web(
-                game_id, values.get("email"), values.get("phone"),
-                verification=receipt,
-                username=values.get("username"),
-            )
-        else:
-            if body.get("consent") is not True:
-                return _resp(400, {"ok": False, "error": "ConsentRequired"})
-            values = registration_values(meta, body)
-            result = _invoke_assign_web(
-                game_id, values.get("email"), values.get("phone"),
-                username=values.get("username"),
-            )
+        record, receipt = confirm_code(
+            verification_table(dynamo_r), PLAYER_TOKEN_SECRET, game_id,
+            body.get("challengeId"), body.get("code"),
+        )
+        values = registration_values(meta, record["registration"])
+        if values != record["registration"]:
+            raise VerificationError("VerificationSuperseded", 409)
+        result = _invoke_assign_web(
+            game_id, values["email"], values.get("phone"),
+            verification=receipt, username=values["username"],
+            **({"loyalty_consent_version": values["loyaltyConsentVersion"]}
+               if "loyaltyConsentVersion" in values else {}),
+        )
     except RegistrationError as exc:
         return _resp(400, {"ok": False, "error": str(exc)})
     except VerificationError as exc:
         return _verification_error(exc)
     if not result.get("ok"):
-        return _resp(_reason_to_status(result.get("reason", "")), {
+        status = result.get("status") if (result.get("reason") or "").startswith("Kivly") else None
+        return _resp(status if type(status) is int and 400 <= status <= 599 else _reason_to_status(result.get("reason", "")), {
             **result, "ok": False, "error": result.get("reason", "JoinFailed"),
         })
 
@@ -409,6 +414,7 @@ def _handle_join(event):
     if isinstance(assignment, dict) and claims:
         player = _get_player(claims["gameId"], claims["playerId"])
         if player:
+            kivly_registration.require_player(dynamo_r, meta, player)
             assignment["profilePicUrl"] = _player_profile_pic_url(player)
             assignment.setdefault("participantName", _player_display_label(player))
 
@@ -707,6 +713,7 @@ def _handle_score(event):
     player = _get_player(game_id, claims["playerId"])
     if not player:
         return _resp(404 if game_type == "STACK" else 403, {"ok": False, "error": "PlayerNotFound"})
+    kivly_registration.require_player(dynamo_r, meta, player)
 
     if game_type == "STACK":
         allowed = {"gameId", "playerToken", "action", "attemptId"}
@@ -755,6 +762,7 @@ def _handle_rulet4_spin(event):
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
     try:
+        kivly_registration.require_player(dynamo_r, meta, player)
         result = rulet4_spin(meta, player, gp_table)
     except ValueError:
         return _resp(400, {"ok": False, "error": "InvalidRulet4Config"})
@@ -787,6 +795,7 @@ def _handle_player_photo(event):
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
     if player.get("joinSource") != "web":
         return _resp(403, {"ok": False, "error": "WebPhotoUploadOnly"})
+    kivly_registration.require_player(dynamo_r, _get_game(game_id) or {}, player)
     action = body.get("action")
     existing_photo_key = player.get("participantPhotoKey")
     if existing_photo_key:
@@ -924,6 +933,7 @@ def _impostor_assignment_from_player(meta: dict, player: dict, game_id: str) -> 
 
 def _player_response(meta: dict, player: dict, game_id: str, player_id: int, token: str):
     """Shared PlayerResponse: {ok, gameId, gameType, playerToken, assignment, prizes}."""
+    kivly_registration.require_player(dynamo_r, meta, player)
     game_type = (meta.get("gameType") or "").upper()
     if game_type == "EMPAREJA2":
         assignment = _empareja2_assignment_from_player(player)
@@ -1015,6 +1025,7 @@ def _handle_redeem(event):
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
 
+    kivly_registration.require_player(dynamo_r, meta, player)
     blob = get_game_type_blob(player, game_type)
 
     if game_type == "STACK":
@@ -1114,6 +1125,9 @@ def lambda_handler(event, context):
             return _handle_rulet4_spin(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
+    except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:
+        status, payload = kivly_registration.error_response(exc)
+        return _resp(status, payload)
     except Exception as e:
         log("public_internal_error", {"errorType": type(e).__name__})
         return _resp(500, {"ok": False, "error": "InternalError"})

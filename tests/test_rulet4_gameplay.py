@@ -234,14 +234,14 @@ def test_web_assign_creates_rulet4_participant_with_verified_email(verified_web_
     assert put.call_args.args[0]["type"]["RULET4"]["raffleEligible"] is False
 
 
-def test_rulet4_registration_preserves_disabled_email_capacity_checks():
+def test_rulet4_registration_requires_email_even_with_legacy_disabled_setting():
     meta = {**META, "participantFields": {"email": {"required": False}}}
     with patch.object(assign_mod, "_get_game_meta", return_value=meta), \
          patch.object(assign_mod, "_ensure_game_counters"), \
          patch.object(assign_mod, "_reserve_player_slot", return_value=False), \
          patch.object(assign_mod, "_put_player") as put:
         response = assign_mod._handle_web_assign({"game_id": "ABC123", "username": "Player"})
-    assert response["reason"] == "player_limit_reached"
+    assert response["reason"] == "missing_email"
     put.assert_not_called()
 
 
