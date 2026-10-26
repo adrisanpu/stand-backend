@@ -279,6 +279,22 @@ prizes, including raffle wins. For existing validation/raffle prizes, display
 configuration does not change award eligibility or delivery semantics. STACK
 ranking claims use the configured ranking prize as described below.
 
+### RULET4 server-side configuration and spins
+
+Owner game POST/PUT accepts `settings.rulet4.panels`, persisted as `type.RULET4`.
+Each panel has a unique `id`, a `label`, a hex `color` and a positive integer
+`count` (probability weight, not stock). There are at most 32 panels and 360 total
+weight. Missing stored configuration uses defaults; malformed configuration
+is rejected rather than silently replaced.
+
+`GET /v1/public/game` exposes `rulet4Config`. RULET4 supports the existing web
+registration flow. `POST /v1/public/rulet4/spin` accepts `gameId` and `playerToken`;
+the owner route `POST /v1/game/score` accepts `gameId` and `playerId`.
+Both select and persist one server-side result per player, including its
+configuration snapshot. Retries and session recovery return that same result.
+The paired frontend uses these endpoints for operator and mobile play.
+This increment does not change the general email/phone registration contract.
+
 ### Operator player management
 
 The game owner can list the current roster with authenticated

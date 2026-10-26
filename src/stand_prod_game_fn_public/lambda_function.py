@@ -35,6 +35,8 @@ from stand_common.email_verification import (
     request_code, confirm_code,
 )
 from stand_common.prizes import serialize_prize_catalog
+from stand_common.rulet4 import game_config as rulet4_game_config
+from stand_common.rulet4_gameplay import public_assignment as rulet4_assignment, spin as rulet4_spin
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -247,7 +249,12 @@ def _handle_get_game(event):
         )["results"]
         payload["stackStartSnapshot"] = True
         payload["stackFinishSupported"] = True
-    if game_type in {"EMPAREJA2", "T1MER", "STACK"}:
+    if game_type == "RULET4":
+        try:
+            payload["rulet4Config"] = rulet4_game_config(item)
+        except ValueError:
+            return _resp(400, {"ok": False, "error": "InvalidRulet4Config"})
+    if game_type in {"EMPAREJA2", "T1MER", "STACK", "RULET4"}:
         payload.update(_client_appearance(item))
 
     return _resp(200, _json_sanitize(payload))
@@ -319,7 +326,7 @@ def _registration_game(game_id):
         raise VerificationError("GameNotFound", 404)
     if not meta.get("isActive", True):
         raise VerificationError("GameInactive", 403)
-    if (meta.get("gameType") or "").upper() not in {"EMPAREJA2", "T1MER", "STACK"}:
+    if (meta.get("gameType") or "").upper() not in {"EMPAREJA2", "T1MER", "STACK", "RULET4"}:
         raise VerificationError("unsupported_game_type", 400)
     return meta
 
@@ -724,6 +731,38 @@ def _handle_score(event):
     return _resp(status, _json_sanitize(result))
 
 
+def _handle_rulet4_spin(event):
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+    if set(body) - {"gameId", "playerToken"}:
+        return _resp(400, {"ok": False, "error": "InvalidRulet4Fields"})
+    game_id = body.get("gameId")
+    if not isinstance(game_id, str) or not is_valid_join_code(game_id):
+        return _resp(400, {"ok": False, "error": "InvalidGameId"})
+    token = body.get("playerToken")
+    claims = verify_player_token(token, PLAYER_TOKEN_SECRET) if isinstance(token, str) else None
+    if not claims or claims.get("gameId") != game_id:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    meta = _get_game(game_id)
+    if not meta:
+        return _resp(404, {"ok": False, "error": "GameNotFound"})
+    if not meta.get("isActive", True):
+        return _resp(403, {"ok": False, "error": "GameInactive"})
+    if (meta.get("gameType") or "").upper() != "RULET4":
+        return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
+    player = _get_player(game_id, claims["playerId"])
+    if not player:
+        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+    try:
+        result = rulet4_spin(meta, player, gp_table)
+    except ValueError:
+        return _resp(400, {"ok": False, "error": "InvalidRulet4Config"})
+    return _resp(200, _json_sanitize({
+        "ok": True, "gameId": game_id, "playerId": claims["playerId"], "result": result,
+    }))
+
+
 def _participant_photo_type_is_valid(image_type: str, data: bytes) -> bool:
     if image_type == "image/webp":
         return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
@@ -900,6 +939,9 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
             return _resp(403, {"ok": False, "error": "GameInactive"})
         assignment = stack_public_assignment(player, gp_table, _player_profile_pic_url)
         prizes = _stack_prizes(meta, player, assignment.get("rank"))
+    elif game_type == "RULET4":
+        assignment = rulet4_assignment(player, _player_display_label(player), _player_profile_pic_url(player))
+        prizes = []
     else:
         assignment = None
         prizes = []
@@ -1068,6 +1110,8 @@ def lambda_handler(event, context):
             return _handle_redeem(event)
         if path.endswith("/score") and method == "POST":
             return _handle_score(event)
+        if path.endswith("/rulet4/spin") and method == "POST":
+            return _handle_rulet4_spin(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
     except Exception as e:
