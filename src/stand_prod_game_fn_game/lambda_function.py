@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import boto3
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
+from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import (
@@ -102,6 +103,9 @@ def _public_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
     shape = {k: v for k, v in shape.items() if v is not None}
     # Always the effective (legacy-resolved) pair, so clients never guess defaults.
     shape.update(resolve_game_access(item))
+    if (item.get("gameType") or "").upper() == "RULET4":
+        shape["type"] = {"RULET4": rulet4_game_config(item)}
+        shape["rulet4ConfigStored"] = "RULET4" in item.get("type", {})
     if include_prize_catalog and "prizeCatalog" in item:
         shape["prizeCatalog"] = _serialize_prize_catalog(item)
     return shape
@@ -752,6 +756,17 @@ def _handle_post(event):
     except ValueError as exc:
         return _resp(400, {"error": str(exc)})
 
+    rulet4_config = None
+    if game_type == "RULET4":
+        settings = body.get("settings", {})
+        if not isinstance(settings, dict):
+            return _resp(400, {"error": "settings must be an object."})
+        if "rulet4" in settings and not isinstance(settings["rulet4"], dict):
+            return _resp(400, {"error": "settings.rulet4 must be an object."})
+        try:
+            rulet4_config = validate_rulet4_config(settings.get("rulet4"))
+        except ValueError as exc:
+            return _resp(400, {"error": str(exc)})
     stack_config = None
     if game_type == "STACK":
         settings = body.get("settings", {})
@@ -827,6 +842,8 @@ def _handle_post(event):
             "createdAt": now,
             "updatedAt": now,
         }
+        if game_type == "RULET4":
+            item["type"] = {"RULET4": rulet4_config}
         item = {k: v for k, v in item.items() if v is not None}
 
         quiz_order, quiz_questions = _load_default_quiz_from_catalog(game_type, candidate)
@@ -900,6 +917,9 @@ def _handle_put(event):
     l3tras_settings = settings.get("l3tras")
     impostor_settings = settings.get("impostor")
     stack_settings = settings.get("stack")
+    if "rulet4" in settings and not isinstance(settings["rulet4"], dict):
+        return _resp(400, {"error": "settings.rulet4 must be an object."})
+    rulet4_settings = settings.get("rulet4")
     participant_fields = body.get("participantFields")
     join_channel = body.get("joinChannel")
     play_mode = body.get("playMode")
@@ -917,6 +937,7 @@ def _handle_put(event):
         and not l3tras_settings
         and not impostor_settings
         and stack_settings is None
+        and rulet4_settings is None
         and participant_fields is None
         and join_channel is None
         and play_mode is None
@@ -989,6 +1010,14 @@ def _handle_put(event):
             log("Prize catalog image verification failed", {"gameId": game_id, "error": str(exc)})
             return _resp(500, {"error": "PrizeImageVerificationFailed", "detail": str(exc)})
 
+    rulet4_config = None
+    if rulet4_settings is not None:
+        if (item.get("gameType") or "").upper() != "RULET4":
+            return _resp(400, {"error": "settings.rulet4 is only valid for RULET4 games."})
+        try:
+            rulet4_config = validate_rulet4_config(rulet4_settings, base=rulet4_game_config(item))
+        except ValueError as exc:
+            return _resp(400, {"error": str(exc)})
     stack_config = None
     if stack_settings is not None:
         if (item.get("gameType") or "").upper() != "STACK":
@@ -1008,6 +1037,30 @@ def _handle_put(event):
             participant_fields = normalize_participant_fields(item.get("gameType") or "", participant_fields)
         except ValueError as exc:
             return _resp(400, {"error": str(exc)})
+
+    if rulet4_config is not None:
+        names = {"#type": "type"}
+        values = {":now": now, ":owner": owner_user_id, ":gameType": "RULET4"}
+        condition = "attribute_exists(gameId) AND ownerUserId = :owner AND gameType = :gameType"
+        if "type" in item:
+            names["#rulet4"] = "RULET4"
+            values[":config"] = rulet4_config
+            expression = "SET #type.#rulet4 = :config, updatedAt = :now"
+        else:
+            values[":config"] = {"RULET4": rulet4_config}
+            expression = "SET #type = :config, updatedAt = :now"
+            condition += " AND attribute_not_exists(#type)"
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id}, UpdateExpression=expression,
+                ExpressionAttributeNames=names, ExpressionAttributeValues=values,
+                ConditionExpression=condition,
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(409, {"error": "Game changed; reload configuration before saving."})
+            log("Update RULET4 config failed", {"gameId": game_id, "error": str(exc)})
+            return _resp(500, {"error": "UpdateFailed"})
 
     if stack_config is not None:
         set_game_type_blob(

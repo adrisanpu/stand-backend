@@ -740,6 +740,14 @@ Resources:
             Method: POST
             Auth:
               Authorizer: NONE
+        PublicRulet4SpinPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/rulet4/spin
+            Method: POST
+            Auth:
+              Authorizer: NONE
 
 # =========================
 # GAME FEATURES

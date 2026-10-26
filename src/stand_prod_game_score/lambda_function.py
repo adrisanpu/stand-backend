@@ -4,7 +4,8 @@ import json
 import base64
 
 import boto3
-from stand_common.utils import log, _json_sanitize, _resp
+from stand_common.utils import log, _json_sanitize, _resp, _get_claims
+from stand_common.rulet4_gameplay import spin as rulet4_spin
 
 import games.t1mer as t1mer
 import games.stack as stack
@@ -89,6 +90,31 @@ def _handle_post(event):
         return _resp(500, {"ok": False, "error": "MissingGameType"})
 
     log("score_post_request", {"gameId": game_id, "gameType": game_type})
+
+    if game_type == "RULET4":
+        owner = _get_claims(event).get("sub")
+        if not owner or owner != meta.get("ownerUserId"):
+            return _resp(403, {"ok": False, "error": "Forbidden"})
+        if set(body) - {"gameId", "playerId"}:
+            return _resp(400, {"ok": False, "error": "InvalidRulet4Fields"})
+        player_id = body.get("playerId")
+        if (isinstance(player_id, str) and len(player_id) <= 20
+                and player_id.isascii() and player_id.isdigit()):
+            player_id = int(player_id)
+        if isinstance(player_id, bool) or not isinstance(player_id, int) or player_id < 1:
+            return _resp(400, {"ok": False, "error": "InvalidPlayerId"})
+        player = gp_table.get_item(
+            Key={"gameId": game_id, "playerId": player_id}, ConsistentRead=True,
+        ).get("Item")
+        if not player:
+            return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+        try:
+            result = rulet4_spin(meta, player, gp_table)
+        except ValueError:
+            return _resp(400, {"ok": False, "error": "InvalidRulet4Config"})
+        return _resp(200, _json_sanitize({
+            "ok": True, "gameId": game_id, "playerId": player_id, "result": result,
+        }))
 
     if game_type == "L3TRAS":
         log("score_l3tras_ack", {"gameId": game_id, "success": body.get("success")})

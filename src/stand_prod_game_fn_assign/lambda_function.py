@@ -140,7 +140,7 @@ def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
     return None
 
 
-WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK"})
+WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK", "RULET4"})
 
 
 def _empareja2_web_assignment(player: dict) -> dict:
@@ -184,6 +184,9 @@ def _t1mer_web_assignment(player: dict) -> dict:
 
 
 def _web_assignment(game_type: str, player: dict) -> dict:
+    if game_type == "RULET4":
+        from stand_common.rulet4_gameplay import public_assignment
+        return public_assignment(player, _t1mer_web_assignment(player)["displayName"])
     if game_type == "EMPAREJA2":
         return _empareja2_web_assignment(player)
     if game_type == "STACK":
