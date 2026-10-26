@@ -292,6 +292,10 @@ record, so removing it also removes those results from rankings. The game
 retains its player-ID high-water mark so later joins cannot reuse a removed
 player's ID.
 
+The removal transaction uses native Python values with the DynamoDB resource
+client, which serializes them once. Regression tests check the actual SDK
+request payload without making network calls.
+
 ### STACK: mobile `/play` validated finish and ranking (Phase 3)
 
 STACK is registered for operator CRUD and public web join using the existing

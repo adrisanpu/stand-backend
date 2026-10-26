@@ -1,6 +1,7 @@
 """Owner-only player roster and removal API tests."""
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -122,16 +123,49 @@ def test_delete_player_transaction_removes_raffle_result_and_updates_counts():
     transaction_client.transact_write_items.assert_called_once()
     actions = transaction_client.transact_write_items.call_args.kwargs["TransactItems"]
     update = actions[0]["Update"]
-    assert update["ExpressionAttributeValues"][":playersCount"] == {"N": "1"}
-    assert update["ExpressionAttributeValues"][":validatedCount"] == {"N": "0"}
-    assert update["ExpressionAttributeValues"][":lastPlayerId"] == {"N": "7"}
-    assert update["ExpressionAttributeValues"][":winners"] == {
+    assert update["ExpressionAttributeValues"][":playersCount"] == 1
+    assert update["ExpressionAttributeValues"][":validatedCount"] == 0
+    assert update["ExpressionAttributeValues"][":lastPlayerId"] == 7
+    assert update["ExpressionAttributeValues"][":winners"] == [{"playerId": 8, "username": "Luis"}]
+    assert actions[1]["Delete"]["Key"] == {"gameId": "ABC123", "playerId": 7}
+    wire = _sdk_transaction_payload(actions)
+    assert wire[0]["Update"]["Key"] == {"gameId": {"S": "ABC123"}}
+    assert wire[0]["Update"]["ExpressionAttributeValues"][":playersCount"] == {"N": "1"}
+    assert wire[0]["Update"]["ExpressionAttributeValues"][":winners"] == {
         "L": [{"M": {"playerId": {"N": "8"}, "username": {"S": "Luis"}}}],
     }
-    assert actions[1]["Delete"]["Key"] == {
-        "gameId": {"S": "ABC123"},
-        "playerId": {"N": "7"},
-    }
+    assert wire[1]["Delete"]["Key"] == {"gameId": {"S": "ABC123"}, "playerId": {"N": "7"}}
+
+
+def _sdk_transaction_payload(actions):
+    # A separate process bypasses conftest's SDK stubs; stop before any network call.
+    script = """
+import json
+import sys
+import boto3
+
+class Captured(Exception):
+    pass
+
+def capture(model, params, **kwargs):
+    print(json.dumps(json.loads(params["body"])["TransactItems"]))
+    raise Captured()
+
+resource = boto3.resource(
+    "dynamodb", region_name="us-east-1",
+    aws_access_key_id="test", aws_secret_access_key="test",
+)
+resource.meta.client.meta.events.register("before-call.dynamodb.TransactWriteItems", capture)
+try:
+    resource.meta.client.transact_write_items(TransactItems=json.load(sys.stdin))
+except Captured:
+    pass
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        input=json.dumps(actions), capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout)
 
 
 def test_delete_player_also_removes_its_verified_email_mapping():
@@ -163,8 +197,11 @@ def test_delete_player_also_removes_its_verified_email_mapping():
     assert result["statusCode"] == 200
     actions = dynamodb.meta.client.transact_write_items.call_args.kwargs["TransactItems"]
     assert actions[2]["Delete"]["TableName"] == "verification"
-    assert actions[2]["Delete"]["Key"] == {"id": {"S": "identity-key"}}
+    assert actions[2]["Delete"]["Key"] == {"id": "identity-key"}
     assert actions[2]["Delete"]["ConditionExpression"] == "playerId = :removedPlayerId"
+    wire = _sdk_transaction_payload(actions)
+    assert wire[2]["Delete"]["Key"] == {"id": {"S": "identity-key"}}
+    assert wire[2]["Delete"]["ExpressionAttributeValues"] == {":removedPlayerId": {"N": "7"}}
 
 
 @pytest.mark.parametrize("player_id", [None, True, 0, -1, "1.5", "01"])

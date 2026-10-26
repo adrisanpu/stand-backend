@@ -6,7 +6,6 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
-from boto3.dynamodb.types import TypeSerializer
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
@@ -574,11 +573,6 @@ def _handle_get_players(event):
     return _resp(200, {"ok": True, "players": players})
 
 
-def _serialize_dynamodb_values(values):
-    serializer = TypeSerializer()
-    return {key: serializer.serialize(value) for key, value in values.items()}
-
-
 def _handle_delete_player(event):
     body = _read_json_body(event)
     if not isinstance(body, dict):
@@ -674,16 +668,16 @@ def _handle_delete_player(event):
         {
             "Update": {
                 "TableName": GAMES_TABLE,
-                "Key": _serialize_dynamodb_values({"gameId": game_id}),
+                "Key": {"gameId": game_id},
                 "UpdateExpression": update_expression,
                 "ConditionExpression": " AND ".join(conditions),
-                "ExpressionAttributeValues": _serialize_dynamodb_values(values),
+                "ExpressionAttributeValues": values,
             }
         },
         {
             "Delete": {
                 "TableName": GAMEPLAYER_TABLE,
-                "Key": _serialize_dynamodb_values({"gameId": game_id, "playerId": player_id}),
+                "Key": {"gameId": game_id, "playerId": player_id},
                 "ConditionExpression": "attribute_exists(gameId) AND attribute_exists(playerId)",
             }
         },
@@ -692,9 +686,9 @@ def _handle_delete_player(event):
         transaction.append({
             "Delete": {
                 "TableName": EMAIL_VERIFICATION_TABLE,
-                "Key": _serialize_dynamodb_values({"id": identity_key}),
+                "Key": {"id": identity_key},
                 "ConditionExpression": "playerId = :removedPlayerId",
-                "ExpressionAttributeValues": _serialize_dynamodb_values({":removedPlayerId": player_id}),
+                "ExpressionAttributeValues": {":removedPlayerId": player_id},
             }
         })
     try:
