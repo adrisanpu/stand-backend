@@ -223,9 +223,12 @@ non-expiring intent to prevent duplicate POSTs after uncertain results.
 See [docs/KIVLY_INTEGRATION.md](docs/KIVLY_INTEGRATION.md) for the exact API
 contract, failure/reconciliation policy, and the distinction between offline
 tests and live verification; [docs/KIVLY_CONNECTION.md](docs/KIVLY_CONNECTION.md)
-describes secret storage and read-only connection checks. Kivly rewards,
-catalog selection, reward assignment, and Wallet delivery are not part of this
-release. Existing STAND prize catalogs and gameplay remain unchanged.
+describes secret storage, reward routes and connection checks. STACK owners can
+select an existing Kivly reward; participants can see its status and returned
+Wallet links after a saved finish. This extension does not generate rewards,
+redeem them, or create Wallet passes. It is pending review and live reward
+delivery has not been verified. Existing STAND prize catalogs and gameplay
+remain unchanged.
 
 ### Approved prize PNG catalog
 

@@ -9,6 +9,7 @@ from botocore.exceptions import ClientError
 
 from stand_common import kivly_registration as registration
 from stand_common.kivly import KivlyClient
+from stand_common.kivly_rewards import configured_reward
 from stand_common.utils import _get_claims, _read_json_body, _resp, log
 
 
@@ -145,3 +146,63 @@ def handle_account(event, method, dynamo):
             exc = registration.RegistrationError("KivlyConnectionChanged", 409)
         status, payload = registration.error_response(exc)
         return _resp(status, payload)
+
+
+def handle_game(event, method, dynamo, games, *, catalog=False):
+    try:
+        claims = _get_claims(event)
+        owner = claims.get("sub")
+        if not owner:
+            return _resp(401, {"ok": False, "error": "Unauthorized"})
+        if method not in ("GET", "PUT"):
+            return _resp(405, {"ok": False, "error": "MethodNotAllowed"})
+        body = _read_json_body(event) if method == "PUT" else event.get("queryStringParameters") or {}
+        if not isinstance(body, dict) or not isinstance(body.get("gameId"), str):
+            return _resp(400, {"ok": False, "error": "InvalidGameId"})
+        meta = games.get_item(Key={"gameId": body["gameId"]}, ConsistentRead=True).get("Item")
+        if not meta or meta.get("ownerUserId") != owner:
+            return _resp(403, {"ok": False, "error": "Forbidden"})
+        if (meta.get("gameType") or "").upper() != "STACK":
+            return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
+
+        conn = registration.connection(dynamo, owner)
+        if catalog:
+            if method != "GET":
+                return _resp(405, {"ok": False, "error": "MethodNotAllowed"})
+            if not conn:
+                return _resp(409, {"ok": False, "error": "KivlyConnectionRequired"})
+            return _resp(200, {"ok": True, "rewards": registration._client(conn).list_rewards(
+                conn["locationId"], conn["ownerId"],
+            )})
+
+        if method == "GET":
+            return _resp(200, {"ok": True, "connection": {"connected": bool(conn)},
+                               "reward": configured_reward(meta, conn)})
+
+        if set(body) != {"gameId", "rewardId"}:
+            return _resp(400, {"ok": False, "error": "InvalidRequest"})
+        reward_id = body["rewardId"]
+        reward = None
+        if reward_id is not None:
+            if not conn or not registration.account_game_settings(meta, conn)["enabled"]:
+                return _resp(409, {"ok": False, "error": "KivlyConnectionRequired"})
+            if not isinstance(reward_id, str) or not reward_id.strip():
+                return _resp(400, {"ok": False, "error": "KivlyRewardInvalid"})
+            rewards = registration._client(conn).list_rewards(conn["locationId"], conn["ownerId"])
+            selected = next((item for item in rewards if item["id"] == reward_id), None)
+            if not selected:
+                return _resp(409, {"ok": False, "error": "KivlyRewardUnavailable"})
+            reward = {**selected, "locationId": conn["locationId"]}
+        games.update_item(
+            Key={"gameId": body["gameId"]},
+            UpdateExpression="SET kivlyReward = :reward",
+            ConditionExpression="ownerUserId = :owner",
+            ExpressionAttributeValues={":reward": reward, ":owner": owner},
+        )
+        return _resp(200, {"ok": True})
+    except registration.ERRORS as exc:
+        status, payload = registration.error_response(exc)
+        return _resp(status, payload)
+
+
+handle = handle_game

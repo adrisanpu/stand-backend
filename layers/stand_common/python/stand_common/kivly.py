@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 BASE_URL = "https://api.getkivly.com"
 MAX_RESPONSE_BYTES = 1_048_576
@@ -207,6 +207,92 @@ class KivlyClient:
             Request(url, method="POST" if customer is not None else "GET",
                     headers=headers, data=data),
             expected_status=201 if customer is not None else 200,
+        )
+
+    def _scoped_request(self, location_id, owner_id, path, *, body=None, response_type=dict):
+        token = self._authenticate()
+        if token.location_id != location_id or token.owner_id != owner_id:
+            raise KivlyError("KivlyScopeMismatch")
+        base_path = path.partition("?")[0] if isinstance(path, str) else ""
+        if not (base_path == "/api/v1/rewards/"
+                or base_path.startswith("/api/v1/redemptions/customer/")
+                or base_path == "/api/v1/redemptions/rewards/earn"):
+            raise KivlyError("KivlyRequestNotAllowed")
+        headers = {
+            "Accept": "application/json", "User-Agent": "Stand-Kivly/1.0",
+            "Authorization": f"******",
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        return self._send_request(
+            Request(BASE_URL + path, method="POST" if body is not None else "GET",
+                    headers=headers, data=json.dumps(body).encode() if body is not None else None),
+            response_type=response_type,
+        )
+
+    def list_rewards(self, location_id, owner_id):
+        rewards, total = [], None
+        for page in range(1, 6):
+            result = self._scoped_request(
+                location_id, owner_id,
+                "/api/v1/rewards/?" + urlencode({"skip": (page - 1) * 100, "limit": 100, "status": "active"}),
+            )
+            rows = result.get("data")
+            if (not isinstance(rows, list) or len(rows) > 100
+                    or type(result.get("total")) is not int or result["total"] < 0
+                    or type(result.get("page")) is not int or result["page"] != page
+                    or type(result.get("limit")) is not int or result["limit"] != 100
+                    or type(result.get("has_next")) is not bool
+                    or type(result.get("has_previous")) is not bool
+                    or result["has_previous"] != (page > 1)):
+                raise KivlyError("KivlyCatalogInvalid")
+            if total is None:
+                total = result["total"]
+            if total != result["total"]:
+                raise KivlyError("KivlyCatalogInvalid")
+            for row in rows:
+                if not isinstance(row, dict) or not _text(row.get("id"), 512) or not _text(row.get("title"), 200):
+                    raise KivlyError("KivlyCatalogInvalid")
+                if row.get("status") != "active" or any(item["id"] == row["id"] for item in rewards):
+                    raise KivlyError("KivlyCatalogInvalid")
+                rewards.append({"id": row["id"], "name": row["title"]})
+            if not result["has_next"]:
+                if len(rewards) != total:
+                    raise KivlyError("KivlyCatalogInvalid")
+                return rewards
+            if not rows:
+                raise KivlyError("KivlyCatalogInvalid")
+        raise KivlyError("KivlyCatalogIncomplete")
+
+    def customer_rewards(self, location_id, owner_id, customer_id):
+        if not _text(customer_id, 512):
+            raise KivlyError("KivlyCustomerInvalid")
+        rewards, seen = [], set()
+        for page in range(1, 6):
+            rows = self._scoped_request(
+                location_id, owner_id,
+                "/api/v1/redemptions/customer/" + quote(customer_id, safe="") + "?"
+                + urlencode({"page": page, "limit": 100}), response_type=list,
+            )
+            if len(rows) > 100:
+                raise KivlyError("KivlyRewardsInvalid")
+            for row in rows:
+                if (not isinstance(row, dict) or not _text(row.get("id"), 512)
+                        or row["id"] in seen or row.get("customer_id") != customer_id
+                        or not _text(row.get("reward_id"), 512)):
+                    raise KivlyError("KivlyRewardsInvalid")
+                seen.add(row["id"])
+                rewards.append(row)
+            if len(rows) < 100:
+                return rewards
+        raise KivlyError("KivlyRewardsIncomplete")
+
+    def earn_reward(self, location_id, owner_id, customer_id, reward_id):
+        if not _text(customer_id, 512) or not _text(reward_id, 512):
+            raise KivlyError("KivlyRewardInvalid")
+        self._scoped_request(
+            location_id, owner_id, "/api/v1/redemptions/rewards/earn",
+            body={"customer_id": customer_id, "reward_ids": [reward_id]}, response_type=None,
         )
 
     def find_customer(self, location_id, owner_id, email):

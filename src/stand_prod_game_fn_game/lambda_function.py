@@ -1465,6 +1465,10 @@ def lambda_handler(event, context):
         path = _get_path(event).rstrip("/")
         if path.endswith("/v1/kivly"):
             return kivly_settings.handle_account(event, method, dynamodb)
+        if path.endswith("/v1/game/kivly/rewards"):
+            return kivly_settings.handle_game(event, method, dynamodb, games_table, catalog=True)
+        if path.endswith("/v1/game/kivly"):
+            return kivly_settings.handle_game(event, method, dynamodb, games_table)
         if path.endswith("/v1/game/players"):
             if method == "GET":
                 return _handle_get_players(event)

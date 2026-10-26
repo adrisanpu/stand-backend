@@ -13,14 +13,16 @@ mandatory verified email, and optional phone when `phone.enabled` is true.
 The existing public join support remains EMPAREJA2, T1MER, STACK and RULET4;
 this feature does not introduce new game-specific join implementations.
 
-No Kivly reward generation, reward catalog, reward selection/assignment,
-redemption, or Wallet API/UI is included. Existing STAND game prizes are
-unrelated and remain unchanged. This document describes the packaged feature,
-not evidence that it has been deployed or externally verified.
+STACK can select one existing Kivly reward for every participant who finishes,
+including a zero score. After the server confirms the saved result, the public
+participant can check the reward status and use only Wallet URLs returned by
+Kivly. This extension does not create rewards, redeem them, mark them used, or
+generate passes. The reward/Wallet extension is local and pending review; its
+presence here is not evidence that it has been deployed or externally verified.
 
 ## Organizer API (Cognito authenticated)
 
-The only new route is `/v1/kivly`, handled by the game-management Lambda.
+The organizer connection route is `/v1/kivly`, handled by the game-management Lambda.
 Use the organizer's existing authenticated API client. A game ID is not needed.
 
 ### Read connection: `GET /v1/kivly`
@@ -232,6 +234,22 @@ uncertain creation, or invalid customer; HTTP 429 includes rate limiting; HTTP
 numeric `retryAfter` may be included. Do not automatically replay writes on
 network failures. Existing email rate limits, expiry and attempt caps still apply.
 
+## STACK completion rewards and Wallet
+
+The owner-only `GET /v1/game/kivly/rewards?gameId=...` lists the connected
+location's active rewards. `GET /v1/game/kivly?gameId=...` reads the selected
+reward, and `PUT /v1/game/kivly` accepts `{gameId, rewardId}`; `rewardId: null`
+clears it. These endpoints reject non-STACK games and rewards outside the
+connected Kivly location.
+
+After the STACK result is durably finished, `POST /v1/public/kivly/reward`
+accepts `{gameId, playerToken}`. A durable per-player reservation prevents a
+second `earn` after an uncertain write. Responses have status `none`, `pending`
+or `confirmed`; confirmed results may include only Kivly-returned Apple/Google
+Wallet URLs from approved HTTPS hosts. The integration uses `earn`, never
+`redeem` or `mark-used`. It does not generate Wallet passes. Do not repeat an
+uncertain assignment; it requires operator reconciliation.
+
 ## Validation, deployment and live smoke
 
 Automated tests use stateful DynamoDB fakes, fake SES/Lambda invocation and mocked
@@ -245,7 +263,8 @@ Deploy backend/template and compatible frontend together to **dev only** after
 approval. Existing SES identity/sender and a private `PlayerTokenSecret` of at
 least 32 characters are required. The template supplies the retained registration
 table and narrowly scoped secret/table permissions; no new committed credential
-or new Python dependency is needed.
+or production Python dependency is needed. The test requirements include boto3
+for offline validation of DynamoDB transaction serialization.
 
 Safe initial dev checks: authenticated disconnected GET; load existing RULET4,
 T1MER and EMPAREJA2 games and ensure no club prompt; confirm game rules and
@@ -254,4 +273,5 @@ token/context/customer requests with organizer-provided credentials.
 An actual STACK registration writes a Kivly customer and must be a separately
 authorized test in a designated business with an approved test email, verified
 email access and agreed retention/cleanup. Do not perform it implicitly as a
-deployment smoke test. Reward/Wallet verification is out of scope.
+deployment smoke test. Reward/Wallet delivery has not been live-verified and
+requires its own approved test before being relied on.

@@ -94,6 +94,31 @@ def test_public_game_exposes_only_selected_owner_logo(selected, key, expected, m
         s3.generate_presigned_url.assert_not_called()
 
 
+def test_public_stack_game_exposes_only_the_selected_reward_name(monkeypatch):
+    meta = {
+        "gameId": "ABC123", "gameType": "STACK", "ownerUserId": "owner",
+        "kivlyReward": {"id": "private-reward-id", "name": "Coffee", "locationId": "location"},
+    }
+    monkeypatch.setattr(public_mod, "_get_game", lambda *_: meta)
+    monkeypatch.setattr(public_mod.kivly_registration, "game_settings", lambda *_: {
+        "enabled": True, "clubName": "Club", "privacyUrl": "https://club.test/privacy",
+        "termsUrl": "https://club.test/terms", "consentVersion": "version",
+    })
+    monkeypatch.setattr(public_mod.kivly_registration, "connection", lambda *_: {"locationId": "location"})
+    monkeypatch.setattr(public_mod, "stack_game_config", lambda *_: {})
+    monkeypatch.setattr(public_mod, "stack_ranking", lambda *_args, **_kwargs: {"results": []})
+    monkeypatch.setattr(public_mod, "_client_appearance", lambda *_: {
+        "clientLogoUrl": None, "appearance": {"colors": None, "themeMode": "dark"},
+    })
+
+    response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
+
+    assert response["statusCode"] == 200
+    payload = json.loads(response["body"])
+    assert payload["kivlyReward"] == {"name": "Coffee"}
+    assert "private-reward-id" not in response["body"]
+
+
 def test_public_logo_without_owner_does_not_read_users(monkeypatch):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     with patch.object(public_mod.dynamo_r, "Table") as table:

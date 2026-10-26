@@ -37,7 +37,7 @@ from stand_common.email_verification import (
 from stand_common.prizes import serialize_prize_catalog
 from stand_common.rulet4 import game_config as rulet4_game_config
 from stand_common.rulet4_gameplay import public_assignment as rulet4_assignment, spin as rulet4_spin
-from stand_common import kivly_registration
+from stand_common import kivly_registration, kivly_rewards
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -259,6 +259,13 @@ def _handle_get_game(event):
         )["results"]
         payload["stackStartSnapshot"] = True
         payload["stackFinishSupported"] = True
+        reward = item.get("kivlyReward")
+        if reward and item.get("ownerUserId"):
+            reward = kivly_rewards.configured_reward(
+                item, kivly_registration.connection(dynamo_r, item["ownerUserId"]),
+            )
+        if loyalty["enabled"] and reward:
+            payload["kivlyReward"] = {"name": reward["name"]}
     if game_type == "RULET4":
         try:
             payload["rulet4Config"] = rulet4_game_config(item)
@@ -771,6 +778,34 @@ def _handle_rulet4_spin(event):
     }))
 
 
+def _handle_kivly_reward(event):
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+    game_id, token = body.get("gameId"), body.get("playerToken")
+    if not isinstance(game_id, str) or not is_valid_join_code(game_id):
+        return _resp(400, {"ok": False, "error": "InvalidGameId"})
+    if not isinstance(token, str):
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    claims = verify_player_token(token, PLAYER_TOKEN_SECRET)
+    if not claims or claims.get("gameId") != game_id:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    meta = _get_game(game_id)
+    if not meta:
+        return _resp(404, {"ok": False, "error": "GameNotFound"})
+    if not meta.get("isActive", True) or not _is_mobile_play(meta):
+        return _resp(403, {"ok": False, "error": "GameInactive"})
+    if (meta.get("gameType") or "").upper() != "STACK":
+        return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
+    player = _get_player(game_id, claims["playerId"])
+    if not player:
+        return _resp(404, {"ok": False, "error": "PlayerNotFound"})
+    result = kivly_rewards.completion_reward(dynamo_r, meta, player)
+    return _resp(200, _json_sanitize({
+        "ok": True, "gameId": game_id, "playerId": claims["playerId"], "reward": result,
+    }))
+
+
 def _participant_photo_type_is_valid(image_type: str, data: bytes) -> bool:
     if image_type == "image/webp":
         return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
@@ -1123,6 +1158,8 @@ def lambda_handler(event, context):
             return _handle_score(event)
         if path.endswith("/rulet4/spin") and method == "POST":
             return _handle_rulet4_spin(event)
+        if path.endswith("/kivly/reward") and method == "POST":
+            return _handle_kivly_reward(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
     except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:

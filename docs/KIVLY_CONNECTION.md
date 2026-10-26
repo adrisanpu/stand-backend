@@ -5,7 +5,7 @@ and dev-only release scope. Account connection is shared, but club membership is
 required only for STACK. Connection success is not evidence of a customer
 registration or any reward/card delivery.
 
-## External operations in this release
+## External operations
 
 `stand_common.kivly.KivlyClient` uses only the fixed HTTPS host
 `https://api.getkivly.com`:
@@ -16,10 +16,14 @@ registration or any reward/card delivery.
 | `GET /api/v1/integration/context` | Verify authorized business and owner scope |
 | `GET /api/v1/customers/` | Read-only access check or bounded complete email lookup |
 | `POST /api/v1/customers/` | Create a consented, email-verified STACK participant only |
+| `GET /api/v1/rewards/` | Read the active catalog for owner selection |
+| `GET /api/v1/redemptions/customer/{customer_id}` | Read a customer's reward assignments and returned Wallet links |
+| `POST /api/v1/redemptions/rewards/earn` | Assign the selected reward after a saved STACK finish |
 
 Customer POST is never part of connect/status. It carries only `name`, `email`,
 `external_id`, `source: "stand"` and optional enabled `phone`. There are no
-reward, catalog, redemption or Wallet methods/routes in this release.
+reward creation, redemption, mark-used or Wallet-generation methods/routes. The
+completion flow uses `earn` only; an uncertain write is not automatically retried.
 The transport validates TLS, rejects redirects, bounds response size to 1 MiB,
 uses an eight-second per-request timeout, and never retries a request internally.
 Large businesses or slow upstream responses can fail closed within the Lambda
@@ -39,9 +43,9 @@ deleting a secret that a successful-but-unacknowledged write might reference.
 Investigate `KivlyConnectionReconciliationRequired`; do not silently discard it.
 
 The account-management role can create/read/delete only this environment's
-Kivly secrets. The assignment role can read those secrets and get/put/update the
-registration table. The public role does not gain Kivly secret or registration
-table access. Non-STACK public flows skip integration lookup entirely.
+Kivly secrets. The assignment and public roles can read those secrets and
+get/put/update the registration table for their respective registration and
+completion-reward flows. Non-STACK public flows skip integration lookup entirely.
 
 Tokens stay in process memory, not public responses or DynamoDB. Warm assignment
 invocations cache clients by secret ARN and connection version; reconnecting or
@@ -52,8 +56,9 @@ verification codes or request bodies.
 
 ## Evidence boundary
 
-`tests/test_kivly_client.py`, `tests/test_kivly_account.py` and
-`tests/test_kivly_registration.py` are offline mocked contract tests. They are not
-live probes. No credentials, `VARS.txt`, external response dumps or live-writing
-probe scripts are packaged. Live testing requires a designated dev organizer,
-authorized scoped credentials and separate approval for customer writes.
+`tests/test_kivly_client.py`, `tests/test_kivly_account.py`,
+`tests/test_kivly_registration.py` and `tests/test_kivly_rewards.py` are offline
+mocked contract tests, not live probes. The repository includes local connection
+and controlled registration probe scripts; neither is packaged into a Lambda.
+Never run a customer-creating probe without separate approval and designated test
+data. Live reward/Wallet behavior is not proven by these tests.
