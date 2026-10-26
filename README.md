@@ -279,6 +279,19 @@ prizes, including raffle wins. For existing validation/raffle prizes, display
 configuration does not change award eligibility or delivery semantics. STACK
 ranking claims use the configured ranking prize as described below.
 
+### Operator player management
+
+The game owner can list the current roster with authenticated
+`GET /v1/game/players?gameId=...`. The response includes only each player's
+`playerId` and display `username`, and never includes contact details.
+Authenticated `DELETE /v1/game/players` accepts
+`{"gameId":"...","playerId":123}` and atomically removes that player's record,
+associated raffle wins, verified-email identity mapping and cached
+player/validation counts. Scores and quiz answers are stored on the player
+record, so removing it also removes those results from rankings. The game
+retains its player-ID high-water mark so later joins cannot reuse a removed
+player's ID.
+
 ### STACK: mobile `/play` validated finish and ranking (Phase 3)
 
 STACK is registered for operator CRUD and public web join using the existing

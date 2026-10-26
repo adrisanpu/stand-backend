@@ -111,6 +111,7 @@ Resources:
               - dynamodb:Scan
               - dynamodb:BatchGetItem
               - dynamodb:BatchWriteItem
+              - dynamodb:TransactWriteItems
               - dynamodb:ConditionCheckItem
             Resource:
               - !Sub
@@ -134,6 +135,7 @@ Resources:
               - !Sub
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdCatalogTable
+              - !GetAtt StandEmailVerificationTable.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -552,6 +554,7 @@ Resources:
       Environment:
         Variables:
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
+          EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
       Events:
         GameCrudGet:
           Type: HttpApi
@@ -576,6 +579,18 @@ Resources:
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/game
+            Method: DELETE
+        GamePlayersGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/players
+            Method: GET
+        GamePlayersDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/players
             Method: DELETE
         GamePrizeUploadUrl:
           Type: HttpApi

@@ -6,6 +6,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
+from boto3.dynamodb.types import TypeSerializer
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
@@ -29,6 +30,7 @@ from stand_common.game_access import (
     access_for_update,
     resolve_game_access,
 )
+from stand_common.email_verification import identity_id
 from stand_common.prizes import (
     MAX_PRIZE_IMAGE_BYTES,
     allowed_prize_slots,
@@ -42,6 +44,8 @@ from stand_common.prizes import (
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 USERS_TABLE = os.environ.get("USERS_TABLE", "stand-prod-user-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
+EMAIL_VERIFICATION_TABLE = os.environ.get("EMAIL_VERIFICATION_TABLE", "")
+PLAYER_TOKEN_SECRET = os.environ.get("PLAYER_TOKEN_SECRET", "stand-dev-player-token-v1")
 CATALOG_TABLE = os.environ.get("CATALOG_TABLE", "stand-prod-catalog-table")
 USER_MEDIA_BUCKET = os.environ.get("USER_MEDIA_BUCKET", "")
 
@@ -510,6 +514,203 @@ def _handle_get(event):
         "count": len(items),
         "games": [_public_game_shape(it) for it in items],
     })
+
+
+def _player_admin_game(event):
+    params = _get_query_params(event)
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        body = {}
+    game_id_raw = params.get("gameId") or body.get("gameId")
+    if not isinstance(game_id_raw, str) or not game_id_raw.strip():
+        return None, _resp(400, {"error": "Missing required field 'gameId'."})
+    game_id = game_id_raw.strip()
+
+    claims = _get_claims(event)
+    owner_user_id = (claims.get("sub") or "").strip()
+    if not owner_user_id:
+        return None, _resp(401, {"error": "Missing sub claim (unauthorized)"})
+
+    try:
+        item = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+    except ClientError as exc:
+        log("PlayerAdminGetGameFailed", {"error": str(exc), "gameId": game_id})
+        return None, _resp(500, {"error": "GetItemFailed"})
+    if not item:
+        return None, _resp(404, {"error": "GameNotFound", "gameId": game_id})
+    if (item.get("ownerUserId") or "") != owner_user_id:
+        return None, _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+    return (game_id, owner_user_id, item), None
+
+
+def _handle_get_players(event):
+    game, error = _player_admin_game(event)
+    if error:
+        return error
+    game_id, _, _ = game
+    players = []
+    kwargs = {
+        "KeyConditionExpression": Key("gameId").eq(game_id),
+        "ProjectionExpression": "playerId, #username, instagramUsername",
+        "ExpressionAttributeNames": {"#username": "username"},
+    }
+    try:
+        while True:
+            response = gp_table.query(**kwargs)
+            for item in response.get("Items") or []:
+                player_id = int(item["playerId"])
+                username = item.get("username") or item.get("instagramUsername")
+                players.append({
+                    "playerId": player_id,
+                    "username": username.strip() if isinstance(username, str) and username.strip() else f"Jugador {player_id}",
+                })
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            kwargs["ExclusiveStartKey"] = last_key
+    except (ClientError, KeyError, TypeError, ValueError) as exc:
+        log("PlayerAdminListFailed", {"error": str(exc), "gameId": game_id})
+        return _resp(500, {"error": "PlayerListFailed"})
+    return _resp(200, {"ok": True, "players": players})
+
+
+def _serialize_dynamodb_values(values):
+    serializer = TypeSerializer()
+    return {key: serializer.serialize(value) for key, value in values.items()}
+
+
+def _handle_delete_player(event):
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "Invalid JSON body"})
+    player_id_raw = body.get("playerId")
+    if isinstance(player_id_raw, bool):
+        return _resp(400, {"error": "playerId must be a positive integer."})
+    try:
+        player_id = int(player_id_raw)
+        if player_id <= 0 or str(player_id_raw).strip() != str(player_id):
+            raise ValueError
+    except (TypeError, ValueError):
+        return _resp(400, {"error": "playerId must be a positive integer."})
+
+    game, error = _player_admin_game(event)
+    if error:
+        return error
+    game_id, owner_user_id, game_item = game
+
+    try:
+        player_response = gp_table.get_item(
+            Key={"gameId": game_id, "playerId": player_id},
+            ConsistentRead=True,
+        )
+    except ClientError as exc:
+        log("PlayerAdminGetPlayerFailed", {"error": str(exc), "gameId": game_id, "playerId": player_id})
+        return _resp(500, {"error": "GetPlayerFailed"})
+    player = player_response.get("Item")
+    if not player:
+        return _resp(404, {"error": "PlayerNotFound", "playerId": player_id})
+
+    identity_mapping = None
+    if player.get("email"):
+        if not EMAIL_VERIFICATION_TABLE:
+            log("PlayerAdminIdentityTableMissing", {"gameId": game_id, "playerId": player_id})
+            return _resp(500, {"error": "PlayerIdentityCleanupUnavailable"})
+        identity_key = identity_id(PLAYER_TOKEN_SECRET, game_id, player["email"])
+        try:
+            identity_mapping = dynamodb.Table(EMAIL_VERIFICATION_TABLE).get_item(
+                Key={"id": identity_key},
+                ConsistentRead=True,
+            ).get("Item")
+        except ClientError as exc:
+            log("PlayerAdminGetIdentityFailed", {"error": str(exc), "gameId": game_id, "playerId": player_id})
+            return _resp(500, {"error": "PlayerIdentityCleanupUnavailable"})
+
+    existing_winners = game_item.get("raffleWinners")
+    existing_winners = existing_winners if isinstance(existing_winners, list) else []
+    remaining_winners = [
+        winner for winner in existing_winners
+        if not isinstance(winner, dict) or str(winner.get("playerId")) != str(player_id)
+    ]
+    try:
+        player_count = int(game_item.get("playersCount", 0))
+        validated_count = int(game_item.get("validatedCount", 0))
+        last_player_id = max(int(game_item.get("lastPlayerId", 0)), player_id)
+    except (TypeError, ValueError, OverflowError) as exc:
+        log("PlayerAdminInvalidGameCounters", {"error": str(exc), "gameId": game_id})
+        return _resp(500, {"error": "InvalidGameCounters"})
+
+    update_expression = (
+        "SET playersCount = :playersCount, raffleWinners = :winners, "
+        "lastPlayerId = :lastPlayerId, updatedAt = :now"
+    )
+    values = {
+        ":playersCount": max(0, player_count - 1),
+        ":winners": remaining_winners,
+        ":lastPlayerId": last_player_id,
+        ":now": _iso_now(),
+        ":owner": owner_user_id,
+    }
+    conditions = ["ownerUserId = :owner", "attribute_exists(gameId)"]
+    if "playersCount" in game_item:
+        conditions.append("playersCount = :expectedPlayersCount")
+        values[":expectedPlayersCount"] = game_item["playersCount"]
+    else:
+        conditions.append("attribute_not_exists(playersCount)")
+    if "raffleWinners" in game_item:
+        conditions.append("raffleWinners = :expectedWinners")
+        values[":expectedWinners"] = game_item["raffleWinners"]
+    else:
+        conditions.append("attribute_not_exists(raffleWinners)")
+    if player.get("validated"):
+        update_expression += ", validatedCount = :validatedCount"
+        values[":validatedCount"] = max(0, validated_count - 1)
+        if "validatedCount" in game_item:
+            conditions.append("validatedCount = :expectedValidatedCount")
+            values[":expectedValidatedCount"] = game_item["validatedCount"]
+        else:
+            conditions.append("attribute_not_exists(validatedCount)")
+
+    transaction = [
+        {
+            "Update": {
+                "TableName": GAMES_TABLE,
+                "Key": _serialize_dynamodb_values({"gameId": game_id}),
+                "UpdateExpression": update_expression,
+                "ConditionExpression": " AND ".join(conditions),
+                "ExpressionAttributeValues": _serialize_dynamodb_values(values),
+            }
+        },
+        {
+            "Delete": {
+                "TableName": GAMEPLAYER_TABLE,
+                "Key": _serialize_dynamodb_values({"gameId": game_id, "playerId": player_id}),
+                "ConditionExpression": "attribute_exists(gameId) AND attribute_exists(playerId)",
+            }
+        },
+    ]
+    if identity_mapping and str(identity_mapping.get("playerId")) == str(player_id):
+        transaction.append({
+            "Delete": {
+                "TableName": EMAIL_VERIFICATION_TABLE,
+                "Key": _serialize_dynamodb_values({"id": identity_key}),
+                "ConditionExpression": "playerId = :removedPlayerId",
+                "ExpressionAttributeValues": _serialize_dynamodb_values({":removedPlayerId": player_id}),
+            }
+        })
+    try:
+        dynamodb.meta.client.transact_write_items(TransactItems=transaction)
+    except ClientError as exc:
+        code = (exc.response.get("Error") or {}).get("Code")
+        reasons = exc.response.get("CancellationReasons") or []
+        conditional_failure = code == "TransactionCanceledException" and any(
+            reason.get("Code") == "ConditionalCheckFailed" for reason in reasons
+        )
+        if conditional_failure:
+            return _resp(409, {"error": "PlayerChanged", "detail": "Refresh the player list and retry."})
+        log("PlayerAdminDeleteFailed", {"error": str(exc), "gameId": game_id, "playerId": player_id})
+        return _resp(500, {"error": "PlayerDeleteFailed"})
+
+    return _resp(200, {"ok": True, "playerId": player_id})
 
 
 # ---------------- POST ----------------
@@ -1212,6 +1413,14 @@ def lambda_handler(event, context):
     try:
         if method == "OPTIONS":
             return _resp(204, "")
+
+        path = _get_path(event).rstrip("/")
+        if path.endswith("/v1/game/players"):
+            if method == "GET":
+                return _handle_get_players(event)
+            if method == "DELETE":
+                return _handle_delete_player(event)
+            return _resp(405, {"error": f"Method {method} not allowed"})
 
         if method == "GET":
             return _handle_get(event)
