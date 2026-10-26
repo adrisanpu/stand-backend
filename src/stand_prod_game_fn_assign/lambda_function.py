@@ -331,6 +331,10 @@ def _handle_web_assign(event: dict) -> dict:
 
     verified_table, verified_record = _verified_email(event, game_id, values) if email else (None, None)
     existing = _find_verified_player(verified_table, game_id, email) if email else None
+    max_players_raw = meta.get("maxPlayers") or 9999
+    max_players = int(max_players_raw)
+    if not existing and int(meta.get("playersCount", 0)) >= max_players:
+        return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
     membership = kivly_registration.ensure_membership(dynamo_r, meta, values)
     if existing:
         if membership:
@@ -342,8 +346,6 @@ def _handle_web_assign(event: dict) -> dict:
             )
         return _existing_web_response(verified_table, verified_record, game_id, game_type, existing)
 
-    max_players_raw = meta.get("maxPlayers") or 9999
-    max_players = int(max_players_raw) if not isinstance(max_players_raw, Decimal) else int(max_players_raw)
     now = _iso_now()
     if not email:
         try:
@@ -432,10 +434,11 @@ def _handle_web_assign(event: dict) -> dict:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 continue
             if not email:
-                try:
-                    _rollback_player_slot(game_id, now)
-                except Exception as re:
-                    log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
+                if not email:
+                    try:
+                        _rollback_player_slot(game_id, now)
+                    except Exception as re:
+                        log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
             return {"ok": False, "reason": "put_failed", "detail": str(e)}
 
     try:

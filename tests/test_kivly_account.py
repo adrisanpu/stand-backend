@@ -5,12 +5,22 @@ from unittest.mock import MagicMock
 import pytest
 
 from stand_common import kivly_settings
+from tests.email_fake import FakeDynamoError
+
+read_connection = kivly_settings.registration.connection
 
 
 def account_event(body=None):
     event = {"requestContext": {"authorizer": {"jwt": {"claims": {"sub": "owner"}}}}}
     if body is not None:
         event["body"] = json.dumps(body)
+    return event
+
+
+def game_event(game_id, body=None):
+    event = account_event(body)
+    if body is None:
+        event["queryStringParameters"] = {"gameId": game_id}
     return event
 
 
@@ -133,49 +143,33 @@ def test_demo_details_can_be_saved_with_registration_disabled():
     assert settings["enabled"] is False
 
 
-def test_game_settings_ignore_old_per_game_club_configuration(monkeypatch):
-    games = MagicMock()
-    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: {"locationId": "location"})
-    monkeypatch.setattr(kivly_settings, "_verify_connection", lambda *_: type("Context", (), {
-        "location_name": "Connected club",
-    })())
-    event = account_event()
-    event["queryStringParameters"] = {"gameId": "GAME1"}
+def test_game_settings_ignore_old_per_game_club_configuration():
     meta = {"ownerUserId": "owner", "gameType": "STACK"}
-    games.get_item.return_value = {"Item": meta}
-    response = kivly_settings.handle(event, "GET", MagicMock(), games)
-    assert json.loads(response["body"])["settings"]["clubName"] == "Connected club"
     meta["kivly"] = {
         "enabled": False, "clubName": "Saved club",
         "privacyUrl": "https://club.test/privacy", "termsUrl": "https://club.test/terms",
     }
-    response = kivly_settings.handle(event, "GET", MagicMock(), games)
-    assert json.loads(response["body"])["settings"]["clubName"] == "Connected club"
-    assert json.loads(response["body"])["settings"]["enabled"] is False
+    settings = kivly_settings.registration.account_game_settings(meta, {"locationId": "location"})
+    assert settings == {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
 
 
 @pytest.mark.parametrize("game_type", ["STACK", "T1MER", "L3TRAS", "EMPAREJA2", "IMPOSTOR", "RULET4", "INFOCARDS", "SEMAFORO"])
-def test_global_connection_only_requires_club_registration_for_stack(monkeypatch, game_type):
+def test_account_connection_applies_only_to_stack_without_game_opt_in(monkeypatch, game_type):
     conn = {
         "locationId": "location",
         "clubSettings": {"clubName": "Club", "privacyUrl": "https://club.test/privacy", "termsUrl": "https://club.test/terms"},
     }
-    get_connection = MagicMock(return_value=conn)
-    monkeypatch.setattr(kivly_settings.registration, "connection", get_connection)
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
     meta = {"ownerUserId": "owner", "gameType": game_type, "kivly": {"enabled": False}}
     effective = kivly_settings.registration.apply_account_settings(MagicMock(), meta)
-    assert meta["kivly"]["enabled"] is False
+    assert effective["kivly"]["enabled"] is (game_type == "STACK")
     if game_type == "STACK":
-        assert effective["kivly"]["enabled"] is True
         assert effective["kivly"]["locationId"] == "location"
         assert effective["participantFields"]["email"] == {"required": True}
-        assert get_connection.call_count == 1
-        assert kivly_settings.registration.game_settings(effective)["enabled"] is True
     else:
-        assert effective["kivly"]["enabled"] is False
-        assert effective.get("participantFields", {}) == meta.get("participantFields", {})
-        assert get_connection.call_count == 0
-        assert kivly_settings.registration.game_settings(effective)["enabled"] is False
+        assert "locationId" not in effective["kivly"]
+    assert meta["kivly"]["enabled"] is False
+    assert kivly_settings.registration.game_settings(effective)["enabled"] is (game_type == "STACK")
 
 
 def test_global_disconnect_disables_existing_game_requirement(monkeypatch):
@@ -239,7 +233,8 @@ def membership_game():
          "privacyUrl": "https://club.test/privacy", "termsUrl": "https://club.test/terms"},
         {"locationId": "location"},
     )
-    return {"ownerUserId": "owner", "kivly": settings, "participantFields": {"email": {"required": True}}}
+    return {"ownerUserId": "owner", "gameType": "STACK", "kivly": settings,
+            "participantFields": {"email": {"required": True}}}
 
 
 @pytest.mark.parametrize("conn,code", [
@@ -312,3 +307,157 @@ def test_new_membership_is_created_once_for_the_connected_business(monkeypatch, 
     assert table.update_item.call_args.kwargs["ExpressionAttributeValues"][":s"] == "confirmed"
     assert result["customerId"] == "customer-1"
     kivly_settings.registration.require_player(MagicMock(), game, {"kivlyMembership": result})
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+def test_account_requires_authenticated_owner_before_any_lookup(method):
+    dynamo = MagicMock()
+    response = kivly_settings.handle_account({}, method, dynamo)
+    assert response["statusCode"] == 401
+    dynamo.Table.assert_not_called()
+
+
+@pytest.mark.parametrize("body", [None, {}, {"clientId": "id"}, {"clientId": "id", "clientSecret": 123}])
+def test_account_rejects_invalid_credential_form_without_external_calls(monkeypatch, body):
+    client = MagicMock()
+    monkeypatch.setattr(kivly_settings, "KivlyClient", client)
+    response = kivly_settings.handle_account(account_event(body), "PUT", MagicMock())
+    assert response["statusCode"] == 400
+    client.assert_not_called()
+
+
+def test_disconnect_removes_only_connection_and_schedules_secret_cleanup(monkeypatch):
+    monkeypatch.setenv("USERS_TABLE", "users")
+    conn = {"secretArn": "private", "locationId": "location", "ownerId": "owner", "version": "v1"}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    secrets, dynamo = MagicMock(), MagicMock()
+    monkeypatch.setattr(kivly_settings.boto3, "client", lambda *_: secrets)
+    response = kivly_settings.handle_account(account_event(), "DELETE", dynamo)
+    assert json.loads(response["body"]) == {"ok": True}
+    update = dynamo.Table.return_value.update_item.call_args.kwargs
+    assert update["UpdateExpression"] == "REMOVE #c"
+    assert update["ConditionExpression"] == "#c.#v = :old"
+    secrets.delete_secret.assert_called_once_with(SecretId="private", RecoveryWindowInDays=7)
+    dynamo.Table.return_value.delete_item.assert_not_called()
+
+
+def test_failed_secret_cleanup_is_reported_without_reverting_disconnect(monkeypatch):
+    monkeypatch.setenv("USERS_TABLE", "users")
+    conn = {"secretArn": "private", "locationId": "location", "ownerId": "owner", "version": "v1"}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    secrets, dynamo = MagicMock(), MagicMock()
+    secrets.delete_secret.side_effect = FakeDynamoError("AccessDeniedException")
+    monkeypatch.setattr(kivly_settings.boto3, "client", lambda *_: secrets)
+    response = kivly_settings.handle_account(account_event(), "DELETE", dynamo)
+    assert json.loads(response["body"]) == {"ok": True, "warning": "KivlySecretCleanupRequired"}
+    dynamo.Table.return_value.update_item.assert_called_once()
+
+
+def test_concurrent_account_change_is_a_conflict(monkeypatch):
+    monkeypatch.setenv("USERS_TABLE", "users")
+    conn = {"secretArn": "private", "locationId": "location", "ownerId": "owner", "version": "v1"}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    dynamo = MagicMock()
+    dynamo.Table.return_value.update_item.side_effect = FakeDynamoError("ConditionalCheckFailedException")
+    response = kivly_settings.handle_account(account_event(), "DELETE", dynamo)
+    assert response["statusCode"] == 409
+    assert json.loads(response["body"])["error"] == "KivlyConnectionChanged"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("clubName", ""), ("privacyUrl", ""), ("termsUrl", "javascript:invalid"),
+    ("privacyUrl", "https://user:password@club.test/privacy"),
+])
+def test_invalid_shared_club_settings_cannot_break_public_registration(monkeypatch, key, value):
+    conn = {"locationId": "location", "version": "v1"}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    dynamo = MagicMock()
+    club = {"clubName": "Club", "privacyUrl": "https://club.test/privacy", "termsUrl": "https://club.test/terms"}
+    response = kivly_settings.handle_account(
+        account_event({"clubSettings": {**club, key: value}}), "PUT", dynamo,
+    )
+    assert response["statusCode"] == 400
+    dynamo.Table.assert_not_called()
+
+
+def test_connection_reads_only_private_owner_setting_consistently(monkeypatch):
+    monkeypatch.setenv("USERS_TABLE", "users")
+    conn = {"secretArn": "private", "locationId": "location", "ownerId": "owner", "version": "v1"}
+    dynamo = MagicMock()
+    dynamo.Table.return_value.get_item.return_value = {"Item": {"kivlyConnection": conn}}
+    assert read_connection(dynamo, "owner") == conn
+    dynamo.Table.return_value.get_item.assert_called_once_with(
+        Key={"userId": "owner"}, ConsistentRead=True, ProjectionExpression="kivlyConnection",
+    )
+
+
+def test_connection_read_failure_cannot_silently_disable_club(monkeypatch):
+    monkeypatch.setenv("USERS_TABLE", "users")
+    dynamo = MagicMock()
+    dynamo.Table.return_value.get_item.side_effect = FakeDynamoError("ProvisionedThroughputExceededException")
+    with pytest.raises(kivly_settings.registration.RegistrationError, match="KivlyUnavailable"):
+        read_connection(dynamo, "owner")
+
+
+def test_generic_user_response_hides_private_connection():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "src" / "stand_prod_user_fn_user" / "lambda_function.py"
+    spec = importlib.util.spec_from_file_location("kivly_user_redaction_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = module._normalize_user({"userId": "owner", "kivlyConnection": {"secretArn": "private"}})
+    assert result["userId"] == "owner"
+    assert "kivlyConnection" not in result
+
+
+def test_game_reward_catalog_is_limited_to_stack_owner_and_connected_account(monkeypatch):
+    dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": membership_game()}
+    client.list_rewards.return_value = [{"id": "reward-1", "name": "Coffee"}]
+    conn = {"locationId": "location", "ownerId": "kivly-owner"}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
+
+    response = kivly_settings.handle_game(game_event("GAME1"), "GET", dynamo, games, catalog=True)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"ok": True, "rewards": client.list_rewards.return_value}
+    client.list_rewards.assert_called_once_with("location", "kivly-owner")
+
+
+def test_game_reward_selection_validates_catalog_and_saves_only_stack_reward(monkeypatch):
+    dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": membership_game()}
+    client.list_rewards.return_value = [{"id": "reward-1", "name": "Coffee"}]
+    conn = {"locationId": "location", "ownerId": "kivly-owner", "clubSettings": {
+        "clubName": "Club", "privacyUrl": "https://club.test/privacy",
+        "termsUrl": "https://club.test/terms",
+    }}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
+
+    response = kivly_settings.handle_game(
+        game_event("GAME1", {"gameId": "GAME1", "rewardId": "reward-1"}),
+        "PUT", dynamo, games,
+    )
+
+    assert response["statusCode"] == 200
+    values = games.update_item.call_args.kwargs["ExpressionAttributeValues"]
+    assert values[":reward"] == {"id": "reward-1", "name": "Coffee", "locationId": "location"}
+    assert values[":owner"] == "owner"
+    client.list_rewards.assert_called_once_with("location", "kivly-owner")
+
+
+def test_game_reward_catalog_rejects_other_games_and_disconnected_account(monkeypatch):
+    dynamo, games = MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": {"ownerUserId": "owner", "gameType": "RULET4"}}
+    response = kivly_settings.handle_game(game_event("GAME1"), "GET", dynamo, games, catalog=True)
+    assert response["statusCode"] == 400
+    dynamo.Table.assert_not_called()
+
+    games.get_item.return_value = {"Item": membership_game()}
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: None)
+    response = kivly_settings.handle_game(game_event("GAME1"), "GET", dynamo, games, catalog=True)
+    assert response["statusCode"] == 409

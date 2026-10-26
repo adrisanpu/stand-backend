@@ -6,8 +6,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
-from boto3.dynamodb.types import TypeSerializer
-from stand_common import kivly_registration, kivly_settings
+from stand_common import kivly_settings
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
@@ -402,7 +401,6 @@ def _handle_get(event):
             payload["game"]["type"] = {"STACK": stack_game_config(item)}
         return _resp(200, payload)
 
-
     # ---------------- 2) gameName (optional) ----------------
     if game_name:
         try:
@@ -580,11 +578,6 @@ def _handle_get_players(event):
     return _resp(200, {"ok": True, "players": players})
 
 
-def _serialize_dynamodb_values(values):
-    serializer = TypeSerializer()
-    return {key: serializer.serialize(value) for key, value in values.items()}
-
-
 def _handle_delete_player(event):
     body = _read_json_body(event)
     if not isinstance(body, dict):
@@ -680,16 +673,16 @@ def _handle_delete_player(event):
         {
             "Update": {
                 "TableName": GAMES_TABLE,
-                "Key": _serialize_dynamodb_values({"gameId": game_id}),
+                "Key": {"gameId": game_id},
                 "UpdateExpression": update_expression,
                 "ConditionExpression": " AND ".join(conditions),
-                "ExpressionAttributeValues": _serialize_dynamodb_values(values),
+                "ExpressionAttributeValues": values,
             }
         },
         {
             "Delete": {
                 "TableName": GAMEPLAYER_TABLE,
-                "Key": _serialize_dynamodb_values({"gameId": game_id, "playerId": player_id}),
+                "Key": {"gameId": game_id, "playerId": player_id},
                 "ConditionExpression": "attribute_exists(gameId) AND attribute_exists(playerId)",
             }
         },
@@ -698,9 +691,9 @@ def _handle_delete_player(event):
         transaction.append({
             "Delete": {
                 "TableName": EMAIL_VERIFICATION_TABLE,
-                "Key": _serialize_dynamodb_values({"id": identity_key}),
+                "Key": {"id": identity_key},
                 "ConditionExpression": "playerId = :removedPlayerId",
-                "ExpressionAttributeValues": _serialize_dynamodb_values({":removedPlayerId": player_id}),
+                "ExpressionAttributeValues": {":removedPlayerId": player_id},
             }
         })
     try:
@@ -850,6 +843,8 @@ def _handle_post(event):
             "createdAt": now,
             "updatedAt": now,
         }
+        if game_type == "RULET4":
+            item["type"] = {"RULET4": rulet4_config}
         item = {k: v for k, v in item.items() if v is not None}
 
         quiz_order, quiz_questions = _load_default_quiz_from_catalog(game_type, candidate)
@@ -863,8 +858,6 @@ def _handle_post(event):
         if game_type == "STACK":
             item["type"] = {"STACK": stack_config}
             item["requiresValidation"] = False
-        if game_type == "RULET4":
-            item["type"] = {"RULET4": rulet4_config}
         
         try:
             games_table.put_item(
@@ -920,13 +913,13 @@ def _handle_put(event):
         return _resp(400, {"error": "settings must be an object."})
     if "stack" in settings and not isinstance(settings["stack"], dict):
         return _resp(400, {"error": "settings.stack must be an object."})
-    if "rulet4" in settings and not isinstance(settings["rulet4"], dict):
-        return _resp(400, {"error": "settings.rulet4 must be an object."})
     empareja2_settings = settings.get("empareja2")
     prize_update = settings.get("prizeDelivered")
     l3tras_settings = settings.get("l3tras")
     impostor_settings = settings.get("impostor")
     stack_settings = settings.get("stack")
+    if "rulet4" in settings and not isinstance(settings["rulet4"], dict):
+        return _resp(400, {"error": "settings.rulet4 must be an object."})
     rulet4_settings = settings.get("rulet4")
     participant_fields = body.get("participantFields")
     join_channel = body.get("joinChannel")
@@ -950,7 +943,6 @@ def _handle_put(event):
         and join_channel is None
         and play_mode is None
         and not prize_catalog_supplied
-        and "kivly" not in body
     ):
         return _resp(400, {"error": "Provide at least one game update, including 'prizeCatalog'."})
 
@@ -967,15 +959,6 @@ def _handle_put(event):
         return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
-
-    effective_kivly = kivly_registration.account_game_settings(
-        item, kivly_registration.connection(dynamodb, owner_user_id),
-    )
-    if effective_kivly["enabled"]:
-        participant_fields = normalize_participant_fields(
-            item.get("gameType") or "", participant_fields if participant_fields is not None else item.get("participantFields"),
-        )
-        participant_fields["email"] = {"required": True}
 
     prepared_prize_catalog = None
     prepared_prize_response = None
@@ -1077,6 +1060,7 @@ def _handle_put(event):
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return _resp(409, {"error": "Game changed; reload configuration before saving."})
+            log("Update RULET4 config failed", {"gameId": game_id, "error": str(exc)})
             return _resp(500, {"error": "UpdateFailed"})
 
     if stack_config is not None:
@@ -1088,15 +1072,10 @@ def _handle_put(event):
 
     if participant_fields is not None:
         try:
-            values = {":u": now, ":owner": owner_user_id}
-            updates = ["updatedAt = :u"]
-            if participant_fields is not None:
-                updates.append("participantFields = :pf")
-                values[":pf"] = participant_fields
             games_table.update_item(
                 Key={"gameId": game_id},
-                UpdateExpression="SET " + ", ".join(updates),
-                ExpressionAttributeValues=values,
+                UpdateExpression="SET participantFields = :pf, updatedAt = :u",
+                ExpressionAttributeValues={":pf": participant_fields, ":u": now, ":owner": owner_user_id},
                 ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
             )
         except ClientError as e:
@@ -1486,10 +1465,10 @@ def lambda_handler(event, context):
         path = _get_path(event).rstrip("/")
         if path.endswith("/v1/kivly"):
             return kivly_settings.handle_account(event, method, dynamodb)
-        if path.endswith("/v1/game/kivly"):
-            return kivly_settings.handle(event, method, dynamodb, games_table)
         if path.endswith("/v1/game/kivly/rewards"):
-            return kivly_settings.handle(event, method, dynamodb, games_table, catalog=True)
+            return kivly_settings.handle_game(event, method, dynamodb, games_table, catalog=True)
+        if path.endswith("/v1/game/kivly"):
+            return kivly_settings.handle_game(event, method, dynamodb, games_table)
         if path.endswith("/v1/game/players"):
             if method == "GET":
                 return _handle_get_players(event)
@@ -1516,9 +1495,6 @@ def lambda_handler(event, context):
 
         return _resp(405, {"error": f"Method {method} not allowed"})
 
-    except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:
-        status, payload = kivly_registration.error_response(exc)
-        return _resp(status, payload)
     except Exception as e:
         log("UnhandledError", {"error": str(e)})
         return _resp(500, {"error": "UnhandledError", "detail": str(e)})

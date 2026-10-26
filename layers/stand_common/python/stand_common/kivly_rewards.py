@@ -26,7 +26,8 @@ def wallet_url(value):
 
 def configured_reward(meta, conn):
     reward = meta.get("kivlyReward")
-    if not reward or not conn or reward.get("locationId") != conn["locationId"]:
+    if (not isinstance(reward, dict) or not conn
+            or reward.get("locationId") != conn["locationId"]):
         return None
     return reward
 

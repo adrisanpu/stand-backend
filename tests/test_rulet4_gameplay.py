@@ -28,6 +28,7 @@ CONFIG = {"panels": [
 META = {
     "gameId": "ABC123", "gameType": "RULET4", "isActive": True,
     "ownerUserId": "owner", "type": {"RULET4": CONFIG},
+    "participantFields": {"email": {"required": True}},
 }
 PLAYER = {
     "gameId": "ABC123", "playerId": 1, "username": "Player",
@@ -217,7 +218,7 @@ def test_operator_rejects_client_selected_results_and_invalid_ids(extra, error, 
 
 
 def test_web_assign_creates_rulet4_participant_with_verified_email(verified_web_assignment):
-    meta = {**META, "participantFields": {"email": {"required": False}}}
+    meta = META
     with patch.object(assign_mod, "_get_game_meta", return_value=meta), \
          patch.object(assign_mod, "_find_existing_player_by_email", return_value=None), \
          patch.object(assign_mod, "_ensure_game_counters"), \
@@ -231,6 +232,17 @@ def test_web_assign_creates_rulet4_participant_with_verified_email(verified_web_
     assert response["assignment"]["gameType"] == "RULET4"
     assert response["assignment"]["result"] is None
     assert put.call_args.args[0]["type"]["RULET4"]["raffleEligible"] is False
+
+
+def test_rulet4_registration_requires_email_even_with_legacy_disabled_setting():
+    meta = {**META, "participantFields": {"email": {"required": False}}}
+    with patch.object(assign_mod, "_get_game_meta", return_value=meta), \
+         patch.object(assign_mod, "_ensure_game_counters"), \
+         patch.object(assign_mod, "_reserve_player_slot", return_value=False), \
+         patch.object(assign_mod, "_put_player") as put:
+        response = assign_mod._handle_web_assign({"game_id": "ABC123", "username": "Player"})
+    assert response["reason"] == "missing_email"
+    put.assert_not_called()
 
 
 @pytest.mark.parametrize("meta,reason", [

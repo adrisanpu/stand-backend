@@ -652,30 +652,6 @@ Resources:
             Path: /v1/game/prizes
             Method: POST
 
-        KivlyGet:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/game/kivly
-            Method: GET
-        KivlyRewardsGet:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/game/kivly/rewards
-            Method: GET
-        KivlyPut:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/game/kivly
-            Method: PUT
-        KivlyDelete:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/game/kivly
-            Method: DELETE
         KivlyAccountGet:
           Type: HttpApi
           Properties:
@@ -694,6 +670,24 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/kivly
             Method: DELETE
+        GameKivlyGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly
+            Method: GET
+        GameKivlyPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly
+            Method: PUT
+        GameKivlyRewardsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly/rewards
+            Method: GET
 
   StandProdGameFnAssign:
     Type: AWS::Serverless::Function
@@ -766,14 +760,6 @@ Resources:
           EMAIL_GLOBAL_MAX_PER_HOUR: "20000"
           KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
       Events:
-        PublicKivlyRewardPost:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/public/kivly/reward
-            Method: POST
-            Auth:
-              Authorizer: NONE
         PublicGameGet:
           Type: HttpApi
           Properties:
@@ -851,6 +837,14 @@ Resources:
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/public/rulet4/spin
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicKivlyRewardPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/kivly/reward
             Method: POST
             Auth:
               Authorizer: NONE

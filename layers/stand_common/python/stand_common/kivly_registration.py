@@ -49,13 +49,15 @@ def connection(dynamo, owner):
 
 def account_game_settings(meta, conn):
     """Resolve the account-wide integration without persisting per-game switches."""
-    if (meta.get("gameType") or "").upper() != "STACK":
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
-    club = conn.get("clubSettings") if conn else None
     disabled = {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
+    if (meta.get("gameType") or "").upper() != "STACK":
+        return disabled
+    club = conn.get("clubSettings") if conn else None
     if not club:
         return disabled
     if not isinstance(club, dict):
+        raise RegistrationError("KivlyConfigurationInvalid")
+    if not all(isinstance(club.get(key), str) for key in ("clubName", "privacyUrl", "termsUrl")):
         raise RegistrationError("KivlyConfigurationInvalid")
     for key in ("privacyUrl", "termsUrl"):
         try:
@@ -70,12 +72,8 @@ def account_game_settings(meta, conn):
 def apply_account_settings(dynamo, meta):
     if not meta or not meta.get("ownerUserId"):
         return meta
-    if (meta.get("gameType") or "").upper() != "STACK":
-        return {
-            **meta,
-            "kivly": {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""},
-        }
-    settings = account_game_settings(meta, connection(dynamo, meta["ownerUserId"]))
+    conn = connection(dynamo, meta["ownerUserId"]) if (meta.get("gameType") or "").upper() == "STACK" else None
+    settings = account_game_settings(meta, conn)
     fields = dict(meta.get("participantFields") or {})
     if settings["enabled"]:
         fields["email"] = {"required": True}
@@ -83,6 +81,8 @@ def apply_account_settings(dynamo, meta):
 
 
 def game_settings(meta):
+    if (meta.get("gameType") or "").upper() != "STACK":
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
     settings = meta.get("kivly")
     if settings is None:
         return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
@@ -107,8 +107,6 @@ def consent_version(settings):
 def prepare_settings(meta, raw, conn):
     if not isinstance(raw, dict) or type(raw.get("enabled")) is not bool:
         raise RegistrationError("KivlyConfigurationInvalid", 400)
-    if raw.get("rewardId") is not None:
-        raise RegistrationError("KivlyCatalogUnverified", 409)
     if isinstance(conn, dict) and isinstance(conn.get("clubSettings"), dict):
         raw = {**raw, **conn["clubSettings"]}
     result = {"enabled": raw["enabled"]}
@@ -277,6 +275,8 @@ def require_player(dynamo, meta, player):
 def error_response(error):
     if isinstance(error, KivlyError):
         status = 429 if error.http_status == 429 else 503
+        if error.code == "KivlyCredentialsInvalid":
+            status = 400
         code = "KivlyAccessDenied" if error.http_status in (401, 403) else error.code
     elif isinstance(error, RegistrationError):
         status, code = error.status, error.code
