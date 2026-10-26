@@ -238,12 +238,25 @@ def normalize_participant_fields(game_type: str, fields: dict | None = None) -> 
             raise ValueError(f"Unsupported participant field: {name}.")
         if not isinstance(config, dict):
             raise ValueError(f"participantFields.{name} must be an object.")
-        if set(config) - {"required"}:
-            raise ValueError(f"participantFields.{name} only supports 'required'.")
+        allowed = {"required", "enabled"} if name == "phone" else {"required"}
+        if set(config) - allowed:
+            raise ValueError(f"Unsupported participantFields.{name} option.")
         if "required" in config:
             if not isinstance(config["required"], bool):
                 raise ValueError(f"participantFields.{name}.required must be a boolean.")
             result[name]["required"] = config["required"]
+        if "enabled" in config:
+            if not isinstance(config["enabled"], bool):
+                raise ValueError(f"participantFields.{name}.enabled must be a boolean.")
+            result[name]["enabled"] = config["enabled"]
+    return result
+
+
+def web_participant_fields(game_type: str, fields: dict | None = None) -> dict:
+    result = normalize_participant_fields(game_type, fields)
+    result["email"] = {"required": True}
+    phone = result["phone"]
+    result["phone"] = {"required": False, "enabled": phone.get("enabled", phone["required"])}
     return result
 
 

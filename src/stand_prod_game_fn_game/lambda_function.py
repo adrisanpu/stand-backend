@@ -6,6 +6,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
+from stand_common import kivly_settings
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
@@ -1462,6 +1463,8 @@ def lambda_handler(event, context):
             return _resp(204, "")
 
         path = _get_path(event).rstrip("/")
+        if path.endswith("/v1/kivly"):
+            return kivly_settings.handle_account(event, method, dynamodb)
         if path.endswith("/v1/game/players"):
             if method == "GET":
                 return _handle_get_players(event)

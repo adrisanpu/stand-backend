@@ -63,6 +63,21 @@ if not LAYER_PATH.exists() and "stand_common" not in sys.modules:
     sys.modules["stand_common.utils"] = utils
 
 
+@pytest.fixture(autouse=True)
+def configure_kivly_error_types(monkeypatch):
+    """New handlers need real exception types instead of the SDK MagicMock."""
+    from stand_common import kivly_registration, kivly_settings
+    from tests.email_fake import FakeDynamoError
+
+    monkeypatch.setattr(kivly_registration, "ClientError", FakeDynamoError)
+    monkeypatch.setattr(kivly_registration, "BotoCoreError", FakeDynamoError)
+    monkeypatch.setattr(kivly_settings, "ClientError", FakeDynamoError)
+    # Unrelated offline tests start without an account integration.
+    monkeypatch.setattr(kivly_registration, "connection", lambda *_: None)
+    monkeypatch.setattr(kivly_registration, "ERRORS", (
+        kivly_registration.RegistrationError, kivly_registration.KivlyError, FakeDynamoError,
+    ))
+
 @pytest.fixture
 def verified_web_assignment(monkeypatch):
     """Assignment unit tests start after verification; real gates have separate integration coverage."""

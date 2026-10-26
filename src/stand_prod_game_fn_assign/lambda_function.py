@@ -12,6 +12,7 @@ from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
     require_verified_registration, complete_registration, identity_id,
 )
+from stand_common import kivly_registration
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -28,8 +29,8 @@ def _code4() -> int:
     return random.randint(1000, 9999)
 
 def _get_game_meta(game_id: str) -> dict | None:
-    resp = games_table.get_item(Key={"gameId": game_id})
-    return resp.get("Item")
+    resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
+    return kivly_registration.apply_account_settings(dynamo_r, resp.get("Item"))
 
 def _ensure_game_counters(game_id: str):
     """
@@ -330,11 +331,21 @@ def _handle_web_assign(event: dict) -> dict:
 
     verified_table, verified_record = _verified_email(event, game_id, values) if email else (None, None)
     existing = _find_verified_player(verified_table, game_id, email) if email else None
+    max_players_raw = meta.get("maxPlayers") or 9999
+    max_players = int(max_players_raw)
+    if not existing and int(meta.get("playersCount", 0)) >= max_players:
+        return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
+    membership = kivly_registration.ensure_membership(dynamo_r, meta, values)
     if existing:
+        if membership:
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": int(existing["playerId"])},
+                UpdateExpression="SET kivlyMembership = :m",
+                ConditionExpression="attribute_exists(playerId)",
+                ExpressionAttributeValues={":m": membership},
+            )
         return _existing_web_response(verified_table, verified_record, game_id, game_type, existing)
 
-    max_players_raw = meta.get("maxPlayers") or 9999
-    max_players = int(max_players_raw) if not isinstance(max_players_raw, Decimal) else int(max_players_raw)
     now = _iso_now()
     if not email:
         try:
@@ -364,6 +375,8 @@ def _handle_web_assign(event: dict) -> dict:
             base_item["phone"] = phone
         if username:
             base_item["username"] = username
+        if membership:
+            base_item["kivlyMembership"] = membership
 
         assigner = ASSIGNERS.get(game_type, assign_generic)
         patch = assigner({
@@ -395,6 +408,13 @@ def _handle_web_assign(event: dict) -> dict:
                     winner = _find_verified_player(verified_table, game_id, email)
                     if not winner:
                         raise VerificationError("VerificationUnavailable", 503)
+                    if membership:
+                        gp_table.update_item(
+                            Key={"gameId": game_id, "playerId": int(winner["playerId"])},
+                            UpdateExpression="SET kivlyMembership = :m",
+                            ConditionExpression="attribute_exists(playerId)",
+                            ExpressionAttributeValues={":m": membership},
+                        )
                     return _existing_web_response(verified_table, verified_record, game_id, game_type, winner)
                 complete_registration(verified_table, verified_record, new_pid)
             else:
@@ -414,10 +434,11 @@ def _handle_web_assign(event: dict) -> dict:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 continue
             if not email:
-                try:
-                    _rollback_player_slot(game_id, now)
-                except Exception as re:
-                    log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
+                if not email:
+                    try:
+                        _rollback_player_slot(game_id, now)
+                    except Exception as re:
+                        log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
             return {"ok": False, "reason": "put_failed", "detail": str(e)}
 
     try:
@@ -435,6 +456,9 @@ def lambda_handler(event, context):
         return {"ok": False, "reason": "unsupported_source"}
     except VerificationError as e:
         return {"ok": False, "reason": e.code}
+    except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:
+        status, payload = kivly_registration.error_response(exc)
+        return {**payload, "reason": payload["error"], "status": status}
     except Exception as e:
         log("assign_internal_error", {"errorType": type(e).__name__})
         return {"ok": False, "reason": "internal_error", "detail": repr(e)}

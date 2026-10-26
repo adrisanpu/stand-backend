@@ -44,6 +44,11 @@ SECRET = "test-secret"
 public_mod.PLAYER_TOKEN_SECRET = SECRET
 
 
+@pytest.fixture
+def photo_game(monkeypatch):
+    monkeypatch.setattr(public_mod, "_get_game", lambda _: {"gameType": "STACK"})
+
+
 @pytest.mark.parametrize("code", ["K9R4QM", "012345"])
 def test_valid_join_codes(code):
     assert is_valid_join_code(code) is True
@@ -112,8 +117,8 @@ def test_public_game_hides_legacy_instagram_registration_field():
         response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
     assert response["statusCode"] == 200
     assert json.loads(response["body"])["participantFields"] == {
-        "email": {"required": False},
-        "phone": {"required": True},
+        "email": {"required": True},
+        "phone": {"required": False, "enabled": True},
     }
 
 
@@ -265,7 +270,7 @@ def test_all_mobile_games_publish_owner_appearance(game_type):
     assert json.loads(response["body"])["prizeCatalog"][slot]["imageUrl"] is None
 
 
-def test_web_participant_can_request_a_scoped_photo_upload(monkeypatch):
+def test_web_participant_can_request_a_scoped_photo_upload(monkeypatch, photo_game):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     token = issue_player_token("ABC123", 7, SECRET)
     s3 = MagicMock()
@@ -304,7 +309,7 @@ def test_web_participant_can_request_a_scoped_photo_upload(monkeypatch):
     ("image/png", 0, "InvalidPhotoSize"),
     ("image/png", 5 * 1024 * 1024 + 1, "InvalidPhotoSize"),
 ])
-def test_photo_upload_rejects_unsupported_or_oversized_images(monkeypatch, image_type, size, error):
+def test_photo_upload_rejects_unsupported_or_oversized_images(monkeypatch, image_type, size, error, photo_game):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     token = issue_player_token("ABC123", 7, SECRET)
     with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}):
@@ -327,7 +332,7 @@ def test_only_web_participants_can_upload_profile_photos():
     assert json.loads(response["body"])["error"] == "WebPhotoUploadOnly"
 
 
-def test_photo_completion_validates_image_and_persists_s3_key(monkeypatch):
+def test_photo_completion_validates_image_and_persists_s3_key(monkeypatch, photo_game):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     token = issue_player_token("ABC123", 7, SECRET)
     photo_key = "players/ABC123/7/profile-01234567-89ab-cdef-0123-456789abcdef.png"
@@ -354,7 +359,7 @@ def test_photo_completion_validates_image_and_persists_s3_key(monkeypatch):
     s3.get_object.assert_called_once_with(Bucket="media", Key=photo_key, Range="bytes=0-11")
 
 
-def test_photo_completion_rejects_non_image_bytes(monkeypatch):
+def test_photo_completion_rejects_non_image_bytes(monkeypatch, photo_game):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     token = issue_player_token("ABC123", 7, SECRET)
     photo_key = "players/ABC123/7/profile-01234567-89ab-cdef-0123-456789abcdef.png"

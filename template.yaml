@@ -85,6 +85,17 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - !Ref StandProdGameRolePolicy
+      Policies:
+        - PolicyName: KivlyOwnerCredentials
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
 
   StandProdGameRolePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -234,6 +245,19 @@ Resources:
       ManagedPolicyArns:
         - !Ref StandProdGameRolePolicy
       Policies:
+        - PolicyName: KivlyRegistration
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt StandKivlyRegistrationTable.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
         - PolicyName: EmailVerification
           PolicyDocument:
             Version: "2012-10-17"
@@ -313,6 +337,22 @@ Resources:
 # =========================
 # DYNAMODB TABLES
 # =========================
+
+  StandKivlyRegistrationTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "stand-${Environment}-kivly-registration-table"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
   StandEmailVerificationTable:
     Type: AWS::DynamoDB::Table
@@ -599,6 +639,25 @@ Resources:
             Path: /v1/game/prizes
             Method: POST
 
+        KivlyAccountGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/kivly
+            Method: GET
+        KivlyAccountPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/kivly
+            Method: PUT
+        KivlyAccountDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/kivly
+            Method: DELETE
+
   StandProdGameFnAssign:
     Type: AWS::Serverless::Function
     Properties:
@@ -613,6 +672,7 @@ Resources:
         Variables:
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
+          KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
       Events:
         AssignPost:
           Type: HttpApi
