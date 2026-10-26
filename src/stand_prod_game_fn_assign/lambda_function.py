@@ -75,8 +75,7 @@ def _rollback_player_slot(game_id: str, now_iso: str):
 
 def _get_last_player_id(game_id: str) -> int:
     """
-    Query descending by SK to get the last assigned playerId.
-    Returns 0 if none.
+    Query the highest existing ID and retain the high-water mark after removals.
     """
     resp = gp_table.query(
         KeyConditionExpression=Key("gameId").eq(game_id),
@@ -86,10 +85,13 @@ def _get_last_player_id(game_id: str) -> int:
         ConsistentRead=True,
     )
     items = resp.get("Items") or []
-    if not items:
-        return 0
-    pid = items[0].get("playerId")
-    return int(pid) if not isinstance(pid, Decimal) else int(pid)
+    latest_id = int(items[0]["playerId"]) if items else 0
+    game = games_table.get_item(
+        Key={"gameId": game_id},
+        ProjectionExpression="lastPlayerId",
+        ConsistentRead=True,
+    ).get("Item") or {}
+    return max(latest_id, int(game.get("lastPlayerId", 0)))
 
 
 def _put_player(item: dict) -> None:
