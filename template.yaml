@@ -85,6 +85,17 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - !Ref StandProdGameRolePolicy
+      Policies:
+        - PolicyName: KivlyOwnerCredentials
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
 
   StandProdGameRolePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -111,6 +122,7 @@ Resources:
               - dynamodb:Scan
               - dynamodb:BatchGetItem
               - dynamodb:BatchWriteItem
+              - dynamodb:TransactWriteItems
               - dynamodb:ConditionCheckItem
             Resource:
               - !Sub
@@ -134,6 +146,7 @@ Resources:
               - !Sub
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdCatalogTable
+              - !GetAtt StandEmailVerificationTable.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -188,6 +201,19 @@ Resources:
       ManagedPolicyArns:
         - !Ref StandProdGameRolePolicy
       Policies:
+        - PolicyName: KivlyCompletionRewards
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt StandKivlyRegistrationTable.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
         - PolicyName: EmailVerification
           PolicyDocument:
             Version: "2012-10-17"
@@ -232,6 +258,19 @@ Resources:
       ManagedPolicyArns:
         - !Ref StandProdGameRolePolicy
       Policies:
+        - PolicyName: KivlyRegistration
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt StandKivlyRegistrationTable.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
         - PolicyName: EmailVerification
           PolicyDocument:
             Version: "2012-10-17"
@@ -311,6 +350,22 @@ Resources:
 # =========================
 # DYNAMODB TABLES
 # =========================
+
+  StandKivlyRegistrationTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "stand-${Environment}-kivly-registration-table"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
   StandEmailVerificationTable:
     Type: AWS::DynamoDB::Table
@@ -552,6 +607,7 @@ Resources:
       Environment:
         Variables:
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
+          EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
       Events:
         GameCrudGet:
           Type: HttpApi
@@ -577,12 +633,67 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game
             Method: DELETE
+        GamePlayersGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/players
+            Method: GET
+        GamePlayersDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/players
+            Method: DELETE
         GamePrizeUploadUrl:
           Type: HttpApi
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/game/prizes
             Method: POST
+
+        KivlyGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly
+            Method: GET
+        KivlyRewardsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly/rewards
+            Method: GET
+        KivlyPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly
+            Method: PUT
+        KivlyDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly
+            Method: DELETE
+        KivlyAccountGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/kivly
+            Method: GET
+        KivlyAccountPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/kivly
+            Method: PUT
+        KivlyAccountDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/kivly
+            Method: DELETE
 
   StandProdGameFnAssign:
     Type: AWS::Serverless::Function
@@ -598,6 +709,7 @@ Resources:
         Variables:
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
+          KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
       Events:
         AssignPost:
           Type: HttpApi
@@ -652,7 +764,16 @@ Resources:
           EMAIL_MAX_PER_HOUR: "5"
           EMAIL_IP_MAX_PER_HOUR: "3000"
           EMAIL_GLOBAL_MAX_PER_HOUR: "20000"
+          KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
       Events:
+        PublicKivlyRewardPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/kivly/reward
+            Method: POST
+            Auth:
+              Authorizer: NONE
         PublicGameGet:
           Type: HttpApi
           Properties:
@@ -722,6 +843,14 @@ Resources:
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/public/score
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicRulet4SpinPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/rulet4/spin
             Method: POST
             Auth:
               Authorizer: NONE

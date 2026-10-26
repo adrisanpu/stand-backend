@@ -6,6 +6,7 @@ those before any test module is imported.
 """
 import sys
 import types
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
@@ -19,6 +20,30 @@ sys.modules.setdefault("botocore", MagicMock())
 sys.modules.setdefault("botocore.exceptions", MagicMock())
 sys.modules.setdefault("boto3.dynamodb", MagicMock())
 sys.modules.setdefault("boto3.dynamodb.conditions", MagicMock())
+
+dynamodb_types = types.ModuleType("boto3.dynamodb.types")
+
+
+class TypeSerializer:
+    """Serialize values used by mocked low-level DynamoDB transaction requests."""
+    def serialize(self, value):
+        if isinstance(value, bool):
+            return {"BOOL": value}
+        if value is None:
+            return {"NULL": True}
+        if isinstance(value, (int, Decimal)):
+            return {"N": str(value)}
+        if isinstance(value, str):
+            return {"S": value}
+        if isinstance(value, list):
+            return {"L": [self.serialize(item) for item in value]}
+        if isinstance(value, dict):
+            return {"M": {key: self.serialize(item) for key, item in value.items()}}
+        raise TypeError(f"Unsupported DynamoDB test value: {type(value).__name__}")
+
+
+dynamodb_types.TypeSerializer = TypeSerializer
+sys.modules.setdefault("boto3.dynamodb.types", dynamodb_types)
 
 # ---------------------------------------------------------------------------
 # 2. Add the Lambda Layer (stand_common) to sys.path so imports resolve
@@ -62,6 +87,21 @@ if not LAYER_PATH.exists() and "stand_common" not in sys.modules:
     sys.modules["stand_common"] = stand_common
     sys.modules["stand_common.utils"] = utils
 
+
+@pytest.fixture(autouse=True)
+def configure_kivly_error_types(monkeypatch):
+    """New handlers need real exception types instead of the SDK MagicMock."""
+    from stand_common import kivly_registration, kivly_settings
+    from tests.email_fake import FakeDynamoError
+
+    monkeypatch.setattr(kivly_registration, "ClientError", FakeDynamoError)
+    monkeypatch.setattr(kivly_registration, "BotoCoreError", FakeDynamoError)
+    monkeypatch.setattr(kivly_settings, "ClientError", FakeDynamoError)
+    # Unrelated offline tests start without an account integration.
+    monkeypatch.setattr(kivly_registration, "connection", lambda *_: None)
+    monkeypatch.setattr(kivly_registration, "ERRORS", (
+        kivly_registration.RegistrationError, kivly_registration.KivlyError, FakeDynamoError,
+    ))
 
 @pytest.fixture
 def verified_web_assignment(monkeypatch):

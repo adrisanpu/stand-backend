@@ -12,6 +12,7 @@ from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
     require_verified_registration, complete_registration, identity_id,
 )
+from stand_common import kivly_registration
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -28,8 +29,8 @@ def _code4() -> int:
     return random.randint(1000, 9999)
 
 def _get_game_meta(game_id: str) -> dict | None:
-    resp = games_table.get_item(Key={"gameId": game_id})
-    return resp.get("Item")
+    resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
+    return kivly_registration.apply_account_settings(dynamo_r, resp.get("Item"))
 
 def _ensure_game_counters(game_id: str):
     """
@@ -75,8 +76,7 @@ def _rollback_player_slot(game_id: str, now_iso: str):
 
 def _get_last_player_id(game_id: str) -> int:
     """
-    Query descending by SK to get the last assigned playerId.
-    Returns 0 if none.
+    Query the highest existing ID and retain the high-water mark after removals.
     """
     resp = gp_table.query(
         KeyConditionExpression=Key("gameId").eq(game_id),
@@ -86,10 +86,13 @@ def _get_last_player_id(game_id: str) -> int:
         ConsistentRead=True,
     )
     items = resp.get("Items") or []
-    if not items:
-        return 0
-    pid = items[0].get("playerId")
-    return int(pid) if not isinstance(pid, Decimal) else int(pid)
+    latest_id = int(items[0]["playerId"]) if items else 0
+    game = games_table.get_item(
+        Key={"gameId": game_id},
+        ProjectionExpression="lastPlayerId",
+        ConsistentRead=True,
+    ).get("Item") or {}
+    return max(latest_id, int(game.get("lastPlayerId", 0)))
 
 
 def _put_player(item: dict) -> None:
@@ -138,7 +141,7 @@ def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
     return None
 
 
-WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK"})
+WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK", "RULET4"})
 
 
 def _empareja2_web_assignment(player: dict) -> dict:
@@ -182,6 +185,9 @@ def _t1mer_web_assignment(player: dict) -> dict:
 
 
 def _web_assignment(game_type: str, player: dict) -> dict:
+    if game_type == "RULET4":
+        from stand_common.rulet4_gameplay import public_assignment
+        return public_assignment(player, _t1mer_web_assignment(player)["displayName"])
     if game_type == "EMPAREJA2":
         return _empareja2_web_assignment(player)
     if game_type == "STACK":
@@ -325,7 +331,15 @@ def _handle_web_assign(event: dict) -> dict:
 
     verified_table, verified_record = _verified_email(event, game_id, values) if email else (None, None)
     existing = _find_verified_player(verified_table, game_id, email) if email else None
+    membership = kivly_registration.ensure_membership(dynamo_r, meta, values)
     if existing:
+        if membership:
+            gp_table.update_item(
+                Key={"gameId": game_id, "playerId": int(existing["playerId"])},
+                UpdateExpression="SET kivlyMembership = :m",
+                ConditionExpression="attribute_exists(playerId)",
+                ExpressionAttributeValues={":m": membership},
+            )
         return _existing_web_response(verified_table, verified_record, game_id, game_type, existing)
 
     max_players_raw = meta.get("maxPlayers") or 9999
@@ -359,6 +373,8 @@ def _handle_web_assign(event: dict) -> dict:
             base_item["phone"] = phone
         if username:
             base_item["username"] = username
+        if membership:
+            base_item["kivlyMembership"] = membership
 
         assigner = ASSIGNERS.get(game_type, assign_generic)
         patch = assigner({
@@ -390,6 +406,13 @@ def _handle_web_assign(event: dict) -> dict:
                     winner = _find_verified_player(verified_table, game_id, email)
                     if not winner:
                         raise VerificationError("VerificationUnavailable", 503)
+                    if membership:
+                        gp_table.update_item(
+                            Key={"gameId": game_id, "playerId": int(winner["playerId"])},
+                            UpdateExpression="SET kivlyMembership = :m",
+                            ConditionExpression="attribute_exists(playerId)",
+                            ExpressionAttributeValues={":m": membership},
+                        )
                     return _existing_web_response(verified_table, verified_record, game_id, game_type, winner)
                 complete_registration(verified_table, verified_record, new_pid)
             else:
@@ -430,6 +453,9 @@ def lambda_handler(event, context):
         return {"ok": False, "reason": "unsupported_source"}
     except VerificationError as e:
         return {"ok": False, "reason": e.code}
+    except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:
+        status, payload = kivly_registration.error_response(exc)
+        return {**payload, "reason": payload["error"], "status": status}
     except Exception as e:
         log("assign_internal_error", {"errorType": type(e).__name__})
         return {"ok": False, "reason": "internal_error", "detail": repr(e)}

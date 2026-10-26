@@ -20,6 +20,7 @@ def _is_expired(active_until: str | None) -> bool:
 def _normalize_user(item: dict) -> dict:
     # Garantiza forma consistente en respuesta
     user = dict(item or {})
+    user.pop("kivlyConnection", None)
     user.setdefault("plan", "FREE")
     user.setdefault("activeUntil", None)
     return user

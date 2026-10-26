@@ -39,6 +39,13 @@ Deploy config is in `samconfig.toml`:
 
 Region: `us-east-1`. Full dev setup: **[docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md)**.
 
+Kivly dual registration for STACK, owner connection, activation prerequisites and
+controlled test-business probe:
+**[docs/KIVLY_INTEGRATION.md](docs/KIVLY_INTEGRATION.md)**.
+The separate secure local connection check remains token/context only:
+**[docs/KIVLY_CONNECTION.md](docs/KIVLY_CONNECTION.md)**.
+Wallet/email and external rewards are not part of this increment.
+
 ## Structure
 
 - `template.yaml` – SAM template (APIs, Lambdas, roles)
@@ -65,8 +72,8 @@ persist both fields together. Existing records are exposed as mobile/Web without
 a table migration; configured participant and plan limits are unchanged.
 
 Instagram is not a participant registration field or game access channel.
-Participant registration uses a required display username and configured
-email/phone fields. Existing Instagram values remain in stored records but are
+Participant registration uses a required full name, mandatory verified email
+and optionally displayed phone. Existing Instagram values remain in stored records but are
 not requested or used by the public registration contract.
 
 `POST /v1/public/player` accepts `{ "gameId": "...", "playerToken": "..." }`
@@ -109,26 +116,27 @@ for history but are not used for gameplay.
 
 ### Configurable web registration fields (`/play`)
 
-For EMPAREJA2, T1MER and STACK, game POST/PUT accepts `participantFields`:
+Game POST/PUT accepts `participantFields`; public web forms normalize them as:
 
 ```json
 {
   "email": { "required": true },
-  "phone": { "required": false }
+  "phone": { "required": false, "enabled": false }
 }
 ```
 
-`required: true` means **request and require** the field; `false` means **do not
-request or store** it. There is no optional-but-requested state. Missing
-configuration/keys use the defaults shown above (including legacy records without
-phone). The public registration endpoint and participant form expose only email
-and phone; the game configuration Lambda temporarily tolerates a legacy
+Email is always required and verified, even if a legacy setting disables it.
+Phone is always optional: `phone.enabled` controls visibility and collection.
+Without `enabled`, legacy `phone.required:true` makes it visible but not required.
+Missing phone configuration hides it. The public registration endpoint and
+participant form expose only email and phone as contact fields; the game
+configuration Lambda temporarily tolerates a legacy
 `instagram` field, but the public endpoint hides and ignores it. PUT replaces the
 field configuration, filling omitted keys from defaults, not from the previous
 configuration. Malformed configuration returns 400 before writes.
 
-Web registration always requires a `username`, including email-only, phone-only,
-email+phone, and no-contact-field forms. Username is a display name and is
+Web registration always asks for full name first, stored as `username`, followed
+by mandatory email and optional enabled phone. The full name is displayed publicly in rankings and is
 trimmed, limited to 100 Unicode characters and cannot contain control characters
 (U+0000–001F, U+007F–009F). Missing, null, empty or whitespace-only names return
 `missing_username`; malformed names return `invalid_username` (HTTP 400).
@@ -139,26 +147,27 @@ assignments, player recovery and rankings use it before existing fallbacks
 (STACK rankings still never use email). Repeat email registrations
 recover the existing player without renaming it, including legacy players without
 names. Existing session/access recovery does not require a new name and retains
-legacy fallbacks. Usernames are not unique. Photo upload remains optional in every
+legacy fallbacks. Names are not unique. Photo upload remains optional in every
 mode and separate from email verification.
 
-`POST /v1/public/join` accepts `gameId`, `username`, `consent: true`, and only
-enabled contact fields: `email` and `phone`.
-Required fields must be non-empty strings. Email retains its format validation and
-is lowercased; phone is trimmed and stored as the top-level player `phone` string, preserving `+`, spacing
-and punctuation (no country-specific format restriction). Disabled incoming values
-are ignored, including malformed values, and never persisted. Errors include
-`missing_email`, `invalid_email`, `missing_phone` and `invalid_phone` (HTTP 400).
+`POST /v1/public/email/request` captures `gameId`, full name as `username`,
+`consent:true`, required `email` and optional enabled `phone`. Email is validated
+and lowercased. A supplied phone is trimmed, limited to 64 characters without
+control characters and stored as top-level player `phone`, preserving `+`, spacing
+and punctuation (no country-specific format restriction). Empty phones are omitted;
+disabled phone values are ignored, including malformed values. Errors include
+`missing_email`, `invalid_email` and `invalid_phone` (HTTP 400).
 
-An enabled email retains existing duplicate-registration recovery after email
-verification (see below). Without email,
-joins create distinct players; phone is not a substitute deduplication key. Keep
-the returned `playerToken` for session recovery. Contact fields may be disabled.
+`POST /v1/public/join` accepts only `gameId`, verified `challengeId` and `code`;
+it uses the captured registration, not replacement name/contact fields.
+Verified email retains existing duplicate-registration recovery (see below);
+phone is not a substitute deduplication key. Keep the returned `playerToken` for
+session recovery. Email cannot be disabled for web registration.
 Existing stored contact data is not retroactively removed by config changes.
 
 ### Email verification for web registration
 
-When email is requested, first call `POST /v1/public/email/request` with the same
+Always first call `POST /v1/public/email/request` with the
 registration fields (`gameId`, `username`, `consent: true`, enabled contact fields), plus
 `language: "es" | "en"`. Its response is:
 
@@ -173,7 +182,7 @@ registration fields (`gameId`, `username`, `consent: true`, enabled contact fiel
 ```
 
 Both timestamps are ISO 8601. Submit the registration to `/v1/public/join` with
-the returned `challengeId` and the emailed `code`. Email-enabled joins, including
+the returned `challengeId` and the emailed `code`. All web joins, including
 duplicate-registration recovery, require verification before a participant
 session can be issued; the successful join response is unchanged. Resending uses
 the request endpoint again after `resendAvailableAt`. Do not log codes, full
@@ -199,9 +208,9 @@ new verification-table or SES permissions.
 Public limits default to `EMAIL_MAX_PER_HOUR=5` per email,
 `EMAIL_IP_MAX_PER_HOUR=3000` per source IP, and
 `EMAIL_GLOBAL_MAX_PER_HOUR=20000` per environment. These abuse controls do not
-replace SES account quotas (shared by dev/prod). Existing valid sessions and
-no-email Web registration do not require an email
-challenge. The existing private `PlayerTokenSecret` also derives a
+replace SES account quotas (shared by dev/prod). Existing valid sessions do not
+require a new email challenge; new web registration always does.
+The existing private `PlayerTokenSecret` also derives a
 purpose-separated verification key; no new committed secret is needed.
 
 **Release gate:** set up and verify the shared sender using
@@ -279,6 +288,19 @@ prizes, including raffle wins. For existing validation/raffle prizes, display
 configuration does not change award eligibility or delivery semantics. STACK
 ranking claims use the configured ranking prize as described below.
 
+### Operator player management
+
+The game owner can list the current roster with authenticated
+`GET /v1/game/players?gameId=...`. The response includes only each player's
+`playerId` and display `username`, and never includes contact details.
+Authenticated `DELETE /v1/game/players` accepts
+`{"gameId":"...","playerId":123}` and atomically removes that player's record,
+associated raffle wins, verified-email identity mapping and cached
+player/validation counts. Scores and quiz answers are stored on the player
+record, so removing it also removes those results from rankings. The game
+retains its player-ID high-water mark so later joins cannot reuse a removed
+player's ID.
+
 ### STACK: mobile `/play` validated finish and ranking (Phase 3)
 
 STACK is registered for operator CRUD and public web join using the existing
@@ -316,8 +338,17 @@ configuration; operator GET by gameId/gameName returns `game.type.STACK`
 (not `settings.STACK` or `settings.stack`).
 The complete configuration is stored directly in game `type.STACK`, not a
 new table. `playMode` is always `mobile` and `joinChannel` is always `web`.
-Web registration defaults to required email and a required display username;
+Web registration requires verified email and full name stored as `username`;
 phone is optional and Instagram is not collected as participant data.
+
+With Kivly connected, game settings can select one existing completion reward
+through `PUT /v1/game/kivly` (`rewardId` or null), using the catalog from
+`GET /v1/game/kivly/rewards?gameId=...`. After a saved STACK finish,
+`POST /v1/public/kivly/reward` with gameId/playerToken assigns it once per player,
+regardless of score, and returns confirmed/pending/none with actual optional
+Apple/Google Wallet URLs. Uncertain writes are never automatically replayed.
+See [Kivly integration](docs/KIVLY_INTEGRATION.md) for contracts, limitations
+and the authorized live check still required before claiming real delivery.
 
 `GET /v1/public/game?gameId=...` returns **`stackConfig`**:
 
