@@ -254,8 +254,16 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
                 raise PrizeError("InvalidStackPrizeLimit", 400)
             value.update(imageKey=key, limit=limit)
         elif value["source"] == "kivly":
-            if set(prize) - {"id", "source", "name", "rewardId", "locationId", "stockTotal", "imageUrl"}:
+            if set(prize) - {"id", "source", "name", "rewardId", "locationId", "stockTotal", "imageUrl", "imageKey"}:
                 raise PrizeError("InvalidStackPrize", 400)
+            if "imageKey" in prize:
+                key = prize["imageKey"]
+                if key is not None and not any(
+                    prize_image_key(meta["ownerUserId"], meta["gameId"], slot, key)
+                    for slot in ("ranking", "raffle", "validation")
+                ):
+                    raise PrizeError("InvalidStackPrizeImage", 400)
+                value["imageKey"] = key
             if not conn or prize.get("locationId") != conn["locationId"]:
                 raise PrizeError("KivlyConnectionChanged")
             selected = next((r for r in rewards if r["id"] == prize.get("rewardId")), None)
@@ -310,10 +318,10 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
 
 
 def image_url(prize, meta=None):
-    if prize.get("source") == "kivly":
+    if prize.get("source") == "kivly" and "imageKey" not in prize:
         return reward_image_url(prize.get("imageUrl"))
     key = prize.get("imageKey")
-    if prize.get("source") != "stand" or (key and meta and not any(
+    if prize.get("source") not in ("stand", "kivly") or (key and meta and not any(
         prize_image_key(meta["ownerUserId"], meta["gameId"], slot, key)
         for slot in ("ranking", "raffle", "validation")
     )):
@@ -326,7 +334,7 @@ def image_url(prize, meta=None):
 def program_view(program, meta=None):
     program = upgrade_program(program)
     return {**program, "catalog": [{**p, **({"imageUrl": image_url(p, meta)}
-                                         if p["source"] == "stand" or p.get("imageUrl") else {})}
+                                         if p["source"] == "stand" or "imageKey" in p or p.get("imageUrl") else {})}
                                   for p in program["catalog"]]}
 
 

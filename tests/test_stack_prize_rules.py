@@ -235,6 +235,70 @@ def test_kivly_prize_image_is_taken_only_from_verified_catalog_not_save_payload(
                                        [{"id": "r1", "name": "Coffee"}], True)
     assert "imageUrl" not in no_image["catalog"][1]
 
+
+def test_kivly_prize_can_use_an_owned_uploaded_image_and_clear_it(monkeypatch):
+    s3 = MagicMock()
+    s3.generate_presigned_url.return_value = "https://signed.test/image.png"
+    monkeypatch.setattr(prizes.boto3, "client", lambda _: s3)
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    key = "games/owner/ABC123/ranking/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.png"
+    program = deepcopy(PROGRAM)
+    program["catalog"][1]["imageKey"] = key
+    result = prizes.validate_program(program, META, {"locationId": "loc"}, [{
+        "id": "r1", "name": "Coffee", "imageUrl": "https://cdn.kivly.store/verified.png",
+    }], True)
+    assert result["catalog"][1]["imageKey"] == key
+    assert prizes.program_view(result, META)["catalog"][1]["imageUrl"] == "https://signed.test/image.png"
+    assert prizes.image_url(result["catalog"][1], META) == "https://signed.test/image.png"
+    program["catalog"][1]["imageKey"] = None
+    cleared = prizes.validate_program(program, META, {"locationId": "loc"}, [{
+        "id": "r1", "name": "Coffee", "imageUrl": "https://cdn.kivly.store/verified.png",
+    }], True)
+    assert prizes.program_view(cleared, META)["catalog"][1]["imageUrl"] is None
+
+
+@pytest.mark.parametrize("key", [
+    "games/other/ABC123/ranking/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.png",
+    "games/owner/XYZ789/ranking/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.png",
+    "games/staged/owner/ABC123/ranking/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.png",
+    "https://untrusted.test/image.png", "", 123,
+])
+def test_kivly_prize_rejects_unverified_image_keys(key):
+    program = deepcopy(PROGRAM)
+    program["catalog"][1]["imageKey"] = key
+    with pytest.raises(prizes.PrizeError, match="InvalidStackPrizeImage"):
+        prizes.validate_program(program, META, {"locationId": "loc"}, [{"id": "r1", "name": "Coffee"}], True)
+
+
+def test_owner_save_promotes_kivly_upload_and_returns_fresh_image(rig, monkeypatch):
+    from stand_common import stack_prize_api
+    conn = {"locationId": "loc", "ownerId": "business"}
+    client = MagicMock()
+    client.list_rewards.return_value = [{"id": "r1", "name": "Coffee"}]
+    monkeypatch.setattr(stack_prize_api.registration, "connection", lambda *_: conn)
+    monkeypatch.setattr(stack_prize_api.registration, "account_game_settings", lambda *_: {"enabled": True})
+    monkeypatch.setattr(stack_prize_api.registration, "_client", lambda *_: client)
+    s3 = MagicMock()
+    s3.generate_presigned_url.side_effect = lambda _, **kw: "signed:" + kw["Params"]["Key"]
+    monkeypatch.setattr(prizes.boto3, "client", lambda _: s3)
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    staged = "games/staged/owner/ABC123/ranking/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.png"
+    program = deepcopy(PROGRAM)
+    program["catalog"][1]["imageKey"] = staged
+    read_image = MagicMock(return_value=b"verified-png")
+    event = {"requestContext": {"authorizer": {"jwt": {"claims": {"sub": "owner"}}}},
+             "body": json.dumps({"gameId": "ABC123", "program": program})}
+    response = stack_prize_api.handle(event, "PUT", rig, lambda _: True, read_image)
+    assert response["statusCode"] == 200, response
+    saved = meta(rig)["stackPrizeProgram"]["catalog"][1]
+    assert saved["imageKey"].startswith("games/owner/ABC123/ranking/")
+    read_image.assert_called_once_with(staged)
+    s3.put_object.assert_called_once_with(
+        Bucket="media", Key=saved["imageKey"], Body=b"verified-png", ContentType="image/png",
+    )
+    assert json.loads(response["body"])["program"]["catalog"][1]["imageUrl"] == "signed:" + saved["imageKey"]
+
+
 @pytest.mark.parametrize("url", ["http://example.kivly.store", "https://kivly.store.attacker.test",
                                 "https://user:pass@example.kivly.store", "https://example.kivly.store/add-to-wallet",
                                 "https://example.kivly.store?customer_id=x", "https://example.kivly.store:444",
