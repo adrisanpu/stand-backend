@@ -11,7 +11,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from stand_common.kivly import KivlyClient, KivlyError
-from stand_common.utils import _iso_now, log
+from stand_common.utils import _iso_now, is_valid_phone, log
 
 
 class RegistrationError(Exception):
@@ -179,6 +179,12 @@ def _required_connection(dynamo, meta):
     return conn
 
 
+def _log_upstream_failure(stage, error):
+    log("kivly_registration_request_failed", {
+        "stage": stage, "code": error.code, "httpStatus": error.http_status,
+    })
+
+
 def ensure_membership(dynamo, meta, values):
     try:
         return _ensure_membership(dynamo, meta, values)
@@ -195,46 +201,72 @@ def _ensure_membership(dynamo, meta, values):
     table = _table(dynamo)
     key = _identity(meta, conn, values["email"])
     record = table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")
-    if record and record.get("state") == "confirmed":
+    confirmed = record is not None and record.get("state") == "confirmed"
+    if confirmed:
         if not isinstance(record.get("customerId"), str) or not record["customerId"]:
             raise RegistrationError("KivlyReconciliationRequired", 409)
-        return _membership(settings, record["customerId"])
-    if record and (record.get("state") != "creating" or not record.get("externalId")):
+    elif record and (record.get("state") != "creating" or not record.get("externalId")):
         raise RegistrationError("KivlyReconciliationRequired", 409)
     client = _client(conn)
-    customer = client.find_customer(conn["locationId"], conn["ownerId"], values["email"])
-    if record:
+    try:
+        customer = client.find_customer(conn["locationId"], conn["ownerId"], values["email"])
+    except KivlyError as exc:
+        _log_upstream_failure("customer_lookup", exc)
+        raise
+    log("kivly_registration_lookup_completed", {
+        "stage": "customer_lookup", "found": customer is not None,
+    })
+    if record and not confirmed:
         # Recover a lost POST response only through the exact attempt identity.
         if not customer or customer.get("external_id") != record.get("externalId"):
             raise RegistrationError("KivlyReconciliationRequired", 409)
     elif customer is None:
-        record = {"id": key, "state": "creating", "externalId": "stand-" + uuid.uuid4().hex, "createdAt": _iso_now()}
+        if os.environ.get("KIVLY_EXTERNAL_WRITES_ENABLED", "true").lower() != "true":
+            log("kivly_registration_write_blocked", {
+                "stage": "customer_create", "code": "KivlyWritesDisabled",
+            })
+            raise RegistrationError("KivlyWritesDisabled", 503)
+        intent = {"id": key, "state": "creating", "externalId": "stand-" + uuid.uuid4().hex, "createdAt": _iso_now()}
         try:
-            table.put_item(Item=record, ConditionExpression="attribute_not_exists(id)")
+            if confirmed:
+                # Only a complete lookup may replace a confirmed but deleted customer.
+                table.put_item(
+                    Item=intent, ConditionExpression="#s = :confirmed AND customerId = :previous",
+                    ExpressionAttributeNames={"#s": "state"},
+                    ExpressionAttributeValues={":confirmed": "confirmed", ":previous": record["customerId"]},
+                )
+            else:
+                table.put_item(Item=intent, ConditionExpression="attribute_not_exists(id)")
         except ClientError as exc:
             if _code(exc) == "ConditionalCheckFailedException":
                 raise RegistrationError("KivlyRegistrationBusy", 409) from None
             raise
+        record, confirmed = intent, False
         try:
             customer = client.create_customer(
                 conn["locationId"], conn["ownerId"], values["username"], values["email"], record["externalId"],
                 **({"phone": values["phone"]} if values.get("phone") else {}),
             )
-        except KivlyError:
+        except KivlyError as exc:
             # The intent is never removed or expired, even if the response was lost.
+            _log_upstream_failure("customer_create", exc)
             raise RegistrationError("KivlyReconciliationRequired", 409) from None
     if customer.get("is_active") is not True:
         raise RegistrationError("KivlyCustomerInvalid", 409)
     # Existing customers are reused, never modified. Concurrent lookups of an
     # existing customer can safely converge on the same confirmed identity.
     if record:
+        condition = ("#s = :expected AND customerId = :previous" if confirmed
+                     else "#s = :expected AND externalId = :external")
+        previous = ({":previous": record["customerId"]} if confirmed
+                    else {":external": record["externalId"]})
         table.update_item(
             Key={"id": key},
             UpdateExpression="SET #s = :s, customerId = :c, confirmedAt = :at",
-            ConditionExpression="externalId = :external",
+            ConditionExpression=condition,
             ExpressionAttributeNames={"#s": "state"},
             ExpressionAttributeValues={":s": "confirmed", ":c": customer["id"], ":at": _iso_now(),
-                                       ":external": record["externalId"]},
+                                       ":expected": "confirmed" if confirmed else "creating", **previous},
         )
     else:
         try:
@@ -250,7 +282,13 @@ def _ensure_membership(dynamo, meta, values):
     current = _required_connection(dynamo, meta)
     if current["version"] != conn["version"]:
         raise RegistrationError("KivlyConnectionChanged", 409)
-    return _membership(settings, customer["id"])
+    membership = _membership(settings, customer["id"])
+    phone = customer.get("phone")
+    if is_valid_phone(phone):
+        membership["phone"] = phone
+    else:
+        log("kivly_customer_phone_unavailable", {"code": "KivlyPhoneRequired"})
+    return membership
 
 
 def _membership(settings, customer_id):
@@ -282,7 +320,9 @@ def error_response(error):
         status, code = error.status, error.code
     else:
         status, code = 503, "KivlyUnavailable"
-    log("kivly_operation_failed", {"code": code})
+    log("kivly_operation_failed", {
+        "code": code, "httpStatus": error.http_status if isinstance(error, KivlyError) else None,
+    })
     payload = {"ok": False, "error": code}
     if isinstance(error, (KivlyError, RegistrationError)) and error.retry_after is not None:
         payload["retryAfter"] = error.retry_after

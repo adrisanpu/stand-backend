@@ -8,7 +8,8 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _resp, _iso_now, _as_int, get_game_type_blob
+from stand_common.utils import log, _resp, _iso_now, _as_int, get_game_type_blob, _get_claims
+from stand_common import stack_prizes
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -93,7 +94,7 @@ def _player_display_name(it: dict, player_id: int) -> str:
 # ----------------- Dynamo helpers -----------------
 
 def _get_game(game_id: str):
-    resp = games_table.get_item(Key={"gameId": game_id})
+    resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
     return resp.get("Item")
 
 
@@ -264,6 +265,33 @@ def lambda_handler(event, context):
         if not game_type:
             return _resp(500, {"ok": False, "error": "MissingGameType"})
 
+        if game_type == "STACK" and "stackPrizeProgram" in game:
+            if _get_claims(event).get("sub") != game.get("ownerUserId"):
+                return _resp(403, {"ok": False, "error": "Forbidden"})
+            if game.get("stackPrizeState", "open") != "open":
+                return _resp(409, {"ok": False, "error": "StackClosing"})
+            if n_winners > 100:
+                return _resp(400, {"ok": False, "error": "InvalidNumberOfWinners"})
+            previous = game.get("raffleWinners") or []
+            won = {int(w["playerId"]) for w in previous}
+            pool = [p for p in stack_prizes.players(dynamo_r, game_id)
+                    if int(p["playerId"]) not in won
+                    and get_game_type_blob(p, "STACK").get("attempt", {}).get("status") != "excluded" and (
+                        not only_validated or get_game_type_blob(p, "STACK").get("attempt", {}).get("status") == "finished")]
+            selected = random.sample(pool, min(len(pool), n_winners))
+            winners = [{"playerId": int(p["playerId"]), "username": _player_display_name(p, p["playerId"]),
+                        "wonAt": _iso_now()} for p in selected]
+            if winners:
+                task = stack_prizes.job(game, "raffle", [
+                    {"playerId": w["playerId"], "rank": len(previous) + i}
+                    for i, w in enumerate(winners, 1)
+                ])
+                stack_prizes.transact(dynamo_r, [
+                    stack_prizes.game_update(game, ", raffleWinners = :w", {":w": previous + winners}),
+                    stack_prizes.put(task),
+                ])
+            return _resp(200, {"ok": True, "gameId": game_id, "winners": [w["username"] for w in winners]})
+
         # 1) all players → base set for selección
         all_items = _query_all_players(game_id)
 
@@ -356,6 +384,8 @@ def lambda_handler(event, context):
             "candidatePlayers": candidates_count,
         })
 
+    except stack_prizes.PrizeError as exc:
+        return _resp(exc.status, {"ok": False, "error": exc.code})
     except ClientError as e:
         log("raffle_dynamo_error", {"error": str(e)})
         return _resp(500, {"ok": False, "error": "DynamoError", "detail": str(e)})

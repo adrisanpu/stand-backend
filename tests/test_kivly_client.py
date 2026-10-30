@@ -42,6 +42,19 @@ def customer_page(rows, *, page=1, total=None, has_next=False):
     }
 
 
+@pytest.mark.parametrize("image,expected", [
+    ("https://cdn.kivly.store/rewards/coffee.png", "https://cdn.kivly.store/rewards/coffee.png"),
+    (None, None), ("javascript:alert(1)", None), ("http://cdn.test/image.png", None),
+    ("https://user:password@cdn.test/image.png", None), ("https://[invalid", None),
+])
+def test_reward_catalog_only_maps_safe_documented_image_field(client, monkeypatch, image, expected):
+    result = customer_page([{"id": "coffee", "title": "Coffee", "status": "active",
+                             "image": image, "imageUrl": "https://invented.test/ignore.png"}])
+    monkeypatch.setattr(client, "_scoped_request", lambda *_: result)
+    rewards = client.list_rewards("location", "owner")
+    assert rewards[0].get("imageUrl") == expected
+
+
 def test_authentication_cache_is_private_and_reused(client, monkeypatch):
     request = MagicMock(return_value=token_response())
     monkeypatch.setattr(client, "_request", request)

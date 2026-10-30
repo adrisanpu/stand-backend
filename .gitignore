@@ -51,4 +51,3 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-.kivly-registration-probe.lock

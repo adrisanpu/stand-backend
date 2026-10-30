@@ -37,10 +37,26 @@ Parameters:
     NoEcho: true
     Description: Required private HMAC secret (at least 32 characters) for participant sessions
 
+  KivlyExternalWritesEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Allow Kivly customer creation and reward assignment
+
   EmailSenderAddress:
     Type: String
     Default: no-reply@playstand.app
-    Description: Verified SES From address for participant email verification
+    Description: Verified SES From address for participant verification and reward emails
+
+  StackRewardEmailEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable STACK reward email after SES setup and authorized Kivly QR acceptance
 
   EmailIdentityName:
     Type: String
@@ -64,9 +80,110 @@ Globals:
         CATALOG_TABLE: !Ref StandProdCatalogTable
         STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
         PLAYER_TOKEN_SECRET: !Ref PlayerTokenSecret
+        STACK_PRIZES_TABLE: !Ref StandStackPrizesTable
+        KIVLY_EXTERNAL_WRITES_ENABLED: !Ref KivlyExternalWritesEnabled
+        STACK_REWARD_EMAIL_ENABLED: !Ref StackRewardEmailEnabled
 
 
 Resources:
+
+  StandStackPrizesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "stand-${Environment}-stack-prizes"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: gameId
+          AttributeType: S
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: work
+          AttributeType: S
+        - AttributeName: dueAt
+          AttributeType: N
+      KeySchema:
+        - AttributeName: gameId
+          KeyType: HASH
+        - AttributeName: id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: pending-work
+          KeySchema:
+            - AttributeName: work
+              KeyType: HASH
+            - AttributeName: dueAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  StandStackPrizeDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  StandStackPrizeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      VisibilityTimeout: 360
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt StandStackPrizeDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  StandStackPrizeDelivery:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stand-${Environment}-stack-prize-delivery"
+      CodeUri: src/stand_stack_prize_delivery/
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
+          EMAIL_SENDER_ADDRESS: !Ref EmailSenderAddress
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StandStackPrizesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StandProdGameTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StandProdGameplayerTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StandProdUserTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt StandStackPrizeQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+            - Effect: Allow
+              Action: ses:SendRawEmail
+              Resource: !Sub "arn:${AWS::Partition}:ses:us-east-1:${AWS::AccountId}:identity/${EmailIdentityName}"
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref EmailSenderAddress
+      Events:
+        RecoverOutbox:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+        Deliver:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt StandStackPrizeQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
 # =========================
 # IAM ROLE (Lambda execution)
@@ -147,6 +264,12 @@ Resources:
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdCatalogTable
               - !GetAtt StandEmailVerificationTable.Arn
+              - !GetAtt StandStackPrizesTable.Arn
+              - !Sub "${StandStackPrizesTable.Arn}/index/pending-work"
+          - Sid: StackPrizeEnqueue
+            Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt StandStackPrizeQueue.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -688,6 +811,24 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/kivly/rewards
             Method: GET
+        StackPrizesGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/stack/prizes
+            Method: GET
+        StackPrizesPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/stack/prizes
+            Method: PUT
+        StackPrizesClose:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/stack/prizes
+            Method: POST
 
   StandProdGameFnAssign:
     Type: AWS::Serverless::Function
@@ -866,6 +1007,7 @@ Resources:
       Environment:
         Variables:
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
+          STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
       Events:
         ScoreGet:
           Type: HttpApi

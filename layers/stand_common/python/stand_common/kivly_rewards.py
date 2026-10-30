@@ -64,16 +64,20 @@ def completion_reward(dynamo, meta, player):
     if record:
         if record["state"] != "confirmed":
             return _result(record)
+        if not record.get("redemptionId"):
+            return _result(record)
         rows = client.customer_rewards(conn["locationId"], conn["ownerId"], customer_id)
         redemption = next((row for row in rows if row["id"] == record["redemptionId"]
                            and row["reward_id"] == record["rewardId"]), None)
-        if not redemption:
-            raise registration.RegistrationError("KivlyRewardNotFound", 409)
         return _result(record, redemption)
 
     if not any(item["id"] == reward["id"] for item in client.list_rewards(conn["locationId"], conn["ownerId"])):
         raise registration.RegistrationError("KivlyRewardUnavailable", 409)
-    before = {row["id"] for row in client.customer_rewards(conn["locationId"], conn["ownerId"], customer_id)}
+    try:
+        before = {row["id"] for row in client.customer_rewards(conn["locationId"], conn["ownerId"], customer_id)}
+    except registration.KivlyError as exc:
+        registration._log_upstream_failure("pre_earn_lookup", exc)
+        before = set()
     record = {"id": key, "state": "pending", "rewardId": reward["id"], "name": reward["name"],
               "locationId": conn["locationId"], "customerId": customer_id, "createdAt": _iso_now()}
     try:
@@ -84,23 +88,32 @@ def completion_reward(dynamo, meta, player):
         raise
     try:
         client.earn_reward(conn["locationId"], conn["ownerId"], customer_id, reward["id"])
-        rows = client.customer_rewards(conn["locationId"], conn["ownerId"], customer_id)
-        new = [row for row in rows if row["id"] not in before and row["reward_id"] == reward["id"]]
-        if len(new) != 1:
-            registration.error_response(registration.RegistrationError("KivlyRewardReconciliationRequired", 409))
-            return _result(record)
+        redemption = None
+        try:
+            rows = client.customer_rewards(conn["locationId"], conn["ownerId"], customer_id)
+        except registration.KivlyError as exc:
+            registration._log_upstream_failure("post_earn_lookup", exc)
+        else:
+            new = [row for row in rows if row["id"] not in before and row["reward_id"] == reward["id"]]
+            if len(new) == 1:
+                redemption = new[0]
         current = registration._required_connection(dynamo, meta)
         if current["version"] != conn["version"]:
             raise registration.RegistrationError("KivlyConnectionChanged", 409)
+        update = "SET #s = :s REMOVE redemptionId"
+        values = {":s": "confirmed", ":pending": "pending", ":reward": reward["id"]}
+        if redemption:
+            update = "SET #s = :s, redemptionId = :r"
+            values[":r"] = redemption["id"]
         table.update_item(
-            Key={"id": key}, UpdateExpression="SET #s = :s, redemptionId = :r",
+            Key={"id": key}, UpdateExpression=update,
             ConditionExpression="#s = :pending AND rewardId = :reward",
             ExpressionAttributeNames={"#s": "state"},
-            ExpressionAttributeValues={":s": "confirmed", ":r": new[0]["id"],
-                                       ":pending": "pending", ":reward": reward["id"]},
+            ExpressionAttributeValues=values,
         )
     except registration.ERRORS as exc:
         # A successful-looking response is not enough; the reservation survives all uncertainty.
         registration.error_response(exc)
         return _result(record)
-    return _result({**record, "state": "confirmed"}, new[0])
+    return _result({**record, "state": "confirmed",
+                    **({"redemptionId": redemption["id"]} if redemption else {})}, redemption)

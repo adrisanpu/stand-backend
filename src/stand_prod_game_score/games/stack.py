@@ -1,7 +1,10 @@
 """Atomic single-attempt STACK lifecycle."""
 import re
+import os
+import boto3
 
 from botocore.exceptions import ClientError
+from stand_common import stack_prizes
 from stand_common.stack import CONFIG_VERSION, game_config, replay, player_rank
 from stand_common.utils import _iso_now, _parse_iso, get_game_type_blob
 
@@ -30,7 +33,7 @@ def _finished_success(game_id, player_id, player, gp_table):
         "attemptId": attempt["attemptId"], "status": "finished",
         "configVersion": attempt["configVersion"], "score": blob["score"],
         "scoreUpdatedAt": blob["scoreUpdatedAt"], "finishedAt": attempt["finishedAt"],
-        "rank": player_rank(game_id, player_id, gp_table),
+        "rank": blob.get("rankAtFinish") if "rankAtFinish" in blob else player_rank(game_id, player_id, gp_table),
     }
 
 
@@ -47,7 +50,7 @@ def _existing_result(game_id: str, player_id: int, player: dict, attempt_id: str
     return None
 
 
-def _finish(game_id, player_id, player, gp_table, payload):
+def _finish(game_id, player_id, player, gp_table, payload, meta=None):
     blob = get_game_type_blob(player, "STACK")
     attempt = blob.get("attempt")
     if not attempt:
@@ -74,6 +77,14 @@ def _finish(game_id, player_id, player, gp_table, payload):
     final_attempt = {
         **attempt, "status": "finished", "finishedAt": now, "evidenceHash": evidence_hash,
     }
+    if "prizeProgram" in attempt:
+        try:
+            rank = stack_prizes.finish(boto3.resource("dynamodb"), meta, player, final_attempt, score)
+        except stack_prizes.PrizeError as exc:
+            return {"ok": False, "error": exc.code}
+        return {"ok": True, "gameId": game_id, "playerId": player_id,
+                "attemptId": attempt["attemptId"], "status": "finished", "configVersion": CONFIG_VERSION,
+                "score": score, "scoreUpdatedAt": now, "finishedAt": now, "rank": rank}
     key = {"gameId": game_id, "playerId": player_id}
     try:
         gp_table.update_item(
@@ -112,6 +123,10 @@ def _finish(game_id, player_id, player, gp_table, payload):
 
 
 def store_score(game_id: str, gp_table, payload: dict, game_meta: dict) -> dict:
+    if os.environ.get("STACK_PRIZES_TABLE"):
+        game_meta = boto3.resource("dynamodb").Table(os.environ["GAMES_TABLE"]).get_item(
+            Key={"gameId": game_id}, ConsistentRead=True,
+        )["Item"]
     action = payload.get("action")
     if action not in ("start", "finish"):
         return {"ok": False, "error": "InvalidStackAction"}
@@ -131,7 +146,7 @@ def store_score(game_id: str, gp_table, payload: dict, game_meta: dict) -> dict:
     if not player:
         return {"ok": False, "error": "PlayerNotFound"}
     if action == "finish":
-        return _finish(game_id, player_id, player, gp_table, payload)
+        return _finish(game_id, player_id, player, gp_table, payload, game_meta)
     existing = _existing_result(game_id, player_id, player, attempt_id, gp_table)
     if existing:
         return existing
@@ -146,6 +161,12 @@ def store_score(game_id: str, gp_table, payload: dict, game_meta: dict) -> dict:
         "configVersion": CONFIG_VERSION,
         "configSnapshot": config,
     }
+    if "stackPrizeProgram" in game_meta or os.environ.get("STACK_PRIZES_TABLE"):
+        try:
+            stack_prizes.start(boto3.resource("dynamodb"), game_meta, player, attempt)
+        except stack_prizes.PrizeError as exc:
+            return {"ok": False, "error": exc.code}
+        return _success(game_id, player_id, attempt)
     # Web join initializes both maps. The single conditional write selects the
     # winner even when two starts read the same unused participant concurrently.
     try:

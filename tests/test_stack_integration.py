@@ -165,7 +165,7 @@ def test_web_join_creates_identity_but_no_attempt_and_dedup_recovers(verified_we
          patch.object(assign_mod, "PLAYER_TOKEN_SECRET", SECRET):
         result = assign_mod._handle_web_assign({
             "game_id": "ABCDEF", "email": "ana@example.com", "source": "web",
-            "username": "Ana",
+            "username": "Ana", "phone": "+34 612345678",
         })
     assert result["ok"] is True
     assert result["assignment"] == {
@@ -184,6 +184,7 @@ def test_web_join_creates_identity_but_no_attempt_and_dedup_recovers(verified_we
          patch.object(assign_mod, "_put_player") as put_mock:
         recovered = assign_mod._handle_web_assign({
             "game_id": "ABCDEF", "email": "ana@example.com", "username": "Different registration name",
+            "phone": "+34 612345678",
         })
     assert recovered["already_joined"] is True
     assert recovered["assignment"]["attempt"]["attemptId"] == "old-start"
@@ -198,7 +199,7 @@ def test_public_join_forwards_stack_assignment():
          patch.object(public_mod, "_get_game", return_value=META), \
          patch.object(public_mod, "verification_table"), \
          patch.object(public_mod, "confirm_code", return_value=({
-             "registration": {"email": "ana@example.com", "username": "Ana"},
+             "registration": {"email": "ana@example.com", "username": "Ana", "phone": "+34 612345678"},
          }, "receipt")), \
          patch.object(public_mod, "_invoke_assign_web", return_value=result):
         response = public_mod._handle_join({"body": json.dumps({
@@ -299,7 +300,7 @@ def test_public_score_dispatcher_and_recover_end_to_end_offline(monkeypatch, ver
              patch.object(assign_mod, "gp_table", table), \
              patch.object(assign_mod, "_put_player") as put:
             rejoin = assign_mod._handle_web_assign({
-                "game_id": "ABCDEF", "email": "ana@example.com", "username": "Ana",
+                "game_id": "ABCDEF", "email": "ana@example.com", "username": "Ana", "phone": "+34 612345678",
             })
         assert rejoin["assignment"] == recovered
         put.assert_not_called()

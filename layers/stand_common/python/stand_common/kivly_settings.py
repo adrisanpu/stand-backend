@@ -10,6 +10,7 @@ from botocore.exceptions import ClientError
 from stand_common import kivly_registration as registration
 from stand_common.kivly import KivlyClient
 from stand_common.kivly_rewards import configured_reward
+from stand_common import stack_prizes
 from stand_common.utils import _get_claims, _read_json_body, _resp, log
 
 
@@ -124,12 +125,22 @@ def handle_account(event, method, dynamo):
             if not conn:
                 return _resp(409, {"ok": False, "error": "KivlyConnectionRequired"})
             raw = body["clubSettings"]
-            if not isinstance(raw, dict) or set(raw) != {"clubName", "privacyUrl", "termsUrl"}:
+            if (not isinstance(raw, dict)
+                    or not {"clubName", "privacyUrl", "termsUrl"} <= set(raw)
+                    or set(raw) - {"clubName", "privacyUrl", "termsUrl", "storefrontUrl"}):
                 return _resp(400, {"ok": False, "error": "KivlyConfigurationInvalid"})
             if set(body) != {"clubSettings"}:
                 return _resp(400, {"ok": False, "error": "InvalidRequest"})
             settings = registration.prepare_settings({}, {**raw, "enabled": False}, None)
             club = {key: settings[key] for key in ("clubName", "privacyUrl", "termsUrl")}
+            if "storefrontUrl" in raw:
+                try:
+                    value = raw["storefrontUrl"]
+                    club["storefrontUrl"] = stack_prizes.storefront(value) if value != "" else ""
+                except stack_prizes.PrizeError as exc:
+                    return _resp(exc.status, {"ok": False, "error": exc.code})
+            elif "storefrontUrl" in (conn.get("clubSettings") or {}):
+                club["storefrontUrl"] = conn["clubSettings"]["storefrontUrl"]
             registration.account_game_settings({"gameType": "STACK"}, {**conn, "clubSettings": club})
             dynamo.Table(os.environ["USERS_TABLE"]).update_item(
                 Key={"userId": owner},

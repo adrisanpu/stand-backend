@@ -8,17 +8,19 @@ RULET4 and other non-STACK games do not request club consent or call Kivly in
 their public registration, session or gameplay flows, even when old game data
 contains a Kivly flag.
 
-The general form policy is independent of Kivly: full name (`username`),
-mandatory verified email, and optional phone when `phone.enabled` is true.
+The general form policy is independent of Kivly: full name (`username`) and
+mandatory verified email. STACK also requires phone for both wallet and email;
+other games retain optional phone when `phone.enabled` is true.
 The existing public join support remains EMPAREJA2, T1MER, STACK and RULET4;
 this feature does not introduce new game-specific join implementations.
 
-STACK can select one existing Kivly reward for every participant who finishes,
-including a zero score. After the server confirms the saved result, the public
-participant can check the reward status and use only Wallet URLs returned by
-Kivly. This extension does not create rewards, redeem them, mark them used, or
-generate passes. The reward/Wallet extension is local and pending review; its
-presence here is not evidence that it has been deployed or externally verified.
+STACK supports textual rules combining existing Kivly rewards and game-local
+STAND prizes. Earned STAND units have individual collection QRs; Kivly units are
+assigned server-side, including awards decided after the participant leaves.
+The club card is added through the business's official Kivly storefront.
+This extension does not create rewards, redeem Kivly rewards, mark them used,
+generate passes or push updates to devices. Its presence here is not evidence
+that it has been deployed or that installed-wallet propagation is verified.
 
 ## Organizer API (Cognito authenticated)
 
@@ -102,6 +104,18 @@ Saving this object does not replace credentials. Success is `{"ok":true}`.
 No connection returns HTTP 409 `KivlyConnectionRequired`. There is no per-game
 enable switch. The scope remains STACK even though details are account-wide.
 
+`clubSettings` also accepts optional `storefrontUrl: string`. Save only an HTTPS
+`*.kivly.store` origin (maximum 300 characters), without credentials, path, query,
+fragment or nonstandard port; a trailing slash is normalized away.
+GET returns the saved key inside `connection.clubSettings`. It is shared by all
+STACK games and overrides their legacy program URLs. Omitting it preserves an
+already saved shared value; `""` explicitly disables all wallet links rather than
+restoring game fallbacks. Until the key has ever been saved, use the individual
+game's legacy URL. No old URL is automatically selected for the account.
+Changing only the storefront does not change `consentVersion`, invalidate an
+email challenge, or invalidate registered membership. Legal name/URLs and location
+remain the inputs to consent versioning.
+
 ### Disconnect: `DELETE /v1/kivly`
 
 Returns `{"ok":true}` (idempotent if already disconnected), optionally with the
@@ -130,7 +144,8 @@ STACK integration adds:
 Missing connection, missing club details, demo-disabled settings and all
 non-STACK games omit `loyalty`; do not show club consent in those cases.
 Public field metadata always resolves email to `{"required":true}` and phone to
-`{"required":false,"enabled":true|false}`, including legacy game configuration.
+`{"required":true,"enabled":true}` for STACK, including legacy configuration.
+Other games retain `{"required":false,"enabled":true|false}`.
 There is no public customer ID, location ID or credential in `loyalty`.
 
 ### Request email challenge
@@ -150,8 +165,12 @@ There is no public customer ID, location ID or credential in `loyalty`.
 ```
 
 `username` is trimmed, nonempty and at most 100 Unicode characters; control
-characters are rejected. Email is mandatory, validated and normalized. Phone is
-optional, trimmed and limited to 64 characters; it is ignored when disabled.
+characters are rejected. Email is mandatory, validated and normalized. STACK
+phone is mandatory, trimmed, at most 64 characters, with at least three ASCII
+digits and only an optional leading `+`, digits, spaces, parentheses or hyphens.
+STACK settings cannot disable phone or make it optional. Other games keep
+optional phone, ignored when disabled. Existing valid sessions are not revoked
+solely because they predate required phone.
 `consent: true` is the general STAND consent. For enabled STACK club registration,
 the participant must additionally agree to the displayed club legal details;
 only then send their exact `loyaltyConsentVersion`. Missing/stale club consent
@@ -192,8 +211,11 @@ The successful response remains the existing PlayerResponse:
 assignment has no started attempt (`assignment.attempt: null`). Persist the
 returned player token, not email/code/credentials. Repeating a valid confirmation
 recovers the same player without consuming another slot or renaming them.
-Optional phone is passed to Kivly only on new customer creation; an existing
+Phone is passed to Kivly only on new customer creation; an existing
 customer is reused without modifying its name, email, phone or other data.
+The private membership stores its valid Kivly phone when returned, never a
+substitute from the form. Missing Kivly phone is logged by safe code only;
+registration remains possible but email delivery reports `KivlyPhoneRequired`.
 
 STACK session/access recovery and gameplay check membership against the current
 location/consent version. HTTP 403 `KivlyMembershipRequired` means discard the
@@ -207,15 +229,26 @@ The dedicated `stand-{env}-kivly-registration-table` uses a private HMAC identit
 scoped to organizer, authorized location and normalized email. It is retained
 with point-in-time recovery and deliberately has **no TTL**.
 
-1. Look up a previously confirmed identity.
-2. Otherwise perform a complete, bounded customer listing (at most five pages
-   of 100) and match the verified email case-insensitively.
+1. Read the saved identity, including any unresolved creation intent.
+2. Perform a complete, bounded customer listing (at most five pages of 100)
+   and match the verified email case-insensitively, even for confirmed identities.
 3. Reuse exactly one active match. Never update an existing customer. Duplicate,
    malformed, incomplete or oversized listings fail closed.
 4. If absent, conditionally persist `creating` plus a random `externalId`
    **before** issuing a single customer POST.
 5. Confirm the active returned customer and exact attempt identity. Persist
    confirmation before granting membership, and recheck the account connection.
+
+Deleting a STAND player removes that event's participant (including its stored
+membership) and verified-email mapping. The same email can rejoin with a fresh
+verification and consent, under a new player ID; old player tokens cannot recover
+the replacement. It never deletes Kivly customers, rewards or other events'
+participants. Shared registration records remain to protect unresolved writes.
+On registration, an active customer is reused without modification. If a
+previously confirmed customer was deleted externally, a complete lookup proving
+absence permits a conditional replacement of that confirmed record with one new
+creation intent. Concurrent joins cannot issue a second POST; an uncertain
+creation intent is never reset by deleting a participant.
 
 An uncertain POST result leaves its intent permanently recorded. Retrying may
 confirm an existing customer only if its `external_id` exactly matches that
@@ -234,27 +267,200 @@ uncertain creation, or invalid customer; HTTP 429 includes rate limiting; HTTP
 numeric `retryAfter` may be included. Do not automatically replay writes on
 network failures. Existing email rate limits, expiry and attempt caps still apply.
 
-## STACK completion rewards and Wallet
+## STACK prize rules, delivery and Wallet
 
 The owner-only `GET /v1/game/kivly/rewards?gameId=...` lists the connected
-location's active rewards. `GET /v1/game/kivly?gameId=...` reads the selected
-reward, and `PUT /v1/game/kivly` accepts `{gameId, rewardId}`; `rewardId: null`
-clears it. These endpoints reject non-STACK games and rewards outside the
-connected Kivly location.
+location's active rewards. The new owner endpoint is
+`/v1/game/stack/prizes`: GET takes `gameId` in the query; PUT accepts
+`{gameId, program}`; POST accepts `{gameId, excludePlayerIds: []}` to request or
+progress definitive closure. All reject other owners and non-STACK games.
 
-After the STACK result is durably finished, `POST /v1/public/kivly/reward`
-accepts `{gameId, playerToken}`. A durable per-player reservation prevents a
-second `earn` after an uncertain write. Responses have status `none`, `pending`
-or `confirmed`; confirmed results may include only Kivly-returned Apple/Google
-Wallet URLs from approved HTTPS hosts. The integration uses `earn`, never
-`redeem` or `mark-used`. It does not generate Wallet passes. Do not repeat an
-uncertain assignment; it requires operator reconciliation.
+GET and successful PUT return normalized `program` with `version: 3`,
+`storefrontUrl`, `deliveryChannel`, `catalog` and `rules`. The retained program URL is a
+read-compatible effective value; saving a game does not update the account.
+Catalog entries have a local `id`, `source` (`stand` or `kivly`), `name` and
+`stockTotal` (Y, 1-1,000); STAND accepts an optional verified PNG `imageKey`,
+while Kivly binds a real `rewardId` and the connected `locationId`. Rules
+contain a stable `id`, `condition`, `groups: {allocations: {prizeId, quantity}[]}[]`
+and, for ranking conditions, `topX` (1-100). Version 3 has no `mode` or flat
+`allocations`. Limits are 32 catalog entries, eight rules, eight groups per rule,
+eight unique prize allocations per group and quantities 1-10. The same prize can
+appear in different groups. At most one group (80 units maximum) is reserved in
+one rule transaction, unchanged from the previous AND allocation bound.
+Both old input formats remain accepted: version 1 becomes one group with X=1 and
+Y=1,000; version-2 `all` becomes one group and `random_one` becomes singleton
+groups, preserving quantities. Normalization preserves catalog/rule IDs and
+compares normalized old/new rules before identity checks, so a format-only save
+neither changes identity nor causes previously earned prizes to be awarded again.
+
+```json
+{
+  "version": 3,
+  "storefrontUrl": "",
+  "catalog": [{"id":"pizza","source":"stand","name":"Pizza","stockTotal":20}],
+  "rules": [{
+    "id":"completion","condition":"completed",
+    "groups":[{"allocations":[{"prizeId":"pizza","quantity":2}]}]
+  }]
+}
+```
+
+| Condition | Award decision |
+| --- | --- |
+| `completed` | A valid result is saved, including zero points |
+| `top_finish` | Rank when that participant finishes; later scores never revoke the award |
+| `top_final` | Final ranking after definitive closure |
+| `raffle` | Selected raffle winners |
+
+OR chooses uniformly among groups with some rank-eligible remaining stock,
+without weighting by the number of prizes or remaining stock. A single eligible
+group needs no random draw; entirely unavailable groups are excluded.
+AND grants every eligible allocation inside the selected group, partially:
+`min(quantity, remaining stock)` for each prize. No eligible stock means no award.
+Y is one shared event budget per catalog item, consumed
+across all rules; it is a STAND delivery budget for Kivly rewards, not a claim
+about Kivly's own inventory. Stock reservations and per-rule allocation records
+are atomic and idempotent. Attempts snapshot the program at start; finishing
+atomically saves the result and a durable grant job, which then allocates units.
+Changing a rule requires a new rule ID; existing awards keep their original
+prize snapshot.
+
+Unit allocation accepts integral DynamoDB `Decimal` quantities as well as Python
+integers, and rejects fractional, non-finite or out-of-range quantities before
+creating awards. This also applies to previously queued version-2 grant jobs;
+they keep their saved program and idempotent award identities.
+
+Closing blocks new starts but accepts valid finishes for active attempts, even
+if the game is paused. A scheduled worker finalizes automatically once no
+attempts remain. Explicitly excluding pending attempts gives them status
+`excluded`, without score or prizes; late finishes are rejected. Final ranking
+is immutable, and player deletion is blocked while closing/closed.
+The existing unified close POST also works before any program has been saved,
+initializing a normalized legacy program in the same transaction that begins
+closing. `isActive` is not set false at the start of closing: admitted pending
+attempts can finish. It becomes false atomically with `stackPrizeState: "closed"`
+and the final-award outbox job after all pending attempts finish or are explicitly
+excluded. Final delivery is asynchronous and remains recoverable after closure.
+Generic `PUT /v1/game {isActive:false}` returns `409 StackCloseRequired` for STACK;
+use the close POST instead. Reactivation during/after closure returns
+`409 StackClosing`. Other game types retain their existing active-flag behavior.
+Owner game reads and public result/collection reads remain available after
+definitive STACK closure; new registrations/starts do not.
+
+The retained prize table stores unit awards, allocation records and a durable
+outbox. After the finish transaction commits, the score handler immediately
+enqueues its grant job in FIFO SQS. Committed Kivly unit awards are likewise
+enqueued immediately after allocation, without waiting for the scheduler.
+Enqueue failures are logged and leave the durable outbox pending; a one-minute
+schedule recovers due work into the same queue. Both producers need
+`STACK_PRIZES_QUEUE` and `sqs:SendMessage` permission. Duplicate messages remain
+safe through allocation ledgers and conditional delivery transitions; grant jobs
+process winners in chunks. Owner views show remaining stock, allocation
+outcomes and safe Kivly failure stage/HTTP status.
+Kivly awards move from `queued` to `sending` before `earn`, then to
+`confirmed` when the earn endpoint returns its explicit `success: true`
+acknowledgement. The customer-redemptions endpoint is not a reliable receipt
+for this operation: Kivly can acknowledge an earned Wallet reward while that
+list remains empty, so absence of a new redemption does not negate success.
+Safe failures before `earn` remain queued with delayed retry and owner-visible
+`lastError`, stage and HTTP status. A rejected, malformed or interrupted earn
+becomes `reconciliation_required`, never an automatic second earn. Missing
+participant club binding becomes `connection_required`. Historical
+`reconciliation_required` awards from before acknowledgement-based
+confirmation stay unchanged and require explicit reconciliation; do not replay
+their earn requests.
+
+Public player responses add `stackPrizes`: individual awards, lifecycle state,
+whether final awards are pending, and a `walletUrl` when verified membership
+matches the current connection. STAND tokens bind game, player and award;
+atomic redemption consumes only that unit. Kivly awards never get a STAND redemption token.
+The validator can supply its game ID to reject a QR from a different game.
+
+Configure shared `clubSettings.storefrontUrl` as only the HTTPS business origin, for example
+`https://business.kivly.store`, without customer identifiers, path or query.
+The server builds the official `/add-to-wallet` link from verified membership;
+Kivly offers Apple/Google choices there. No undocumented Apple pass URL is
+constructed. Missing card access is shown explicitly when a club card is
+expected. Installing or refreshing a pass remains Kivly/provider behavior.
+
+### Exclusive wallet or email delivery
+
+The organizer selects `program.deliveryChannel: "wallet" | "email"` per STACK
+game. Omitted values default to wallet; `"both"` and unknown values are rejected.
+The program is snapshotted at attempt start. Changes only affect new attempts,
+including the delivery channel used later for final-ranking and raffle awards;
+existing awards are not resent. Legacy unmanaged attempts keep wallet.
+STAND prizes retain their existing unit QRs in either mode.
+
+Email requires `StackRewardEmailEnabled=true` and an enabled account Kivly
+connection. The parameter defaults to false until SES and an authorized
+real-world QR acceptance test are complete. Owner prize GET returns
+`emailAvailable`; the UI disables email selection when false.
+
+After explicit successful Kivly `earn`, the durable award remains `confirmed`
+and the outbox sends a separate bilingual transactional email through SES.
+The email includes the participant name, prize name, available prize image,
+instructions and a locally generated inline PNG QR. Its payload is exactly
+the phone in Kivly's `CustomerResponse.phone`, following the operator's supplied
+QR specification; it is not a per-award token or proof of identity.
+The worker re-reads the customer by verified email, checks the same customer ID,
+active state and location, and never uses the STAND form phone as a fallback.
+No new Kivly endpoints or client-update operations are introduced.
+
+Kivly staff identify the customer with that QR and handle available rewards and
+redemption in Kivly. The email is not a live balance or proof that a prize
+remains unredeemed. A copy of the QR can identify the same person: staff must
+follow their usual identity procedure. No SMS verification is added.
+
+Public and owner awards expose `deliveryChannel`, `emailState` and a safe
+`emailError`. States are `pending`, `sending`, `accepted`, `failed` and
+`reconciliation_required`, independently of the Kivly assignment state.
+`accepted` means SES accepted the message, not inbox delivery.
+Email-mode player responses have no wallet link or wallet expectation; results
+remain visible without opening/installing a wallet. No phone or QR payload is
+returned publicly.
+
+Throttled sends and failed pre-send Kivly reads retry at most three times.
+An interrupted send, network failure or SES 5xx requires reconciliation, never
+automatic resending. The organizer can POST
+`{"gameId":"ABC123","action":"retry_email","awardId":"award_..."}`
+to `/v1/game/stack/prizes` for a `confirmed` email award with `emailState: failed`,
+even after closure. Fix a missing phone in Kivly first. This resets only the
+notification and never calls `earn` again. Accepted or uncertain sends cannot
+use that retry action; investigate provider evidence before any manual recovery.
+
+Public game metadata and the owner `GET /v1/game` response (by game ID or name)
+expose the same top-level `stackPrizeRules` promotional list:
+`{condition, topX?, names: string[], prizes: {id, name, imageUrl: string|null}[]}[]`.
+Each rule flattens all groups, deduplicating by prize ID; `names` is retained for
+old clients. Zero-limit disabled prizes stay excluded; remaining stock does not
+hide configured promotions. STAND image URLs are fresh one-hour signed URLs for
+committed PNG keys belonging to that owner and game, never client-supplied URLs.
+The documented upstream reward `image` string is optionally mapped to `imageUrl`
+only when it is a safe HTTPS URL. Missing/unsafe images remain absent/null; no
+additional Kivly operation or invented image field is used.
+The owner response also exposes top-level `stackPrizeProgram` in normalized
+version 3 with the shared effective storefront and resolved catalog images, and
+`stackPrizeState`. No additional widget API request is necessary.
+
+### Migration and legacy participants
+
+Opening the editor adapts the old ranking/raffle catalog and completion reward;
+saving enables the new program. Migration is blocked while legacy attempts are
+active. Already finished legacy participants retain their existing claims;
+final jobs do not retroactively award them. Legacy prize stickers are not used
+as promotions for a new program.
+
+The previous `/v1/game/kivly` selection and
+`POST /v1/public/kivly/reward` remain for legacy data. The latter returns `none`
+for managed attempts: viewing/reloading a result must never trigger another
+Kivly earn. New awards are delivered without a browser request.
 
 ## Validation, deployment and live smoke
 
 Automated tests use stateful DynamoDB fakes, fake SES/Lambda invocation and mocked
-Kivly HTTP transport. They cover verified registration, consent binding, optional
-phone, existing-customer reuse, concurrent claims, uncertain POST recovery,
+Kivly HTTP transport. They cover verified registration, consent binding, required
+STACK phone and optional phone elsewhere, existing-customer reuse, concurrent claims, uncertain POST recovery,
 connection changes, and non-STACK isolation. They do **not** prove current live
 Kivly response schemas, business permissions, customer creation or card delivery.
 No live write or credential-based probe is part of packaging.
@@ -274,4 +480,8 @@ An actual STACK registration writes a Kivly customer and must be a separately
 authorized test in a designated business with an approved test email, verified
 email access and agreed retention/cleanup. Do not perform it implicitly as a
 deployment smoke test. Reward/Wallet delivery has not been live-verified and
-requires its own approved test before being relied on.
+requires its own approved test before being relied on: install the official
+card, leave the game, trigger final-ranking/raffle awards, confirm one Kivly
+assignment per unit and check both installed wallet types. Also exercise two
+STAND QRs for the same prize, repeat scans, closing with an active attempt,
+exclusion and a rejected late finish.

@@ -37,7 +37,7 @@ from stand_common.email_verification import (
 from stand_common.prizes import serialize_prize_catalog
 from stand_common.rulet4 import game_config as rulet4_game_config
 from stand_common.rulet4_gameplay import public_assignment as rulet4_assignment, spin as rulet4_spin
-from stand_common import kivly_registration, kivly_rewards
+from stand_common import kivly_registration, kivly_rewards, stack_prizes
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -211,7 +211,9 @@ def _handle_get_game(event):
     item = _get_game(game_id)
     if not item:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
-    if not item.get("isActive", True):
+    closed_stack = (item.get("gameType") == "STACK" and "stackPrizeProgram" in item
+                    and item.get("stackPrizeState") in ("closing", "closed"))
+    if not item.get("isActive", True) and not closed_stack:
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (item.get("gameType") or "").upper()
@@ -259,6 +261,10 @@ def _handle_get_game(event):
         )["results"]
         payload["stackStartSnapshot"] = True
         payload["stackFinishSupported"] = True
+        if "stackPrizeProgram" in item:
+            payload["prizeCatalog"] = {}
+            payload["stackPrizeState"] = item.get("stackPrizeState", "open")
+            payload["stackPrizeRules"] = stack_prizes.promotional_rules(item)
         reward = item.get("kivlyReward")
         if reward and item.get("ownerUserId"):
             reward = kivly_rewards.configured_reward(
@@ -708,7 +714,9 @@ def _handle_score(event):
     meta = _get_game(game_id)
     if not meta:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
-    if not meta.get("isActive", True):
+    closing_finish = (meta.get("gameType") == "STACK" and meta.get("stackPrizeState") == "closing"
+                      and body.get("action") == "finish")
+    if not meta.get("isActive", True) and not closing_finish:
         return _resp(403, {"ok": False, "error": "GameInactive"})
     game_type = (meta.get("gameType") or "").upper()
     if game_type not in ("T1MER", "STACK"):
@@ -800,7 +808,8 @@ def _handle_kivly_reward(event):
     player = _get_player(game_id, claims["playerId"])
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
-    result = kivly_rewards.completion_reward(dynamo_r, meta, player)
+    result = ({"status": "none"} if "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {})
+              else kivly_rewards.completion_reward(dynamo_r, meta, player))
     return _resp(200, _json_sanitize({
         "ok": True, "gameId": game_id, "playerId": claims["playerId"], "reward": result,
     }))
@@ -968,7 +977,10 @@ def _impostor_assignment_from_player(meta: dict, player: dict, game_id: str) -> 
 
 def _player_response(meta: dict, player: dict, game_id: str, player_id: int, token: str):
     """Shared PlayerResponse: {ok, gameId, gameType, playerToken, assignment, prizes}."""
-    kivly_registration.require_player(dynamo_r, meta, player)
+    managed_result = ("prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {})
+                      and get_game_type_blob(player, "STACK").get("attempt", {}).get("status") == "finished")
+    if not managed_result:
+        kivly_registration.require_player(dynamo_r, meta, player)
     game_type = (meta.get("gameType") or "").upper()
     if game_type == "EMPAREJA2":
         assignment = _empareja2_assignment_from_player(player)
@@ -980,7 +992,7 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
         assignment = _impostor_assignment_from_player(meta, player, game_id)
         prizes = []
     elif game_type == "STACK":
-        if not meta.get("isActive", True):
+        if not meta.get("isActive", True) and meta.get("stackPrizeState") not in ("closing", "closed"):
             return _resp(403, {"ok": False, "error": "GameInactive"})
         assignment = stack_public_assignment(player, gp_table, _player_profile_pic_url)
         prizes = _stack_prizes(meta, player, assignment.get("rank"))
@@ -1001,6 +1013,13 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
     }
     if "prizeCatalog" in meta:
         payload["prizeCatalog"] = _public_prize_catalog(meta)
+    if game_type == "STACK" and "stackPrizeProgram" in meta:
+        payload["stackPrizes"] = stack_prizes.public_awards(
+            dynamo_r, meta, player,
+            lambda aid: issue_prize_token(game_id, player_id, "a", PLAYER_TOKEN_SECRET, award_id=aid),
+        )
+        if "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {}):
+            payload["prizes"] = []
     return _resp(200, _json_sanitize(payload))
 
 
@@ -1045,11 +1064,13 @@ def _handle_redeem(event):
     game_id = claims["gameId"]
     player_id = claims["playerId"]
     kind = claims["kind"]
+    if body.get("gameId") is not None and body["gameId"] != game_id:
+        return _resp(400, {"ok": False, "error": "TokenGameMismatch"})
 
     meta = _get_game(game_id)
     if not meta:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
-    if not meta.get("isActive", True):
+    if not meta.get("isActive", True) and not (kind == "a" and meta.get("stackPrizeState") in ("closing", "closed")):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (meta.get("gameType") or "").upper()
@@ -1060,8 +1081,19 @@ def _handle_redeem(event):
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
 
-    kivly_registration.require_player(dynamo_r, meta, player)
+    if kind != "a":
+        kivly_registration.require_player(dynamo_r, meta, player)
     blob = get_game_type_blob(player, game_type)
+
+    if game_type == "STACK" and kind == "a":
+        try:
+            prize = stack_prizes.redeem(dynamo_r, game_id, player_id, claims["awardId"])
+        except stack_prizes.PrizeError as exc:
+            return _resp(exc.status, {"ok": False, "error": exc.code})
+        return _resp(200, _json_sanitize({
+            "ok": True, "gameId": game_id, "playerId": player_id, "kind": "award",
+            "delivered": True, "label": _player_display_label(player), "prize": prize,
+        }))
 
     if game_type == "STACK":
         if kind != "k":
@@ -1162,6 +1194,8 @@ def lambda_handler(event, context):
             return _handle_kivly_reward(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
+    except stack_prizes.PrizeError as exc:
+        return _resp(exc.status, {"ok": False, "error": exc.code})
     except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:
         status, payload = kivly_registration.error_response(exc)
         return _resp(status, payload)

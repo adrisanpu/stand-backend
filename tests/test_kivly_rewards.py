@@ -36,7 +36,11 @@ def reward_rig(monkeypatch):
         records[Item["id"]] = deepcopy(Item)
 
     def update(Key, ExpressionAttributeValues, **kwargs):
-        records[Key["id"]].update(state=ExpressionAttributeValues[":s"], redemptionId=ExpressionAttributeValues[":r"])
+        records[Key["id"]]["state"] = ExpressionAttributeValues[":s"]
+        if ":r" in ExpressionAttributeValues:
+            records[Key["id"]]["redemptionId"] = ExpressionAttributeValues[":r"]
+        else:
+            records[Key["id"]].pop("redemptionId", None)
 
     table.get_item.side_effect = lambda Key, **_: {"Item": deepcopy(records[Key["id"]])} if Key["id"] in records else {}
     table.put_item.side_effect = put
@@ -100,22 +104,47 @@ def test_uncertain_earn_is_pending_and_never_replayed(reward_rig):
     client.earn_reward.assert_called_once()
 
 
-def test_success_response_without_new_assignment_is_not_confirmation(reward_rig):
+def test_success_response_without_redemption_record_is_confirmed(reward_rig):
     game, player, client, _, _ = reward_rig
     client.customer_rewards.side_effect = [[], []]
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "pending"
+    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
     client.earn_reward.assert_called_once()
+    assert client.customer_rewards.call_count == 2
 
 
-def test_ambiguous_new_assignments_stay_pending(reward_rig):
+def test_success_response_with_ambiguous_redemptions_is_confirmed_once(reward_rig):
     game, player, client, _, _ = reward_rig
     client.customer_rewards.side_effect = [
         [], [{"id": "assignment-1", "reward_id": "reward-1"},
              {"id": "assignment-2", "reward_id": "reward-1"}],
     ]
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "pending"
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "pending"
+    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
     client.earn_reward.assert_called_once()
+
+
+def test_success_ack_is_not_reversed_by_post_earn_lookup_failure(reward_rig):
+    game, player, client, _, _ = reward_rig
+    client.customer_rewards.side_effect = [[], KivlyError("KivlyUnavailable")]
+    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
+    client.earn_reward.assert_called_once()
+
+
+def test_confirmed_reward_is_still_confirmed_if_redemption_history_is_empty(reward_rig):
+    game, player, client, table, records = reward_rig
+    records["reward:ABC123:7"] = {
+        "id": "reward:ABC123:7", "state": "confirmed", "rewardId": "reward-1",
+        "name": "Coffee", "locationId": "location", "customerId": "customer-1",
+        "redemptionId": "assignment-1",
+    }
+    client.customer_rewards.return_value = []
+
+    result = kivly_rewards.completion_reward(MagicMock(), game, player)
+
+    assert result["status"] == "confirmed"
+    assert result["appleWalletUrl"] is None
+    client.earn_reward.assert_not_called()
 
 
 def test_existing_customer_is_reused_without_modifying_phone(monkeypatch):
@@ -230,13 +259,21 @@ def test_redemptions_for_another_customer_are_rejected(monkeypatch):
 
 def test_earn_only_uses_documented_customer_and_reward_ids(monkeypatch):
     client = KivlyClient("id", "secret")
-    request = MagicMock()
+    request = MagicMock(return_value={"success": True, "message": "Reward earned"})
     monkeypatch.setattr(client, "_scoped_request", request)
-    client.earn_reward("location", "owner", "customer-1", "reward-1")
+    assert client.earn_reward("location", "owner", "customer-1", "reward-1")["success"] is True
     request.assert_called_once_with(
         "location", "owner", "/api/v1/redemptions/rewards/earn",
-        body={"customer_id": "customer-1", "reward_ids": ["reward-1"]}, response_type=None,
+        body={"customer_id": "customer-1", "reward_ids": ["reward-1"]},
     )
+
+
+@pytest.mark.parametrize("response", [{}, {"success": False}, {"success": 1}, {"success": None}])
+def test_earn_requires_explicit_success_acknowledgement(monkeypatch, response):
+    client = KivlyClient("id", "secret")
+    monkeypatch.setattr(client, "_scoped_request", MagicMock(return_value=response))
+    with pytest.raises(KivlyError, match="KivlyEarnNotConfirmed"):
+        client.earn_reward("location", "owner", "customer-1", "reward-1")
 
 
 def test_scoped_requests_reject_wrong_location_before_network(monkeypatch):
@@ -247,6 +284,24 @@ def test_scoped_requests_reject_wrong_location_before_network(monkeypatch):
     with pytest.raises(KivlyError, match="KivlyScopeMismatch"):
         client.list_rewards("location", "owner")
     request.assert_not_called()
+
+
+@pytest.mark.parametrize("path,body", [
+    ("/api/v1/rewards/?skip=0&limit=100&status=active", None),
+    ("/api/v1/redemptions/customer/test-customer", None),
+    ("/api/v1/redemptions/rewards/earn", {"customer_id": "test-customer", "reward_ids": ["test-reward"]}),
+])
+def test_scoped_requests_send_actual_bearer_token(monkeypatch, path, body):
+    client = KivlyClient("id", "secret")
+    monkeypatch.setattr(client, "_authenticate", lambda: SimpleNamespace(
+        location_id="location", owner_id="owner", value="synthetic-test-token",
+    ))
+    transport = MagicMock(return_value={})
+    monkeypatch.setattr(client, "_send_request", transport)
+    client._scoped_request("location", "owner", path, body=body)
+    request = transport.call_args.args[0]
+    assert request.get_header("Authorization") == "Bearer synthetic-test-token"
+    assert request.get_method() == ("POST" if body else "GET")
 
 
 def test_settings_catalog_requires_game_owner(reward_rig):

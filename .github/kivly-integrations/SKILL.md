@@ -1,0 +1,21 @@
+---
+name: kivly-integrations
+description: Build and troubleshoot third-party integrations with Kivly Public API, including authentication, catalog, orders, reservations, loyalty, invoice lifecycle, campaigns, automatic notifications, gift cards, surveys, cost control, inventory, analytics and signed webhooks. Use the bundled OpenAPI contract and examples; this skill does not administer or deploy Kivly servers.
+---
+
+Use this package to implement the user's Kivly integration. The bundled contract is for backend version 1.1.0; confirm the target deployment supports it before relying on a new endpoint.
+
+1. Read [the integration guide](references/integration-guide.md) for credentials, environments, location scope, rate limits and retries. Obtain credentials through the application's secret store or environment; do not ask for secrets in chat.
+2. Find the exact operation using `python scripts/inspect_api.py search <term>`. Inspect its input and response with `python scripts/inspect_api.py operation METHOD /api/v1/path`. These commands read the bundled OpenAPI locally and make no network requests. Treat [openapi.json](references/openapi.json) as the contract; do not invent GraphQL mutations, scopes, endpoints, envelopes, monetary units or idempotency headers.
+3. Use `scripts/kivly_client.py` as an executable Python example. Credentials are location-level. `POST /api/v1/auth/token` returns `data.token`, `data.location_id`, `data.expires_in`; it is not an OAuth form endpoint and has no refresh token. Cache the token. Do not replace it with `client_secret_token`, a customer JWT or a provider OAuth secret.
+4. Verify connectivity with `python scripts/kivly_client.py --smoke` only when live reads are in the user's scope. It calls integration context and branches, and prints counts rather than customer data. Mutations must implement the user's requested workflow. Tests should use an explicitly designated test account; a normal-panel trial account still targets production.
+5. For costs, read [cost control](references/cost-control.md), preserve currency units and null coverage, and use document/stock workflows rather than inventing movements. For events, read [the webhook guide](references/webhooks.md). Use `scripts/verify_webhook.py` on raw bytes before JSON processing. Persist receipt with a unique event ID before acknowledging, and process idempotently. The signing secret is distinct from the Public API client secret.
+6. Keep automatic retries bounded. The example client retries reads on 429/503; it does not retry business mutations on network errors. Reconcile ambiguous mutations before retrying. Do not assume `external_id` or an arbitrary `Idempotency-Key` header guarantees exactly-once behavior.
+
+For importing website orders into the POS, read [channel orders](references/orders.md). Use authenticated `POST /api/v1/orders`, not the internal `/public/orders/*` checkout. Preserve the channel, external ID and original body on retry; this operation has its own deduplication contract. Do not confuse integer cents in this input/response with decimal currency units in existing order reads/events, or recording an external payment with charging a card.
+
+For POS/ERP loyalty integrations, read [Custom Loyalty](references/custom-loyalty.md): customer lookup and sale submission are distinct operations. Resolve the registered customer's Kivly ID before posting a sale, include nonempty items, and inspect the business response even on HTTP 200. Do not infer customer matching, currency units or replay safety from the historic ReadMe examples.
+
+For invoices, read [billing](references/billing.md) before creating or issuing documents. For campaign sending, event-triggered notifications, gift issuance/redemption or surveys, read [marketing workflows](references/marketing.md). Preserve their side effects, state transitions and monetary units; do not treat creation as delivery or payment.
+
+When reporting results, distinguish offline contract checks, mocked tests and verified live requests. A downloaded specification or successful token exchange does not prove a complete order, refund or webhook flow works. For 403 diagnostics collect the path, UTC time and request/Cloudflare ID without logging credentials or full customer payloads.

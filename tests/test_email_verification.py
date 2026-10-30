@@ -456,11 +456,12 @@ def test_username_is_bound_persisted_recovered_and_used_for_display(rig, monkeyp
     monkeypatch.setattr(assign_mod, "ASSIGNERS", {
         game_type: lambda _event: {"type": {game_type: {}}},
     })
-    challenge = response_body(request_code(username="  Ana 🌟  "))
+    contact = {"phone": "+34 612345678"} if game_type == "STACK" else {}
+    challenge = response_body(request_code(username="  Ana 🌟  ", **contact))
     record = rig["dynamo"].Table("verification").get_item(
         Key={"id": f"challenge:{challenge['challengeId']}"}
     )["Item"]
-    assert record["registration"] == {"email": EMAIL, "username": "Ana 🌟"}
+    assert record["registration"] == {"email": EMAIL, "username": "Ana 🌟", **contact}
     assert "username" not in challenge
 
     response = api_call("join", {
@@ -581,7 +582,7 @@ def test_same_challenge_retry_is_idempotent_and_preserves_stack_attempts_and_pro
         },
     })
     monkeypatch.setattr(stack, "public_assignment", lambda *_args: {"score": 0})
-    challenge = response_body(request_code())
+    challenge = response_body(request_code(phone="+34 612345678"))
     code = sent_code(rig)
     assert join(rig, challenge["challengeId"], code)["statusCode"] == 200
     player = rig["dynamo"].rows("players")[0]

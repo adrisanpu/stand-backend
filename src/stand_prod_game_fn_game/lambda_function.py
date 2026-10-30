@@ -6,7 +6,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
-from stand_common import kivly_settings
+from stand_common import kivly_settings, stack_prize_api, stack_prizes
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
@@ -120,6 +120,16 @@ def _serialize_prize_catalog(item: dict) -> dict:
         USER_MEDIA_BUCKET,
         prize_s3.generate_presigned_url,
     )
+
+
+def _stack_prize_settings(payload, item):
+    if item.get("gameType") == "STACK" and "stackPrizeProgram" in item:
+        payload["prizeCatalog"] = {}
+        payload["stackPrizeProgram"] = stack_prizes.program_view(
+            stack_prizes.effective_program(dynamodb, item), item)
+        payload["stackPrizeRules"] = stack_prizes.promotional_rules(item)
+        payload["stackPrizeState"] = item.get("stackPrizeState", "open")
+        payload["game"]["isActive"] = bool(item.get("isActive", True))
 
 
 def _get_game(game_id: str):
@@ -383,12 +393,16 @@ def _handle_get(event):
         if (item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
-        if not item.get("isActive", True):
+        if not item.get("isActive", True) and not (
+            item.get("gameType") == "STACK" and item.get("stackPrizeState") in ("closing", "closed")
+        ):
             return _resp(403, {"error": "GameInactive", "gameId": game_id})
 
         game_shape = _public_game_shape(item, include_prize_catalog=False)
         payload = {"ok": True, "game": game_shape}
-        if "prizeCatalog" in item:
+        if "stackPrizeProgram" in item and item.get("gameType") == "STACK":
+            payload["prizeCatalog"] = {}
+        elif "prizeCatalog" in item:
             payload["prizeCatalog"] = _serialize_prize_catalog(item)
         if (item.get("gameType") or "").upper() == "EMPAREJA2":
             payload["settings"] = {"empareja2": (item.get("type") or {}).get("EMPAREJA2") or {}}
@@ -399,6 +413,7 @@ def _handle_get(event):
             payload["settings"] = {"impostor": (item.get("type") or {}).get("IMPOSTOR") or {}}
         elif (item.get("gameType") or "").upper() == "STACK":
             payload["game"]["type"] = {"STACK": stack_game_config(item)}
+        _stack_prize_settings(payload, item)
         return _resp(200, payload)
 
     # ---------------- 2) gameName (optional) ----------------
@@ -424,7 +439,9 @@ def _handle_get(event):
             return _resp(404, {"error": "GameNotFound", "gameName": game_name})
 
         item = items[0]
-        if not item.get("isActive", True):
+        if not item.get("isActive", True) and not (
+            item.get("gameType") == "STACK" and item.get("stackPrizeState") in ("closing", "closed")
+        ):
             return _resp(403, {"error": "GameInactive", "gameName": game_name})
 
         game_id = item.get("gameId")
@@ -486,6 +503,7 @@ def _handle_get(event):
             payload["settings"] = {"impostor": (item.get("type") or {}).get("IMPOSTOR") or {}}
         elif game_type == "STACK":
             payload["game"]["type"] = {"STACK": stack_game_config(item)}
+        _stack_prize_settings(payload, item)
         return _resp(200, payload)
     
     # ---------------- 3) & 4) list user's games ----------------
@@ -597,6 +615,9 @@ def _handle_delete_player(event):
         return error
     game_id, owner_user_id, game_item = game
 
+    if game_item.get("gameType") == "STACK" and game_item.get("stackPrizeState") in ("closing", "closed"):
+        return _resp(409, {"error": "StackClosing", "detail": "The final ranking cannot be changed."})
+
     try:
         player_response = gp_table.get_item(
             Key={"gameId": game_id, "playerId": player_id},
@@ -650,6 +671,15 @@ def _handle_delete_player(event):
         ":owner": owner_user_id,
     }
     conditions = ["ownerUserId = :owner", "attribute_exists(gameId)"]
+    if game_item.get("gameType") == "STACK" and "stackPrizeProgram" in game_item:
+        revision = game_item.get("stackPrizeRevision", 0)
+        update_expression += ", stackPrizeRevision = :nextRevision"
+        values[":nextRevision"] = revision + 1
+        if revision == 0:
+            conditions.append("attribute_not_exists(stackPrizeRevision)")
+        else:
+            conditions.append("stackPrizeRevision = :previousRevision")
+            values[":previousRevision"] = revision
     if "playersCount" in game_item:
         conditions.append("playersCount = :expectedPlayersCount")
         values[":expectedPlayersCount"] = game_item["playersCount"]
@@ -753,7 +783,7 @@ def _handle_post(event):
         return _resp(400, {"error": str(exc)})
 
     try:
-        participant_fields = normalize_participant_fields(game_type, body.get("participantFields"))
+        participant_fields = normalize_participant_fields(game_type, body.get("participantFields"), strict=True)
     except ValueError as exc:
         return _resp(400, {"error": str(exc)})
 
@@ -1035,9 +1065,15 @@ def _handle_put(event):
             return _resp(400, {"error": str(exc)})
     if participant_fields is not None:
         try:
-            participant_fields = normalize_participant_fields(item.get("gameType") or "", participant_fields)
+            participant_fields = normalize_participant_fields(item.get("gameType") or "", participant_fields, strict=True)
         except ValueError as exc:
             return _resp(400, {"error": str(exc)})
+
+    if (item.get("gameType") == "STACK" and item.get("stackPrizeState") in ("closing", "closed")
+            and isinstance(is_active, bool)):
+        return _resp(409, {"error": "StackClosing"})
+    if item.get("gameType") == "STACK" and is_active is False:
+        return _resp(409, {"error": "StackCloseRequired"})
 
     if rulet4_config is not None:
         names = {"#type": "type"}
@@ -1463,6 +1499,11 @@ def lambda_handler(event, context):
             return _resp(204, "")
 
         path = _get_path(event).rstrip("/")
+        if path.endswith("/v1/game/stack/prizes"):
+            return stack_prize_api.handle(
+                event, method, dynamodb, lambda owner: _is_user_pro(_get_user(owner)),
+                _read_verified_prize_image,
+            )
         if path.endswith("/v1/kivly"):
             return kivly_settings.handle_account(event, method, dynamodb)
         if path.endswith("/v1/game/kivly/rewards"):

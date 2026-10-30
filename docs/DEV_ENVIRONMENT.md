@@ -125,6 +125,20 @@ sam build
 sam deploy --config-env dev
 ```
 
+The dev configuration enables `KivlyExternalWritesEnabled=true`: verified club
+registrations can create real Kivly customers, and queued Kivly prizes can be
+delivered. Use only authorized test participants and businesses. Set this
+parameter to `false` and redeploy to restore read-only protection; new customer
+creation then returns `KivlyWritesDisabled` and prize delivery stays queued.
+
+The dev configuration also enables `StackRewardEmailEnabled=true` for authorized
+testing. Existing campaigns/attempts keep wallet unless Email is selected for
+new attempts. Reward mail uses the verified SES sender above and the phone
+stored in Kivly; confirm scanner acceptance with a designated test participant.
+Deployment alone does not send a test email or prove physical redemption.
+Set `StackRewardEmailEnabled=false` and redeploy to pause pending reward emails.
+The template default remains false and production configuration does not enable it.
+
 Note outputs:
 
 - `GameApiUrl` — use as `VITE_API_BASE_URL` in frontend (ends with `/prod`; same stage name as prod stack, different API host).

@@ -62,6 +62,8 @@ def assign_body(values):
 @pytest.mark.parametrize("gt", WEB_TYPES)
 def test_defaults_and_legacy_partial_config(gt):
     defaults = {"email": {"required": True}, "instagram": {"required": False}, "phone": {"required": False}}
+    if gt == "STACK":
+        defaults["phone"] = {"required": True, "enabled": True}
     assert default_participant_fields(gt) == defaults
     assert normalize_participant_fields(gt, {}) == defaults
     assert normalize_participant_fields(gt, {"instagram": {"required": True}}) == {
@@ -77,14 +79,14 @@ def test_defaults_and_legacy_partial_config(gt):
 def test_enabled_only_join_and_persistence(web, gt, config):
     meta, put, find, _ = web
     meta.update(gameType=gt, participantFields=config)
-    submitted = {name: VALUES[name] for name in CONTACT_FIELDS if name == "email" or config[name]["required"]}
+    submitted = {name: VALUES[name] for name in CONTACT_FIELDS if name == "email" or config[name]["required"] or gt == "STACK"}
     submitted["instagram"] = VALUES["instagram"]
     result = assign_mod.lambda_handler(assign_body(submitted), None)
     assert result["ok"] is True
     assert result["playerToken"]
     item = put.call_args.args[0]
     for name, key in (("email", "email"), ("phone", "phone")):
-        if name == "email" or config[name]["required"]:
+        if name == "email" or config[name]["required"] or gt == "STACK":
             assert item[key] == STORED[key]
         else:
             assert key not in item
@@ -128,6 +130,10 @@ def test_disabled_values_are_ignored_even_if_malformed(web, gt):
     meta, put, find, _ = web
     meta.update(gameType=gt, participantFields={name: {"required": False} for name in FIELDS})
     result = assign_mod.lambda_handler(assign_body({"email": VALUES["email"], "instagram": [], "phone": 123}), None)
+    if gt == "STACK":
+        assert result == {"ok": False, "reason": "invalid_phone"}
+        put.assert_not_called()
+        return
     assert result["ok"] is True
     assert not ({"instagramUsername", "phone"} & put.call_args.args[0].keys())
     assert put.call_args.args[0]["email"] == STORED["email"]

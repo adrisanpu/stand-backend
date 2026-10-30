@@ -107,6 +107,44 @@ authorization is configured. Only the dedicated public Lambda role receives
 table permissions but cannot send mail. The existing game managed policy is
 reused on these roles to preserve all prior game/session behavior.
 
+### STACK reward emails
+
+The STACK delivery worker separately receives `ses:SendRawEmail` on the same
+identity, restricted to `EmailSenderAddress`. Its MIME message contains
+bilingual text/HTML and a locally generated inline PNG QR; no QR/image service
+receives participant phone numbers. The worker's pinned `qrcode`/`pypng`
+requirements are installed by SAM build and by the test requirements.
+Assignment Lambdas still cannot send email.
+
+`StackRewardEmailEnabled` defaults to `"false"` in the template. The dev
+`samconfig.toml` explicitly enables it for authorized testing; production does
+not. For an approved dev rollout, first verify SES identity, quotas,
+sandbox recipients, bounce/complaint handling and worker From-address permission.
+Enable it only for a controlled test, then use an authorized test mailbox/customer
+to confirm the emailed phone QR works with the actual Kivly scanner. A setting
+or mocked test is not evidence that the Kivly reader accepts the QR.
+Keep production disabled until the controlled flow is accepted.
+
+Select Email in a STACK game's prize settings after enabling the environment.
+New attempts use that channel; existing attempts/awards retain their previous
+channel. Name, verified email and phone are required for new STACK registrations
+in either mode. Publish backend and matching frontend together so older forms
+without phone do not remain in circulation.
+
+The worker sends only for confirmed Kivly assignments. Email acceptance is
+tracked independently: `accepted` means SES returned a MessageId, not delivery
+to the recipient. The existing verification-email rate counters do not apply
+to reward notices; award stock, persisted allocation and bounded retries limit
+reward sends. Account-wide SES quotas still apply and must cover both flows.
+The operator prize panel lists safe notification status/errors and permits retry
+only after definitive failure. Fix a missing phone in Kivly and retry the email;
+this must never allocate another reward or consume additional stock.
+Network/5xx errors and interrupted sends require provider-side investigation,
+not automatic retry. SDK-level retries are disabled for the SES send operation.
+An uncertain or already accepted email cannot be resent
+through the retry API. Disabling `StackRewardEmailEnabled` pauses pending
+notifications without revoking awards; it does not revert past emails.
+
 `StandEmailVerificationTable` is per environment, on-demand, with string PK
 `id` and numeric epoch-seconds `expiresAt` TTL for challenges/rate records.
 Permanent HMAC-keyed identity-to-player mappings intentionally omit `expiresAt`.

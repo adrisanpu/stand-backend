@@ -18,6 +18,7 @@ boto3_stub = MagicMock()
 sys.modules.setdefault("boto3", boto3_stub)
 sys.modules.setdefault("botocore", MagicMock())
 sys.modules.setdefault("botocore.exceptions", MagicMock())
+sys.modules.setdefault("botocore.config", MagicMock())
 sys.modules.setdefault("boto3.dynamodb", MagicMock())
 sys.modules.setdefault("boto3.dynamodb.conditions", MagicMock())
 

@@ -7,12 +7,24 @@ from datetime import datetime, timezone
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 BASE_URL = "https://api.getkivly.com"
 MAX_RESPONSE_BYTES = 1_048_576
 TIMEOUT_SECONDS = 8
 RENEWAL_MARGIN_SECONDS = 30
+
+
+def reward_image_url(value):
+    if not isinstance(value, str) or not value or len(value) > 2048 or any(ord(c) < 33 for c in value):
+        return None
+    try:
+        url = urlsplit(value)
+        if url.scheme == "https" and url.hostname and not url.username and not url.password and url.port in (None, 443):
+            return value
+    except ValueError:
+        return None
+    return None
 
 
 class KivlyError(Exception):
@@ -220,7 +232,7 @@ class KivlyClient:
             raise KivlyError("KivlyRequestNotAllowed")
         headers = {
             "Accept": "application/json", "User-Agent": "Stand-Kivly/1.0",
-            "Authorization": f"******",
+            "Authorization": f"Bearer {token.value}",
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -255,7 +267,11 @@ class KivlyClient:
                     raise KivlyError("KivlyCatalogInvalid")
                 if row.get("status") != "active" or any(item["id"] == row["id"] for item in rewards):
                     raise KivlyError("KivlyCatalogInvalid")
-                rewards.append({"id": row["id"], "name": row["title"]})
+                reward = {"id": row["id"], "name": row["title"]}
+                image = reward_image_url(row.get("image"))
+                if image:
+                    reward["imageUrl"] = image
+                rewards.append(reward)
             if not result["has_next"]:
                 if len(rewards) != total:
                     raise KivlyError("KivlyCatalogInvalid")
@@ -290,10 +306,13 @@ class KivlyClient:
     def earn_reward(self, location_id, owner_id, customer_id, reward_id):
         if not _text(customer_id, 512) or not _text(reward_id, 512):
             raise KivlyError("KivlyRewardInvalid")
-        self._scoped_request(
+        result = self._scoped_request(
             location_id, owner_id, "/api/v1/redemptions/rewards/earn",
-            body={"customer_id": customer_id, "reward_ids": [reward_id]}, response_type=None,
+            body={"customer_id": customer_id, "reward_ids": [reward_id]},
         )
+        if result.get("success") is not True:
+            raise KivlyError("KivlyEarnNotConfirmed")
+        return result
 
     def find_customer(self, location_id, owner_id, email):
         # Filtered search has returned an inconsistent total in a controlled test.

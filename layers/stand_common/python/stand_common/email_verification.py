@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from botocore.exceptions import BotoCoreError, ClientError
 
-from stand_common.utils import is_valid_email, normalize_email, web_participant_fields, mask_email, log
+from stand_common.utils import is_valid_email, is_valid_phone, normalize_email, web_participant_fields, mask_email, log
 from stand_common.kivly_registration import consent_values, RegistrationError as KivlyRegistrationError
 
 CODE_TTL = 600
@@ -41,7 +41,7 @@ def registration_values(meta, body):
             raise RegistrationError(f"invalid_{name}")
         value = (raw or "").strip()
         if not value:
-            if name == "phone":
+            if name == "phone" and not fields["phone"]["required"]:
                 continue
             raise RegistrationError(f"missing_{name}")
         if len(value) > limit or re.search(r"[\x00-\x1f\x7f-\x9f]", value):
@@ -50,6 +50,8 @@ def registration_values(meta, body):
             value = normalize_email(value)
             if not is_valid_email(value):
                 raise RegistrationError("invalid_email")
+        if name == "phone" and fields["phone"]["required"] and not is_valid_phone(value):
+            raise RegistrationError("invalid_phone")
         values[name] = value
     raw = body.get("username")
     if raw is not None and not isinstance(raw, str):

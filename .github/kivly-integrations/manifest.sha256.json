@@ -1,0 +1,14 @@
+{
+  "SKILL.md": "88eb208b3176a6c3259f65e2ee830b09f46b816045c53091441f02b65190fb07",
+  "references/billing.md": "6260b524ae0c649e91a817ce8edd3a9d46245c7ce50818fc8c151972a9116943",
+  "references/cost-control.md": "86b559e380b5da4d690c08f596916e20c265fb3b308ff9487f079f8116a74cb2",
+  "references/custom-loyalty.md": "0ba6e3b00b78ace79227a8d06f9dd13e81d5953244cfbf77ae2e7bc8171931e0",
+  "references/integration-guide.md": "592ab48498c914fe3982629318568adc8c57751f909d33e00aaf9e2243b1bf46",
+  "references/marketing.md": "dd795584899bcf40f7a27d3d97c24fa28327ddd2ff509af589042eb68d57771c",
+  "references/openapi.json": "ceea9a3bf626b49e271439a124d58f772635e77aec6bed4843a3fcfbc8674224",
+  "references/orders.md": "a40e0779b8108406f428c4d1494373997457adf31bf396bb4eaffd0fc1c60a42",
+  "references/webhooks.md": "af18e870ae89a6ec721831d3133e6443e67d2e6e03bd134ce214d48613271eb2",
+  "scripts/inspect_api.py": "3ec225d2faa003f315bdaf8186cb231461107b111ce5f1b480f3844fe44c0b39",
+  "scripts/kivly_client.py": "4c1bcb1eb957c82fbe49c50d7a401208950dabed63adeaf64763754d8b56ac99",
+  "scripts/verify_webhook.py": "23019318cb64dc3da2f09a670bf3f4d47b60a9660ee6790dbb29883e63d37815"
+}

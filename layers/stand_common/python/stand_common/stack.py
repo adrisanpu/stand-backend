@@ -225,5 +225,8 @@ def response_status(result: dict) -> int:
         "GameNotFound": 404,
         "internal_error": 500,
         "BadScoreResponse": 502,
+        "StackPrizeConflict": 503,
+        "StackClosing": 409,
+        "StackClosed": 409,
         "InvalidStackConfig": 400,
     }.get(result.get("error"), 400)

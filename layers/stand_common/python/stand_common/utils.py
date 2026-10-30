@@ -221,12 +221,15 @@ def mask_email(email: str) -> str:
 
 
 def default_participant_fields(game_type: str) -> dict:
+    if (game_type or "").upper() == "STACK":
+        return {"email": {"required": True}, "instagram": {"required": False},
+                "phone": {"required": True, "enabled": True}}
     if (game_type or "").upper() in ("EMPAREJA2", "T1MER", "STACK"):
         return {"email": {"required": True}, "instagram": {"required": False}, "phone": {"required": False}}
     return {"email": {"required": False}, "instagram": {"required": True}, "phone": {"required": False}}
 
 
-def normalize_participant_fields(game_type: str, fields: dict | None = None) -> dict:
+def normalize_participant_fields(game_type: str, fields: dict | None = None, *, strict=False) -> dict:
     """Resolve omitted fields using legacy defaults; required also means requested."""
     result = default_participant_fields(game_type)
     if fields is None:
@@ -249,6 +252,12 @@ def normalize_participant_fields(game_type: str, fields: dict | None = None) -> 
             if not isinstance(config["enabled"], bool):
                 raise ValueError(f"participantFields.{name}.enabled must be a boolean.")
             result[name]["enabled"] = config["enabled"]
+    if (game_type or "").upper() == "STACK":
+        if strict and (result["email"]["required"] is False
+                       or result["phone"]["required"] is False or result["phone"]["enabled"] is False):
+            raise ValueError("STACK requires name, email and phone.")
+        result["email"] = {"required": True}
+        result["phone"] = {"required": True, "enabled": True}
     return result
 
 
@@ -256,8 +265,15 @@ def web_participant_fields(game_type: str, fields: dict | None = None) -> dict:
     result = normalize_participant_fields(game_type, fields)
     result["email"] = {"required": True}
     phone = result["phone"]
-    result["phone"] = {"required": False, "enabled": phone.get("enabled", phone["required"])}
+    result["phone"] = {"required": (game_type or "").upper() == "STACK",
+                       "enabled": phone.get("enabled", phone["required"])}
     return result
+
+
+def is_valid_phone(value) -> bool:
+    return (isinstance(value, str) and 3 <= len(value) <= 64
+            and re.fullmatch(r"\+?[0-9][0-9 ()-]*", value, re.ASCII) is not None
+            and sum(c.isdigit() for c in value) >= 3)
 
 
 def issue_player_token(game_id: str, player_id: int, secret: str, ttl_seconds: int = 43200) -> str:
@@ -289,11 +305,12 @@ def verify_player_token(token: str, secret: str) -> dict | None:
 
 
 # Prize kinds: "v" = validation, "r" = raffle, "k" = ranking
-PRIZE_KINDS = frozenset({"v", "r", "k"})
+PRIZE_KINDS = frozenset({"v", "r", "k", "a"})
 
 
 def issue_prize_token(
-    game_id: str, player_id: int, kind: str, secret: str, ttl_seconds: int = 604800
+    game_id: str, player_id: int, kind: str, secret: str, ttl_seconds: int = 604800,
+    award_id: str | None = None,
 ) -> str:
     """HMAC claim for validation ('v'), raffle ('r') or ranking ('k'). Default TTL 7 days."""
     k = (kind or "").strip().lower()
@@ -305,6 +322,10 @@ def issue_prize_token(
         "k": k,
         "exp": int(time.time()) + ttl_seconds,
     }
+    if k == "a":
+        if not isinstance(award_id, str) or not re.fullmatch(r"award_[0-9a-f]{64}", award_id):
+            raise ValueError("invalid award id")
+        payload["aid"] = award_id
     body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
     sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
     return f"{body}.{sig}"
@@ -329,4 +350,9 @@ def verify_prize_token(token: str, secret: str) -> dict | None:
     k = (payload.get("k") or "").strip().lower()
     if not gid or pid is None or k not in PRIZE_KINDS:
         return None
+    if k == "a":
+        aid = payload.get("aid")
+        if not isinstance(aid, str) or not re.fullmatch(r"award_[0-9a-f]{64}", aid):
+            return None
+        return {"gameId": gid, "playerId": int(pid), "kind": k, "awardId": aid}
     return {"gameId": gid, "playerId": int(pid), "kind": k}

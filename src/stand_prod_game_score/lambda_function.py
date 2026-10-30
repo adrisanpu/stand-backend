@@ -82,7 +82,9 @@ def _handle_post(event):
     meta = _get_game_meta(game_id)
     if not meta:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
-    if not meta.get("isActive", True):
+    closing_finish = (meta.get("gameType") == "STACK" and meta.get("stackPrizeState") == "closing"
+                      and body.get("action") == "finish")
+    if not meta.get("isActive", True) and not closing_finish:
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (meta.get("gameType") or "").upper()
