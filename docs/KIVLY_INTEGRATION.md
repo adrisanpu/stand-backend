@@ -289,8 +289,10 @@ never supplies credentials or a location:
 The required fields follow Kivly's bundled `RewardCreateRequest`. Playstand
 currently exposes `discount_percentage`, `discount_fixed` and `free_item`;
 `value` remains a generic number because the contract does not define its unit.
-The optional UI fields are `image` (HTTPS URL), `termsAndConditions`,
+The create API still accepts optional `image` (HTTPS URL), `termsAndConditions`,
 `validFrom`, `validUntil`, `maxRedemptions` and `maxRedemptionsPerUser`.
+The operator UI uses local PNG uploads instead of a URL field. These images
+belong to the game's prize inventory and do not mutate Kivly reward artwork.
 `pointType` is omitted so Kivly applies its documented `POINT` default. A
 successful upstream HTTP 201 is validated and returned as
 `{"ok":true,"reward":{"id":"...","name":"..."}}` with HTTP 201.
@@ -311,8 +313,8 @@ GET and successful PUT return normalized `program` with `version: 3`,
 `storefrontUrl`, `deliveryChannel`, `catalog` and `rules`. The retained program URL is a
 read-compatible effective value; saving a game does not update the account.
 Catalog entries have a local `id`, `source` (`stand` or `kivly`), `name` and
-`stockTotal` (Y, 1-1,000); STAND accepts an optional verified PNG `imageKey`,
-while Kivly binds a real `rewardId` and the connected `locationId`. Rules
+`stockTotal` (Y, 1-1,000); both sources accept an optional verified PNG `imageKey`,
+while Kivly also binds a real `rewardId` and the connected `locationId`. Rules
 contain a stable `id`, `condition`, `groups: {allocations: {prizeId, quantity}[]}[]`
 and, for ranking conditions, `topX` (1-100). Version 3 has no `mode` or flat
 `allocations`. Limits are 32 catalog entries, eight rules, eight groups per rule,
@@ -466,8 +468,10 @@ expose the same top-level `stackPrizeRules` promotional list:
 `{condition, topX?, names: string[], prizes: {id, name, imageUrl: string|null}[]}[]`.
 Each rule flattens all groups, deduplicating by prize ID; `names` is retained for
 old clients. Zero-limit disabled prizes stay excluded; remaining stock does not
-hide configured promotions. STAND image URLs are fresh one-hour signed URLs for
+hide configured promotions. Uploaded image URLs are fresh one-hour signed URLs for
 committed PNG keys belonging to that owner and game, never client-supplied URLs.
+For Kivly, an explicit `imageKey` overrides external artwork; null explicitly
+clears the image. Omitting it retains the existing external-image behavior.
 The documented upstream reward `image` string is optionally mapped to `imageUrl`
 only when it is a safe HTTPS URL. Missing/unsafe images remain absent/null; no
 additional Kivly operation or invented image field is used.
