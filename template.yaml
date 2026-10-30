@@ -811,6 +811,12 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/kivly/rewards
             Method: GET
+        GameKivlyRewardsPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly/rewards
+            Method: POST
         StackPrizesGet:
           Type: HttpApi
           Properties:

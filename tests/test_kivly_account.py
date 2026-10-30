@@ -1,5 +1,6 @@
 """Account-scoped Kivly connection endpoint tests."""
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,6 +9,17 @@ from stand_common import kivly_settings
 from tests.email_fake import FakeDynamoError
 
 read_connection = kivly_settings.registration.connection
+
+
+def test_reward_creation_is_exposed_as_an_authenticated_sam_route():
+    template = (Path(__file__).resolve().parents[1] / "template.yaml").read_text()
+    route = template.split("        GameKivlyRewardsPost:\n", 1)[1].split("        StackPrizesGet:", 1)[0]
+    assert "Type: HttpApi" in route
+    assert "ApiId: !Ref GameApi" in route
+    assert "Path: /v1/game/kivly/rewards" in route
+    assert "Method: POST" in route
+    assert "Authorizer: NONE" not in route
+    assert "DefaultAuthorizer: CognitoAuthorizer" in template
 
 
 def account_event(body=None):
