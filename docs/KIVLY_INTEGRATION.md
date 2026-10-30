@@ -18,9 +18,10 @@ STACK supports textual rules combining existing Kivly rewards and game-local
 STAND prizes. Earned STAND units have individual collection QRs; Kivly units are
 assigned server-side, including awards decided after the participant leaves.
 The club card is added through the business's official Kivly storefront.
-This extension does not create rewards, redeem Kivly rewards, mark them used,
-generate passes or push updates to devices. Its presence here is not evidence
-that it has been deployed or that installed-wallet propagation is verified.
+STACK owners can create Kivly rewards from the prize panel when connected.
+Playstand does not redeem Kivly rewards, mark them used, generate passes or push
+updates to devices. This extension's presence here is not evidence that it has
+been deployed or that installed-wallet propagation is verified.
 
 ## Organizer API (Cognito authenticated)
 
@@ -270,7 +271,38 @@ network failures. Existing email rate limits, expiry and attempt caps still appl
 ## STACK prize rules, delivery and Wallet
 
 The owner-only `GET /v1/game/kivly/rewards?gameId=...` lists the connected
-location's active rewards. The new owner endpoint is
+location's active rewards. `POST /v1/game/kivly/rewards` creates a Kivly reward
+for an owned STACK game through the organizer's saved connection; the browser
+never supplies credentials or a location:
+
+```json
+{
+  "gameId": "ABC123",
+  "title": "Coffee",
+  "description": "One coffee",
+  "rewardType": "free_item",
+  "value": 1,
+  "pointsRequired": 100
+}
+```
+
+The required fields follow Kivly's bundled `RewardCreateRequest`. Playstand
+currently exposes `discount_percentage`, `discount_fixed` and `free_item`;
+`value` remains a generic number because the contract does not define its unit.
+The optional UI fields are `image` (HTTPS URL), `termsAndConditions`,
+`validFrom`, `validUntil`, `maxRedemptions` and `maxRedemptionsPerUser`.
+`pointType` is omitted so Kivly applies its documented `POINT` default. A
+successful upstream HTTP 201 is validated and returned as
+`{"ok":true,"reward":{"id":"...","name":"..."}}` with HTTP 201.
+
+The upstream create operation is not assumed idempotent. Playstand never
+automatically retries it. A timeout, 5xx or malformed success response returns
+`KivlyRewardCreationUncertain`; refresh the catalog and inspect a matching
+reward before explicitly trying again. `KIVLY_EXTERNAL_WRITES_ENABLED=false`
+blocks creation and returns `KivlyWritesDisabled` while leaving catalog reads
+available.
+
+The other owner endpoint is
 `/v1/game/stack/prizes`: GET takes `gameId` in the query; PUT accepts
 `{gameId, program}`; POST accepts `{gameId, excludePlayerIds: []}` to request or
 progress definitive closure. All reject other owners and non-STACK games.
@@ -405,7 +437,7 @@ the phone in Kivly's `CustomerResponse.phone`, following the operator's supplied
 QR specification; it is not a per-award token or proof of identity.
 The worker re-reads the customer by verified email, checks the same customer ID,
 active state and location, and never uses the STAND form phone as a fallback.
-No new Kivly endpoints or client-update operations are introduced.
+No additional Kivly calls are used by email delivery.
 
 Kivly staff identify the customer with that QR and handle available rewards and
 redemption in Kivly. The email is not a live balance or proof that a prize

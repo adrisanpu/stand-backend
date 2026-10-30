@@ -17,13 +17,17 @@ registration or any reward/card delivery.
 | `GET /api/v1/customers/` | Read-only access check or bounded complete email lookup |
 | `POST /api/v1/customers/` | Create a consented, email-verified STACK participant only |
 | `GET /api/v1/rewards/` | Read the active catalog for owner selection |
+| `POST /api/v1/rewards/` | Create an owner-requested reward from STACK prize settings |
 | `GET /api/v1/redemptions/customer/{customer_id}` | Read a customer's reward assignments and returned Wallet links |
 | `POST /api/v1/redemptions/rewards/earn` | Assign an earned STACK unit from the server-side outbox |
 
 Customer POST is never part of connect/status. It carries only `name`, `email`,
 `external_id`, `source: "stand"` and the required STACK `phone`. There are no
-reward creation, redemption, mark-used or Wallet-generation methods/routes. The
-award flow uses `earn` only; an uncertain write is not automatically retried.
+redemption, mark-used or Wallet-generation methods/routes. Reward creation is
+available only from the authenticated STACK owner prize panel and uses the
+connected credential's authorized location; it does not accept a location from
+the browser. The award flow uses `earn` only; uncertain writes are not
+automatically retried.
 The transport validates TLS, rejects redirects, bounds response size to 1 MiB,
 uses an eight-second per-request timeout, and never retries a request internally.
 Large businesses or slow upstream responses can fail closed within the Lambda
@@ -53,10 +57,17 @@ work independently of player sessions. Pre-earn errors can retry safely;
 second earn. The owner prize panel exposes delivery states, safe error codes,
 operation stages and upstream HTTP statuses. Registration and delivery logs use
 the same stage/status fields without participant identifiers.
-`KIVLY_EXTERNAL_WRITES_ENABLED=false` blocks customer creation and reward
-assignment while preserving read-only diagnostics. The dev deployment is
-temporarily configured with writes disabled; keep it that way until an
-authorized real test is scheduled.
+`KIVLY_EXTERNAL_WRITES_ENABLED=false` blocks customer creation, reward
+creation and reward assignment while preserving read-only diagnostics. Check
+the deployed parameter before using the feature; never make a live reward
+creation request without explicit authorization and a designated test account.
+
+Reward creation uses the bundled Public API `POST /api/v1/rewards/` contract and
+requires HTTP 201 plus a valid `RewardResponse`. Kivly does not provide generic
+idempotency for this operation. A timeout, server error or malformed success
+response is reported as `KivlyRewardCreationUncertain`; refresh the active
+catalog and inspect it before any explicit retry. The client never retries a
+reward-creation POST automatically.
 
 The business storefront origin is configured once in account `clubSettings.storefrontUrl`,
 not inferred from a customer or redemption response. Until that key is saved,

@@ -497,6 +497,111 @@ def test_game_reward_catalog_is_limited_to_stack_owner_and_connected_account(mon
     client.list_rewards.assert_called_once_with("location", "kivly-owner")
 
 
+def test_game_reward_catalog_creates_reward_for_connected_stack_owner(monkeypatch):
+    dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": membership_game()}
+    client.create_reward.return_value = {"id": "reward-1", "name": "Coffee"}
+    conn = {"locationId": "location", "ownerId": "kivly-owner"}
+    monkeypatch.setenv("KIVLY_EXTERNAL_WRITES_ENABLED", "true")
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
+    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
+    reward = {
+        "title": "Coffee", "description": "A coffee", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 25,
+    }
+
+    response = kivly_settings.handle_game(
+        game_event("GAME1", {"gameId": "GAME1", **reward}),
+        "POST", dynamo, games, catalog=True,
+    )
+
+    assert response["statusCode"] == 201
+    assert json.loads(response["body"]) == {
+        "ok": True, "reward": {"id": "reward-1", "name": "Coffee"},
+    }
+    client.create_reward.assert_called_once_with("location", "kivly-owner", reward)
+
+
+def test_game_reward_creation_requires_connection_and_enabled_external_writes(monkeypatch):
+    dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": membership_game()}
+    reward = {
+        "gameId": "GAME1", "title": "Coffee", "description": "A coffee",
+        "rewardType": "free_item", "value": 1, "pointsRequired": 25,
+    }
+    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
+    monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: None)
+    response = kivly_settings.handle_game(
+        game_event("GAME1", reward), "POST", dynamo, games, catalog=True,
+    )
+    assert response["statusCode"] == 409
+    client.create_reward.assert_not_called()
+
+    monkeypatch.setattr(
+        kivly_settings.registration, "connection",
+        lambda *_: {"locationId": "location", "ownerId": "kivly-owner"},
+    )
+    monkeypatch.setenv("KIVLY_EXTERNAL_WRITES_ENABLED", "false")
+    response = kivly_settings.handle_game(
+        game_event("GAME1", reward), "POST", dynamo, games, catalog=True,
+    )
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"])["error"] == "KivlyWritesDisabled"
+    client.create_reward.assert_not_called()
+
+
+def test_game_reward_creation_rejects_unexpected_fields(monkeypatch):
+    dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": membership_game()}
+    monkeypatch.setenv("KIVLY_EXTERNAL_WRITES_ENABLED", "true")
+    monkeypatch.setattr(
+        kivly_settings.registration, "connection",
+        lambda *_: {"locationId": "location", "ownerId": "kivly-owner"},
+    )
+    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
+
+    response = kivly_settings.handle_game(
+        game_event("GAME1", {
+            "gameId": "GAME1", "title": "Coffee", "description": "A coffee",
+            "rewardType": "free_item", "value": 1, "pointsRequired": 25,
+            "locationId": "untrusted-location",
+        }),
+        "POST", dynamo, games, catalog=True,
+    )
+
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"])["error"] == "KivlyRewardInvalid"
+    client.create_reward.assert_not_called()
+
+
+def test_game_reward_creation_exposes_uncertain_result_without_retry(monkeypatch):
+    dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
+    games.get_item.return_value = {"Item": membership_game()}
+    client.create_reward.side_effect = kivly_settings.registration.KivlyError(
+        "KivlyRewardCreationUncertain", 503,
+    )
+    monkeypatch.setenv("KIVLY_EXTERNAL_WRITES_ENABLED", "true")
+    monkeypatch.setattr(
+        kivly_settings.registration, "connection",
+        lambda *_: {"locationId": "location", "ownerId": "kivly-owner"},
+    )
+    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
+
+    response = kivly_settings.handle_game(
+        game_event("GAME1", {
+            "gameId": "GAME1", "title": "Coffee", "description": "A coffee",
+            "rewardType": "free_item", "value": 1, "pointsRequired": 25,
+        }),
+        "POST", dynamo, games, catalog=True,
+    )
+
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"]) == {
+        "ok": False, "error": "KivlyRewardCreationUncertain",
+    }
+    client.create_reward.assert_called_once()
+
+
 def test_game_reward_selection_validates_catalog_and_saves_only_stack_reward(monkeypatch):
     dynamo, games, client = MagicMock(), MagicMock(), MagicMock()
     games.get_item.return_value = {"Item": membership_game()}

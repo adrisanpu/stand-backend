@@ -55,6 +55,103 @@ def test_reward_catalog_only_maps_safe_documented_image_field(client, monkeypatc
     assert rewards[0].get("imageUrl") == expected
 
 
+def test_create_reward_posts_scoped_contract_and_maps_response(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    request = MagicMock(return_value={
+        "id": "reward-1", "title": "Coffee", "description": "A coffee",
+        "reward_type": "free_item", "value": 1, "point_type": "POINT",
+        "points_required": 25, "status": "active",
+    })
+    monkeypatch.setattr(client, "_scoped_request", request)
+
+    created = client.create_reward("location", "owner", {
+        "title": " Coffee ", "description": " A coffee ", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 25, "image": "https://cdn.kivly.store/coffee.png",
+        "termsAndConditions": " One per visit ",
+        "validFrom": "2030-01-01T10:00:00Z", "validUntil": "2030-02-01T10:00:00+00:00",
+        "maxRedemptions": 100, "maxRedemptionsPerUser": 1,
+    })
+
+    assert created == {"id": "reward-1", "name": "Coffee"}
+    request.assert_called_once_with(
+        "location", "owner", "/api/v1/rewards/",
+        body={
+            "title": "Coffee", "description": "A coffee", "rewardType": "free_item",
+            "value": 1, "pointsRequired": 25,
+            "image": "https://cdn.kivly.store/coffee.png",
+            "termsAndConditions": "One per visit",
+            "validFrom": "2030-01-01T10:00:00+00:00",
+            "validUntil": "2030-02-01T10:00:00+00:00",
+            "maxRedemptions": 100, "maxRedemptionsPerUser": 1,
+        },
+        expected_status=201,
+    )
+
+
+@pytest.mark.parametrize("reward", [
+    {},
+    {"title": "Coffee", "description": "A coffee", "rewardType": "other", "value": 1, "pointsRequired": 0},
+    {"title": "Coffee", "description": "A coffee", "rewardType": "free_item", "value": True, "pointsRequired": 0},
+    {"title": "Coffee", "description": "A coffee", "rewardType": "free_item", "value": 1, "pointsRequired": -1},
+    {"title": "Coffee", "description": "A coffee", "rewardType": "free_item", "value": 1, "pointsRequired": 0,
+     "validFrom": "2030-02-01T00:00:00Z", "validUntil": "2030-01-01T00:00:00Z"},
+    {"title": "Coffee", "description": "A coffee", "rewardType": "free_item", "value": 1, "pointsRequired": 0,
+     "image": "javascript:alert(1)"},
+    {"title": "Coffee", "description": "A coffee", "rewardType": "free_item", "value": 1, "pointsRequired": 0,
+     "unexpected": True},
+])
+def test_create_reward_rejects_invalid_input_before_post(client, monkeypatch, reward):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    request = MagicMock()
+    monkeypatch.setattr(client, "_scoped_request", request)
+    with pytest.raises(KivlyError, match="KivlyRewardInvalid"):
+        client.create_reward("location", "owner", reward)
+    request.assert_not_called()
+
+
+def test_create_reward_does_not_repeat_uncertain_mutations(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    request = MagicMock(side_effect=KivlyError("KivlyUnavailable"))
+    monkeypatch.setattr(client, "_scoped_request", request)
+    reward = {
+        "title": "Coffee", "description": "A coffee", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 0,
+    }
+
+    with pytest.raises(KivlyError, match="KivlyRewardCreationUncertain"):
+        client.create_reward("location", "owner", reward)
+    request.assert_called_once()
+
+
+def test_create_reward_marks_invalid_success_response_uncertain(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    monkeypatch.setattr(client, "_scoped_request", lambda *args, **kwargs: {"id": "reward-1"})
+    reward = {
+        "title": "Coffee", "description": "A coffee", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 0,
+    }
+
+    with pytest.raises(KivlyError, match="KivlyRewardCreationUncertain"):
+        client.create_reward("location", "owner", reward)
+
+
+def test_scoped_reward_post_uses_http_201_and_json_body(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    sender = MagicMock(return_value={"accepted": True})
+    monkeypatch.setattr(client, "_send_request", sender)
+    payload = {"title": "Coffee", "description": "A coffee"}
+
+    client._scoped_request(
+        "location", "owner", "/api/v1/rewards/", body=payload, expected_status=201,
+    )
+
+    request = sender.call_args.args[0]
+    assert request.method == "POST"
+    assert request.full_url == "https://api.getkivly.com/api/v1/rewards/"
+    assert json.loads(request.data) == payload
+    assert sender.call_args.kwargs["expected_status"] == 201
+
+
 def test_authentication_cache_is_private_and_reused(client, monkeypatch):
     request = MagicMock(return_value=token_response())
     monkeypatch.setattr(client, "_request", request)
