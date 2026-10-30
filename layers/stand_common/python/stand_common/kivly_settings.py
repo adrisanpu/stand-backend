@@ -165,9 +165,9 @@ def handle_game(event, method, dynamo, games, *, catalog=False):
         owner = claims.get("sub")
         if not owner:
             return _resp(401, {"ok": False, "error": "Unauthorized"})
-        if method not in ("GET", "PUT"):
+        if method not in (("GET", "POST") if catalog else ("GET", "PUT")):
             return _resp(405, {"ok": False, "error": "MethodNotAllowed"})
-        body = _read_json_body(event) if method == "PUT" else event.get("queryStringParameters") or {}
+        body = _read_json_body(event) if method == "POST" or method == "PUT" else event.get("queryStringParameters") or {}
         if not isinstance(body, dict) or not isinstance(body.get("gameId"), str):
             return _resp(400, {"ok": False, "error": "InvalidGameId"})
         meta = games.get_item(Key={"gameId": body["gameId"]}, ConsistentRead=True).get("Item")
@@ -178,13 +178,41 @@ def handle_game(event, method, dynamo, games, *, catalog=False):
 
         conn = registration.connection(dynamo, owner)
         if catalog:
-            if method != "GET":
+            if method not in ("GET", "POST"):
                 return _resp(405, {"ok": False, "error": "MethodNotAllowed"})
             if not conn:
                 return _resp(409, {"ok": False, "error": "KivlyConnectionRequired"})
-            return _resp(200, {"ok": True, "rewards": registration._client(conn).list_rewards(
-                conn["locationId"], conn["ownerId"],
-            )})
+            if method == "POST" and os.environ.get(
+                "KIVLY_EXTERNAL_WRITES_ENABLED", "true",
+            ).lower() != "true":
+                log("kivly_reward_write_blocked", {
+                    "stage": "reward_create", "code": "KivlyWritesDisabled",
+                })
+                raise registration.RegistrationError("KivlyWritesDisabled", 503)
+            if method == "GET":
+                client = registration._client(conn)
+                return _resp(200, {"ok": True, "rewards": client.list_rewards(
+                    conn["locationId"], conn["ownerId"],
+                )})
+            allowed = {
+                "gameId", "title", "description", "rewardType", "value", "pointsRequired",
+                "image", "termsAndConditions", "validFrom", "validUntil",
+                "maxRedemptions", "maxRedemptionsPerUser",
+            }
+            if set(body) - allowed:
+                raise registration.RegistrationError("KivlyRewardInvalid", 400)
+            client = registration._client(conn)
+            try:
+                reward = client.create_reward(
+                    conn["locationId"], conn["ownerId"],
+                    {key: value for key, value in body.items() if key != "gameId"},
+                )
+            except registration.KivlyError as exc:
+                registration._log_upstream_failure("reward_create", exc)
+                if exc.code == "KivlyRewardInvalid":
+                    raise registration.RegistrationError("KivlyRewardInvalid", 400) from None
+                raise
+            return _resp(201, {"ok": True, "reward": reward})
 
         if method == "GET":
             return _resp(200, {"ok": True, "connection": {"connected": bool(conn)},
