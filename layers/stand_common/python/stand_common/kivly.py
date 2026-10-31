@@ -220,7 +220,7 @@ class KivlyClient:
             requests_per_hour=result["requests_per_hour"], resources=tuple(result["resources"]),
         )
 
-    def _customers(self, location_id, owner_id, *, page=None, customer=None):
+    def _customers(self, location_id, owner_id, *, page=None, customer=None, search=None):
         token = self._authenticate()
         if token.location_id != location_id or token.owner_id != owner_id:
             raise KivlyError("KivlyScopeMismatch")
@@ -234,7 +234,10 @@ class KivlyClient:
             headers["Content-Type"] = "application/json"
             data = json.dumps(customer).encode("utf-8")
         else:
-            url += "?" + urlencode({"page": page, "limit": 100, "include_balance": "false"})
+            query = {"page": page, "limit": 100, "include_balance": "false"}
+            if search is not None:
+                query["search"] = search
+            url += "?" + urlencode(query)
         return self._send_request(
             Request(url, method="POST" if customer is not None else "GET",
                     headers=headers, data=data),
@@ -425,12 +428,15 @@ class KivlyClient:
         return result
 
     def find_customer(self, location_id, owner_id, email):
-        # Filtered search has returned an inconsistent total in a controlled test.
-        # Only a complete, bounded unfiltered listing may establish absence.
+        if not _text(email, 254):
+            raise KivlyError("KivlyCustomerInvalid")
+        email = email.strip().casefold()
+        # Search is broad (name/email/phone); only exact email matches qualify.
+        # A complete filtered listing is still required to rule out duplicates.
         seen, matches = set(), []
         total = None
         for page in range(1, 6):
-            result = self._customers(location_id, owner_id, page=page)
+            result = self._customers(location_id, owner_id, page=page, search=email)
             rows = result.get("data")
             if (
                 not isinstance(rows, list) or len(rows) > 100
@@ -454,7 +460,7 @@ class KivlyClient:
                 ):
                     raise KivlyError("KivlyResponseInvalid")
                 seen.add(row["id"])
-                if (row.get("email") or "").strip().casefold() == email.strip().casefold():
+                if (row.get("email") or "").strip().casefold() == email:
                     matches.append(row)
             if not result["has_next"]:
                 if len(seen) != total:

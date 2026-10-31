@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from stand_common import kivly_registration as registration
-from stand_common.kivly import KivlyError
+from stand_common.kivly import KivlyClient, KivlyError
 from stand_common.stack import DEFAULT_CONFIG
 from tests.email_fake import FakeDynamoError
 from tests.test_email_verification import (
@@ -191,6 +191,64 @@ def test_existing_active_customer_is_reused_without_modification(club):
     assert club["dynamo"].rows("players")[0]["kivlyMembership"]["phone"] == "+34 999999999"
     assert club["dynamo"].rows("players")[0]["phone"] == "+34 612345678"
     club["client"].create_customer.assert_not_called()
+
+
+@pytest.mark.parametrize("business_size", [501, 5001])
+@pytest.mark.parametrize("exists", [False, True])
+def test_verified_join_in_large_business_uses_filtered_lookup_and_creates_at_most_once(
+    club, monkeypatch, business_size, exists,
+):
+    customers = [{"id": f"other-{index}", "email": f"other-{index}@club.test"}
+                 for index in range(business_size)]
+    if exists:
+        customers[-1] = {"id": "existing", "email": EMAIL, "is_active": True,
+                         "phone": "+34 612345678"}
+    client = KivlyClient("test-client", "test-secret")
+
+    def customer_request(location, owner, *, page=None, search=None, customer=None):
+        assert (location, owner) == ("location", "business-owner")
+        if customer is not None:
+            assert club["table"].intents[-1]["state"] == "creating"
+            created = {**customer, "id": "created", "is_active": True}
+            customers.append(created)
+            return created
+        assert page == 1
+        assert search == EMAIL.strip().casefold()
+        rows = [row for row in customers if search in row["email"]]
+        return {"data": rows, "total": len(rows), "page": page, "limit": 100,
+                "has_next": False, "has_previous": False}
+
+    requests = MagicMock(side_effect=customer_request)
+    monkeypatch.setattr(client, "_customers", requests)
+    monkeypatch.setattr(registration, "_client", lambda *_: client)
+    requested = club_request(club)
+    first = club_join(club, requested)
+    second = club_join(club, requested)
+
+    assert first["statusCode"] == second["statusCode"] == 200
+    assert club["dynamo"].rows("players")[0]["kivlyMembership"]["customerId"] == (
+        "existing" if exists else "created"
+    )
+    writes = [call for call in requests.call_args_list if call.kwargs.get("customer") is not None]
+    assert len(writes) == (0 if exists else 1)
+
+
+def test_inconsistent_filtered_total_never_creates_customer_or_player(club, monkeypatch):
+    client = KivlyClient("test-client", "test-secret")
+    requests = MagicMock(return_value={
+        "data": [], "total": 501, "page": 1, "limit": 100,
+        "has_next": False, "has_previous": False,
+    })
+    monkeypatch.setattr(client, "_customers", requests)
+    monkeypatch.setattr(registration, "_client", lambda *_: client)
+    response = club_join(club, club_request(club))
+    assert response["statusCode"] == 503
+    assert response_body(response)["error"] == "KivlySearchIncomplete"
+    requests.assert_called_once_with(
+        "location", "business-owner", page=1, search=EMAIL.strip().casefold(),
+    )
+    assert club["table"].items == {}
+    assert club["dynamo"].rows("players") == []
 
 
 def confirmed_identity(club, customer_id="deleted-customer"):

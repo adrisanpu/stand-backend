@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -204,16 +205,93 @@ def test_customer_operations_reject_scope_mismatch_before_network(client, monkey
     client._opener.open.assert_not_called()
 
 
-def test_customer_lookup_requires_complete_listing_and_normalizes_email(client, monkeypatch):
+def test_customer_lookup_requires_complete_filtered_listing_and_normalizes_email(client, monkeypatch):
     pages = iter([
         customer_page([{"id": "unrelated", "email": None}], total=2, has_next=True),
         customer_page([{"id": "match", "email": " Player@Club.Test "}], total=2, page=2),
     ])
     lookup = MagicMock(side_effect=lambda *args, **kwargs: next(pages))
     monkeypatch.setattr(client, "_customers", lookup)
-    assert client.find_customer("location", "owner", "player@club.test")["id"] == "match"
+    assert client.find_customer("location", "owner", " Player@Club.Test ")["id"] == "match"
     assert lookup.call_count == 2
-    lookup.assert_any_call("location", "owner", page=2)
+    lookup.assert_any_call("location", "owner", page=1, search="player@club.test")
+    lookup.assert_any_call("location", "owner", page=2, search="player@club.test")
+
+
+@pytest.mark.parametrize("business_size", [501, 5001])
+@pytest.mark.parametrize("exists", [False, True])
+def test_large_business_lookup_only_requests_filtered_results(client, monkeypatch, business_size, exists):
+    customers = [{"id": f"customer-{index}", "email": f"other-{index}@club.test"}
+                 for index in range(business_size)]
+    if exists:
+        customers[-1]["email"] = "player+event@club.test"
+    monkeypatch.setattr(client, "_authenticate", lambda: _Token("token", "location", "owner", 99999))
+
+    def respond(request, **kwargs):
+        query = parse_qs(urlsplit(request.full_url).query)
+        assert request.method == "GET"
+        assert request.data is None
+        assert query == {
+            "page": ["1"], "limit": ["100"], "include_balance": ["false"],
+            "search": ["player+event@club.test"],
+        }
+        rows = [row for row in customers if query["search"][0] in row["email"]]
+        return customer_page(rows)
+
+    sender = MagicMock(side_effect=respond)
+    monkeypatch.setattr(client, "_send_request", sender)
+    result = client.find_customer("location", "owner", " Player+Event@Club.Test ")
+    assert result == (customers[-1] if exists else None)
+    sender.assert_called_once()
+    assert "%2B" in sender.call_args.args[0].full_url
+
+
+def test_customer_read_access_check_remains_unfiltered(client, monkeypatch):
+    monkeypatch.setattr(client, "_authenticate", lambda: _Token("token", "location", "owner", 99999))
+    sender = MagicMock(return_value=customer_page([]))
+    monkeypatch.setattr(client, "_send_request", sender)
+    client._customers("location", "owner", page=1)
+    assert "search" not in parse_qs(urlsplit(sender.call_args.args[0].full_url).query)
+
+
+def test_partial_search_matches_do_not_count_as_exact_email(client, monkeypatch):
+    monkeypatch.setattr(client, "_customers", lambda *args, **kwargs: customer_page([
+        {"id": "name-match", "name": "player@club.test", "email": None},
+        {"id": "partial-email", "email": "other-player@club.test"},
+    ]))
+    assert client.find_customer("location", "owner", "player@club.test") is None
+
+
+def test_filtered_search_rejects_changed_total(client, monkeypatch):
+    pages = iter([
+        customer_page([{"id": "one"}], total=2, has_next=True),
+        customer_page([{"id": "two"}], total=3, page=2),
+    ])
+    monkeypatch.setattr(client, "_customers", lambda *args, **kwargs: next(pages))
+    with pytest.raises(KivlyError, match="KivlySearchIncomplete"):
+        client.find_customer("location", "owner", "player@club.test")
+
+
+@pytest.mark.parametrize("email", [None, "", " ", "bad\nemail", "x" * 255])
+def test_customer_lookup_rejects_invalid_email_before_network(client, monkeypatch, email):
+    lookup = MagicMock()
+    monkeypatch.setattr(client, "_customers", lookup)
+    with pytest.raises(KivlyError, match="KivlyCustomerInvalid"):
+        client.find_customer("location", "owner", email)
+    lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("status,code", [(429, "KivlyRateLimited"), (503, "KivlyUnavailable")])
+def test_filtered_search_preserves_upstream_failure_without_retry(client, monkeypatch, status, code):
+    monkeypatch.setattr(client, "_authenticate", lambda: _Token("token", "location", "owner", 99999))
+    client._opener.open.side_effect = HTTPError(
+        kivly.BASE_URL + "/api/v1/customers/", status, "unavailable", {"Retry-After": "5"}, io.BytesIO(),
+    )
+    with pytest.raises(KivlyError, match=code) as error:
+        client.find_customer("location", "owner", "player@club.test")
+    assert error.value.http_status == status
+    assert error.value.retry_after == 5
+    client._opener.open.assert_called_once()
 
 
 @pytest.mark.parametrize("page", [
