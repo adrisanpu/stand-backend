@@ -20,7 +20,9 @@ from stand_common.prizes import prize_image_key
 from stand_common.stack import get_ranking
 from stand_common.utils import _iso_now, get_game_type_blob, log
 
-CONDITIONS = {"completed", "top_finish", "top_final", "raffle"}
+CONDITIONS = {"completed", "top_finish", "top_final", "raffle", "score"}
+SCORE_OPERATORS = {">", ">=", "=", "<=", "<", "between"}
+MAX_SCORE = 9007199254740991
 ID = re.compile(r"[a-zA-Z0-9_-]{1,80}", re.ASCII)
 
 
@@ -285,7 +287,8 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
         if (not isinstance(rule, dict) or not isinstance(rule.get("id"), str)
                 or not ID.fullmatch(rule["id"]) or rule["id"] in rule_ids
                 or not isinstance(rule.get("condition"), str) or rule["condition"] not in CONDITIONS
-                or set(rule) - {"id", "condition", "topX", "groups"}):
+                or set(rule) - {"id", "condition", "topX", "groups", "scoreOperator",
+                                "scoreValue", "scoreMaxValue"}):
             raise PrizeError("InvalidStackPrizeRule", 400)
         rule_ids.add(rule["id"])
         groups = rule.get("groups")
@@ -308,6 +311,22 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
             if type(top) is not int or not 1 <= top <= 100:
                 raise PrizeError("InvalidStackPrizeTop", 400)
             value["topX"] = top
+        if rule["condition"] == "score":
+            operator = rule.get("scoreOperator")
+            score_value = rule.get("scoreValue")
+            if (not isinstance(operator, str) or operator not in SCORE_OPERATORS
+                    or type(score_value) is not int or not 0 <= score_value <= MAX_SCORE):
+                raise PrizeError("InvalidStackPrizeScore", 400)
+            value.update(scoreOperator=operator, scoreValue=score_value)
+            if operator == "between":
+                maximum = rule.get("scoreMaxValue")
+                if type(maximum) is not int or not score_value <= maximum <= MAX_SCORE:
+                    raise PrizeError("InvalidStackPrizeScore", 400)
+                value["scoreMaxValue"] = maximum
+            elif "scoreMaxValue" in rule:
+                raise PrizeError("InvalidStackPrizeScore", 400)
+        elif any(key in rule for key in ("scoreOperator", "scoreValue", "scoreMaxValue")):
+            raise PrizeError("InvalidStackPrizeRule", 400)
         if rule["condition"] == "raffle" and not raffles_enabled and rule != previous_rules.get(rule["id"]):
             raise PrizeError("RafflePlanRequired", 403)
         old = previous_rules.get(value["id"])
@@ -361,6 +380,8 @@ def promotional_rules(meta):
             result.append({
                 "condition": rule["condition"],
                 **({"topX": rule["topX"]} if "topX" in rule else {}),
+                **({key: rule[key] for key in ("scoreOperator", "scoreValue", "scoreMaxValue")
+                    if key in rule}),
                 "names": [p["name"] for p in configured],
                 "prizes": [{"id": p["id"], "name": p["name"], "imageUrl": image_url(p, meta)}
                            for p in configured],
@@ -421,12 +442,32 @@ def updated_stock(meta, program, existing_awards=()):
     return result
 
 
-def award_rows(meta, player, program, conditions, rank=None):
+def score_matches(rule, score):
+    if type(score) not in (int, Decimal) or (
+            isinstance(score, Decimal) and not score.is_finite()):
+        return False
+    operator, value = rule["scoreOperator"], rule["scoreValue"]
+    if operator == ">":
+        return score > value
+    if operator == ">=":
+        return score >= value
+    if operator == "=":
+        return score == value
+    if operator == "<=":
+        return score <= value
+    if operator == "<":
+        return score < value
+    return value <= score <= rule["scoreMaxValue"]
+
+
+def award_rows(meta, player, program, conditions, rank=None, score=None):
     program = upgrade_program(program)
     catalog = {p["id"]: p for p in program["catalog"]}
     rows = []
     for rule in program["rules"]:
         if rule["condition"] not in conditions:
+            continue
+        if rule["condition"] == "score" and not score_matches(rule, score):
             continue
         if rule["condition"].startswith("top_") and (rank is None or rank > rule["topX"]):
             continue
@@ -475,9 +516,11 @@ def allocation_id(job_id, player_id, rule_id):
     return "allocation_" + digest
 
 
-def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existing_records=None):
+def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existing_records=None, score=None):
     program = upgrade_program(program)
     rule = next(r for r in program["rules"] if r["id"] == rule["id"])
+    if rule["condition"] == "score" and not score_matches(rule, score):
+        return
     if rule["condition"].startswith("top_") and (rank is None or rank > rule["topX"]):
         return
     key = {"gameId": meta["gameId"], "id": allocation_id(job_id, player["playerId"], rule["id"])}
@@ -592,8 +635,8 @@ def finish(dynamo, meta, player, final_attempt, score):
         "ExpressionAttributeValues": values}}
     operations = [game_update(meta, ""), op]
     task = None
-    if any(rule["condition"] in {"completed", "top_finish"} for rule in program["rules"]):
-        task = job(meta, "finish", [{"playerId": int(player["playerId"]), "rank": rank}])
+    if any(rule["condition"] in {"completed", "top_finish", "score"} for rule in program["rules"]):
+        task = job(meta, "finish", [{"playerId": int(player["playerId"]), "rank": rank, "score": score}])
         task["id"] = "job_" + hashlib.sha256(json.dumps([
             meta["gameId"], int(player["playerId"]), final_attempt["attemptId"],
         ]).encode()).hexdigest()

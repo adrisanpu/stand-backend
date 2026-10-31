@@ -59,6 +59,8 @@ class FakeTable:
     def query(self, **kwargs):
         key_condition = kwargs.get("KeyConditionExpression")
         game_id = getattr(getattr(key_condition, "values", None), "gameId", None)
+        if game_id is None and getattr(key_condition, "field", None) == "gameId":
+            game_id = getattr(key_condition, "value", None)
         if game_id is None:
             # boto3's condition stub is a MagicMock in this test environment.
             game_id = kwargs.get("game_id")
@@ -163,6 +165,13 @@ class FakeTable:
             )
         if "attribute_not_exists(playerId)" in condition:
             return not exists
+        if "attribute_exists(playerId) AND attribute_not_exists(" in condition:
+            attribute = condition.split("attribute_not_exists(", 1)[1].split(")", 1)[0]
+            return exists and "playerId" in item and names.get(attribute, attribute) not in item
+        if "attribute_exists(playerId) AND #" in condition and " = :old" in condition:
+            attribute = condition.split(" AND ", 1)[1].split(" = ", 1)[0]
+            attribute = names.get(attribute, attribute)
+            return exists and "playerId" in item and item.get(attribute) == values[":old"]
         if "attribute_exists(playerId)" in condition:
             return exists and "playerId" in item
         if "attribute_exists(gameId)" in condition:
@@ -200,6 +209,10 @@ class FakeTable:
             return
         if "if_not_exists(verifiedAt, :now)" in expression:
             item.setdefault("verifiedAt", values[":now"])
+            return
+        if expression.startswith("SET #username = :new") or expression.startswith("SET #phone = :new"):
+            field_token = expression.split(" ", 2)[1]
+            item[names[field_token]] = values[":new"]
             return
         if "emailVerifiedAt = if_not_exists" in expression:
             item.setdefault("emailVerifiedAt", values[":at"])

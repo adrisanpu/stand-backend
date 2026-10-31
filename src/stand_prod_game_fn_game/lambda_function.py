@@ -99,6 +99,7 @@ def _public_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
         "gameType": item.get("gameType"),
         "createdAt": item.get("createdAt"),
         "maxPlayers": item.get("maxPlayers"),
+        "showRaffleOnHome": item.get("showRaffleOnHome", True),
         "participantFields": normalize_participant_fields(item.get("gameType") or "", item.get("participantFields")),
     }
     shape = {k: v for k, v in shape.items() if v is not None}
@@ -773,6 +774,9 @@ def _handle_post(event):
             "supportedGameTypes": sorted(SUPPORTED_GAME_TYPES),
         })
 
+    if "showRaffleOnHome" in body and type(body["showRaffleOnHome"]) is not bool:
+        return _resp(400, {"error": "showRaffleOnHome must be a boolean."})
+
     if ("playMode" in body and body["playMode"] is None) or (
         "joinChannel" in body and body["joinChannel"] is None
     ):
@@ -867,6 +871,7 @@ def _handle_post(event):
             "playersCount": 0,
             "validatedCount": 0,
             "raffleWinners": [],
+            "showRaffleOnHome": body.get("showRaffleOnHome", True),
             "requiresValidation": requires_validation,
             "playMode": access["playMode"],
             "joinChannel": access["joinChannel"],
@@ -954,6 +959,8 @@ def _handle_put(event):
     participant_fields = body.get("participantFields")
     join_channel = body.get("joinChannel")
     play_mode = body.get("playMode")
+    if "showRaffleOnHome" in body and type(body["showRaffleOnHome"]) is not bool:
+        return _resp(400, {"error": "showRaffleOnHome must be a boolean."})
 
     if ("playMode" in body and play_mode is None) or (
         "joinChannel" in body and join_channel is None
@@ -972,6 +979,7 @@ def _handle_put(event):
         and participant_fields is None
         and join_channel is None
         and play_mode is None
+        and "showRaffleOnHome" not in body
         and not prize_catalog_supplied
     ):
         return _resp(400, {"error": "Provide at least one game update, including 'prizeCatalog'."})
@@ -1119,6 +1127,22 @@ def _handle_put(event):
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
             log("Update participantFields failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
+
+    if "showRaffleOnHome" in body:
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET showRaffleOnHome = :show, updatedAt = :u",
+                ExpressionAttributeValues={
+                    ":show": body["showRaffleOnHome"], ":u": now, ":owner": owner_user_id,
+                },
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update home raffle visibility failed", {"error": str(exc)})
+            return _resp(500, {"error": "UpdateFailed"})
 
     if access is not None:
         # Single write: playMode and joinChannel are always persisted together.

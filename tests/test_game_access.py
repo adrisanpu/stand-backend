@@ -130,6 +130,48 @@ def test_create_persists_both_fields(body, expected):
     assert (item["playMode"], item["joinChannel"]) == expected
     created = json.loads(response["body"])["game"]
     assert (created["playMode"], created["joinChannel"]) == expected
+    assert created["showRaffleOnHome"] is True
+
+
+@pytest.mark.parametrize("show", [True, False])
+def test_home_raffle_visibility_create_and_read(show):
+    response, table = _create({"gameType": "T1MER", "showRaffleOnHome": show})
+    assert response["statusCode"] == 201
+    item = table.put_item.call_args.kwargs["Item"]
+    assert game._public_game_shape(item)["showRaffleOnHome"] is show
+    assert game._public_game_shape({"gameType": "T1MER"})["showRaffleOnHome"] is True
+
+
+@pytest.mark.parametrize("show", [True, False])
+def test_home_raffle_visibility_can_be_updated_alone(show):
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"gameId": "ABCDEF", "gameType": "T1MER", "ownerUserId": "owner"}}
+    with patch.object(game, "games_table", table):
+        response = game._handle_put(operator_event({"gameId": "ABCDEF", "showRaffleOnHome": show}))
+    assert response["statusCode"] == 200
+    write = table.update_item.call_args.kwargs
+    assert write["ExpressionAttributeValues"][":show"] is show
+    assert "ownerUserId = :owner" in write["ConditionExpression"]
+
+
+@pytest.mark.parametrize("show", [None, "false", 0, 1, []])
+def test_home_raffle_visibility_rejects_non_booleans(show):
+    response, table = _create({"gameType": "T1MER", "showRaffleOnHome": show})
+    assert response["statusCode"] == 400
+    table.put_item.assert_not_called()
+    with patch.object(game, "games_table", table):
+        response = game._handle_put(operator_event({"gameId": "ABCDEF", "showRaffleOnHome": show}))
+    assert response["statusCode"] == 400
+    table.update_item.assert_not_called()
+
+
+def test_home_raffle_visibility_rejects_other_owner():
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"gameId": "ABCDEF", "gameType": "T1MER", "ownerUserId": "someone-else"}}
+    with patch.object(game, "games_table", table):
+        response = game._handle_put(operator_event({"gameId": "ABCDEF", "showRaffleOnHome": False}))
+    assert response["statusCode"] == 403
+    table.update_item.assert_not_called()
 
 
 @pytest.mark.parametrize("body", [

@@ -6,6 +6,24 @@ This runbook requires an authorized AWS operator and the owner of
 `playstand.app` DNS. Repository changes do not provision, verify or deploy
 anything automatically. Production remains a manual, approved release.
 
+## Returning participants
+
+`POST /v1/public/email/request` accepts `mode: "resume"` with `gameId`, `email`
+and optional `language`. A recoverable participant in that same game receives
+the usual email challenge directly. Otherwise the response has
+`detailsRequired: true`, `existingPlayer` and `fields` flags for `username`,
+`phone`, `consent` and `loyaltyConsent`. No profile values or player credentials
+are returned before verification. New participants complete the regular signup;
+existing participants submit only the requested fields in resume mode.
+
+Existing email-code verification is evidence of the original privacy acceptance.
+Legacy records without that evidence require acceptance again. Club acceptance
+must match the current version and location. Missing profile fields are written
+only after successful code verification; existing names, photos and game progress
+are preserved. Resending uses the same endpoint, cooldown and quotas. The
+different next screens necessarily disclose whether an email has a recoverable
+registration; they do not grant access without the code.
+
 ## 1. Establish one shared domain identity
 
 Use AWS profile `stand-deploy-cli` in the same account as the backend. First

@@ -47,7 +47,7 @@ def dispatch():
 def grant(row):
     meta = {"gameId": row["gameId"], "ownerUserId": row["ownerUserId"]}
     program = prizes.upgrade_program(row["program"])
-    conditions = {"completed", "top_finish"} if row["condition"] == "finish" else {row["condition"]}
+    conditions = {"completed", "top_finish", "score"} if row["condition"] == "finish" else {row["condition"]}
     existing_records = prizes.records(dynamo, row["gameId"])
     for winner in row["winners"][:5]:
         player = dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
@@ -64,9 +64,10 @@ def grant(row):
             if rule["condition"] in conditions and not (
                 rule["condition"].startswith("top_")
                 and (winner.get("rank") is None or winner["rank"] > rule["topX"])
-            ):
+            ) and (rule["condition"] != "score" or prizes.score_matches(rule, winner.get("score"))):
                 prizes.allocate_rule(
                     dynamo, meta, player, program, rule, row["id"], winner.get("rank"), existing_records,
+                    score=winner.get("score"),
                 )
     if len(row["winners"]) > 5:
         prizes.table(dynamo).update_item(

@@ -75,6 +75,7 @@ def rig(monkeypatch):
     monkeypatch.setattr(public_mod, "games_table", dynamo.Table("games"))
     monkeypatch.setattr(public_mod, "gp_table", dynamo.Table("players"))
     monkeypatch.setattr(assign_mod, "Key", FakeKeyExpression)
+    monkeypatch.setattr(public_mod, "Key", FakeKeyExpression)
     monkeypatch.setattr(assign_mod, "ClientError", FakeDynamoError)
     monkeypatch.setattr(assign_mod, "ASSIGNERS", {
         "T1MER": lambda _event: {"type": {"T1MER": {}}},
@@ -117,6 +118,172 @@ def request_code(email=EMAIL, game_id=GAME_ID, ip="203.0.113.8", **overrides):
 def sent_code(rig, index=-1):
     text = rig["ses"].sent[index]["Message"]["Body"]["Text"]["Data"]
     return re.search(r"\b(\d{6})\b", text).group(1)
+
+
+def resume_request(**overrides):
+    return api_call("email/request", {
+        "mode": "resume", "gameId": GAME_ID, "email": EMAIL, **overrides,
+    })
+
+
+def seed_returning_player(rig, **overrides):
+    player = {
+        "gameId": GAME_ID, "playerId": 1, "email": EMAIL, "username": "Original",
+        "emailVerifiedAt": "2026-01-01T00:00:00Z", "emailVerificationMethod": "email-code",
+        "validated": True, "validationCode": 1234, "type": {"T1MER": {"score": 99, "timer": 1.0}},
+        "profilePicUrl": "https://example.test/profile.png", **overrides,
+    }
+    rig["dynamo"].seed("players", player)
+    return player
+
+
+def test_resume_unknown_email_requests_details_without_email_or_personal_data(rig):
+    response = resume_request()
+    assert response["statusCode"] == 200
+    body = response_body(response)
+    assert body == {
+        "ok": True, "detailsRequired": True, "existingPlayer": False,
+        "fields": {"username": True, "phone": False, "consent": True, "loyaltyConsent": False},
+    }
+    assert rig["ses"].sent == []
+    assert rig["dynamo"].rows("verification") == []
+
+
+def test_resume_existing_player_issues_code_and_restores_same_progress(rig):
+    player = seed_returning_player(rig)
+    response = resume_request(email=" PLAYER@EXAMPLE.COM ")
+    assert response["statusCode"] == 200
+    body = response_body(response)
+    assert set(body) == {"ok", "challengeId", "emailMasked", "expiresAt", "resendAvailableAt"}
+    assert "Original" not in json.dumps(body)
+    joined = join(rig, body["challengeId"], sent_code(rig))
+    assert joined["statusCode"] == 200
+    result = response_body(joined)
+    assert result["alreadyJoined"] is True
+    assert result["assignment"]["playerId"] == 1
+    assert result["assignment"]["score"] == 99
+    stored = rig["dynamo"].Table("players").get_item(Key={"gameId": GAME_ID, "playerId": 1})["Item"]
+    assert stored["username"] == player["username"]
+    assert stored["profilePicUrl"] == player["profilePicUrl"]
+    assert stored["type"] == player["type"]
+    assert len(rig["dynamo"].rows("players")) == 1
+
+
+def test_resume_does_not_reuse_another_games_registration(rig):
+    seed_returning_player(rig, gameId="OTHER1")
+    response = resume_request()
+    assert response_body(response)["existingPlayer"] is False
+    assert rig["ses"].sent == []
+
+
+def test_resume_legacy_player_requires_only_unproven_consent(rig):
+    seed_returning_player(rig, emailVerifiedAt=None)
+    body = response_body(resume_request())
+    assert body["fields"] == {"username": False, "phone": False, "consent": True, "loyaltyConsent": False}
+    assert rig["ses"].sent == []
+    assert resume_request(consent=False)["statusCode"] == 400
+    assert resume_request(consent=True)["statusCode"] == 200
+    assert len(rig["ses"].sent) == 1
+
+
+def test_resume_cannot_replace_existing_identity_fields_or_fabricate_consent(rig):
+    seed_returning_player(rig)
+    for fields in ({"username": "Attacker"}, {"phone": "+34600000000"}, {"consent": True}):
+        response = resume_request(**fields)
+        assert response["statusCode"] == 400
+        assert response_body(response)["error"] == "UnexpectedResumeField"
+    assert rig["ses"].sent == []
+
+
+def test_resume_fills_missing_name_only_after_code_verification(rig):
+    seed_returning_player(rig, username="")
+    body = response_body(resume_request())
+    assert body["fields"]["username"] is True
+    assert body["fields"]["consent"] is False
+    response = response_body(resume_request(username="Recovered"))
+    assert rig["dynamo"].rows("players")[0]["username"] == ""
+    assert join(rig, response["challengeId"], "999999")["statusCode"] == 400
+    assert rig["dynamo"].rows("players")[0]["username"] == ""
+    result = join(rig, response["challengeId"], sent_code(rig))
+    assert result["statusCode"] == 200
+    assert rig["dynamo"].rows("players")[0]["username"] == "Recovered"
+
+
+def test_resume_missing_required_phone_cannot_skip_details(rig):
+    seed_returning_player(rig)
+    game = rig["dynamo"].rows("games")[0]
+    game["gameType"] = "STACK"
+    rig["dynamo"].seed("games", game)
+    body = response_body(resume_request())
+    assert body["fields"] == {"username": False, "phone": True, "consent": False, "loyaltyConsent": False}
+    assert resume_request(phone="bad")["statusCode"] == 400
+    assert rig["ses"].sent == []
+    response = resume_request(phone="+34 612345678")
+    assert response["statusCode"] == 200
+    assert "challengeId" in response_body(response)
+
+
+def test_resume_retains_cooldown_and_resend_limits(rig, monkeypatch):
+    seed_returning_player(rig)
+    first = response_body(resume_request())
+    limited = resume_request()
+    assert limited["statusCode"] == 429
+    assert response_body(limited)["error"] == "EmailRateLimited"
+    now = verification.time.time()
+    monkeypatch.setattr(verification.time, "time", lambda: now + 61)
+    second = response_body(resume_request())
+    assert second["challengeId"] != first["challengeId"]
+    assert len(rig["ses"].sent) == 2
+    assert join(rig, first["challengeId"], sent_code(rig, 0))["statusCode"] == 409
+
+
+@pytest.mark.parametrize("email", ["invalid", "", None, 123])
+def test_resume_rejects_invalid_email(rig, email):
+    assert resume_request(email=email)["statusCode"] == 400
+    assert rig["ses"].sent == []
+
+
+def test_resume_changed_club_terms_need_explicit_acceptance(rig, monkeypatch):
+    from stand_common import kivly_registration
+    seed_returning_player(rig, kivlyMembership={
+        "consentVersion": "old-version", "locationId": "location1", "customerId": "customer1",
+    })
+    monkeypatch.setattr(kivly_registration, "game_settings", lambda meta: {
+        "enabled": True, "consentVersion": "new-version", "locationId": "location1",
+    })
+    monkeypatch.setattr(verification, "game_settings", kivly_registration.game_settings)
+    body = response_body(resume_request())
+    assert body["fields"]["loyaltyConsent"] is True
+    assert body["fields"]["username"] is False
+    assert rig["ses"].sent == []
+    assert resume_request(loyaltyConsentVersion="old-version")["statusCode"] == 400
+    accepted = resume_request(loyaltyConsentVersion="new-version")
+    assert accepted["statusCode"] == 200
+    assert "challengeId" in response_body(accepted)
+
+
+def test_resume_current_club_consent_does_not_need_acceptance_again(rig, monkeypatch):
+    seed_returning_player(rig, kivlyMembership={
+        "consentVersion": "current-version", "locationId": "location1", "customerId": "customer1",
+    })
+    monkeypatch.setattr(verification, "game_settings", lambda meta: {
+        "enabled": True, "consentVersion": "current-version", "locationId": "location1",
+    })
+    monkeypatch.setattr(verification, "consent_values", lambda meta, values: {
+        "loyaltyConsentVersion": values["loyaltyConsentVersion"],
+    })
+    body = response_body(resume_request())
+    assert "challengeId" in body
+    assert len(rig["ses"].sent) == 1
+
+
+def test_resume_delivery_failure_returns_error_not_details_or_access(rig):
+    seed_returning_player(rig)
+    rig["ses"].exception = FakeDynamoError("MessageRejected")
+    response = resume_request()
+    assert response["statusCode"] == 502
+    assert response_body(response)["error"] == "EmailDeliveryFailed"
+    assert rig["invoke"].calls == []
 
 
 def join(rig, challenge_id, code, game_id=GAME_ID):
