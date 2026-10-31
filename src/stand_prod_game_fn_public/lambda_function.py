@@ -28,11 +28,14 @@ from stand_common.utils import (
     is_valid_join_code,
     issue_player_token,
     get_game_type_blob,
+    is_valid_email,
+    is_valid_phone,
+    normalize_email,
 )
 from stand_common.game_access import resolve_game_access
 from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
-    request_code, confirm_code,
+    request_code, confirm_code, find_verified_player, resume_requirements,
 )
 from stand_common.prizes import serialize_prize_catalog
 from stand_common.rulet4 import game_config as rulet4_game_config
@@ -364,6 +367,8 @@ def _handle_email_request(event):
     try:
         game_id = body.get("gameId")
         meta = _registration_game(game_id)
+        if body.get("mode") == "resume":
+            return _handle_email_resume(event, body, game_id, meta)
         if body.get("consent") is not True:
             return _resp(400, {"ok": False, "error": "ConsentRequired"})
         values = registration_values(meta, body)
@@ -385,6 +390,82 @@ def _handle_email_request(event):
         return _resp(400, {"ok": False, "error": str(exc)})
     except VerificationError as exc:
         return _verification_error(exc)
+
+
+def _handle_email_resume(event, body, game_id, meta):
+    raw_email = body.get("email")
+    if not isinstance(raw_email, str):
+        return _resp(400, {"ok": False, "error": "invalid_email"})
+    email = normalize_email(raw_email)
+    if len(email) > 254 or not is_valid_email(email):
+        return _resp(400, {"ok": False, "error": "invalid_email"})
+    language = body.get("language", "es")
+    if language not in ("es", "en"):
+        return _resp(400, {"ok": False, "error": "InvalidLanguage"})
+
+    table = verification_table(dynamo_r)
+    player = find_verified_player(
+        table, gp_table, PLAYER_TOKEN_SECRET, game_id, email, Key,
+    )
+    needed, stored_values, loyalty_version = resume_requirements(meta, player)
+    supplied_fields = {
+        "username": needed["username"],
+        "phone": needed["phone"],
+        "consent": needed["consent"],
+        "loyaltyConsentVersion": needed["loyaltyConsent"],
+    }
+    allowed = {"gameId", "email", "mode", "language"}
+    allowed.update(name for name, required in supplied_fields.items() if required)
+    unexpected = set(body) - allowed
+    if unexpected:
+        return _resp(400, {"ok": False, "error": "UnexpectedResumeField"})
+    if needed["consent"] and "consent" in body and body["consent"] is not True:
+        return _resp(400, {"ok": False, "error": "ConsentRequired"})
+    if needed["loyaltyConsent"] and "loyaltyConsentVersion" in body:
+        if body["loyaltyConsentVersion"] != loyalty_version:
+            return _resp(400, {"ok": False, "error": "KivlyConsentRequired"})
+
+    candidate = {"email": email, **stored_values}
+    for field in ("username", "phone"):
+        if needed[field] and field in body:
+            candidate[field] = body[field]
+    if "phone" in candidate and candidate["phone"] and not is_valid_phone(candidate["phone"]):
+        raise RegistrationError("invalid_phone")
+    if needed["loyaltyConsent"] and body.get("loyaltyConsentVersion") == loyalty_version:
+        candidate["loyaltyConsentVersion"] = loyalty_version
+    pending = {
+        "username": needed["username"] and "username" not in body,
+        "phone": needed["phone"] and "phone" not in body,
+        "consent": needed["consent"] and body.get("consent") is not True,
+        "loyaltyConsent": needed["loyaltyConsent"] and
+                          body.get("loyaltyConsentVersion") != loyalty_version,
+    }
+    if any(pending.values()):
+        return _resp(200, {
+            "ok": True,
+            "detailsRequired": True,
+            "fields": needed,
+            "existingPlayer": player is not None,
+            **({"loyaltyConsentVersion": loyalty_version}
+               if pending["loyaltyConsent"] else {}),
+        })
+
+    values = registration_values(meta, candidate)
+    resume = None
+    if player:
+        resume = {
+            "playerId": int(player["playerId"]),
+            "fields": [field for field in ("username", "phone") if needed[field] and values.get(field)],
+        }
+    request_context = event.get("requestContext") or {}
+    source_ip = (request_context.get("http") or {}).get("sourceIp") or (
+        request_context.get("identity") or {}
+    ).get("sourceIp")
+    result = request_code(
+        table, boto3.client("ses"), PLAYER_TOKEN_SECRET, game_id, values,
+        source_ip, language, resume=resume,
+    )
+    return _resp(200, result)
 
 
 def _handle_join(event):

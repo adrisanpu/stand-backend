@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from botocore.exceptions import BotoCoreError, ClientError
 
 from stand_common.utils import is_valid_email, is_valid_phone, normalize_email, web_participant_fields, mask_email, log
-from stand_common.kivly_registration import consent_values, RegistrationError as KivlyRegistrationError
+from stand_common.kivly_registration import (
+    consent_values, game_settings, RegistrationError as KivlyRegistrationError,
+)
 
 CODE_TTL = 600
 RESEND_SECONDS = 60
@@ -67,6 +69,92 @@ def registration_values(meta, body):
     except KivlyRegistrationError as exc:
         raise VerificationError(exc.code, exc.status) from None
     return values
+
+
+def find_existing_player_by_email(player_table, game_id, email, key_expression):
+    """Find an email in one game's player partition, including all legacy query pages."""
+    email_norm = normalize_email(email)
+    kwargs = {
+        "KeyConditionExpression": key_expression("gameId").eq(game_id),
+        "ConsistentRead": True,
+    }
+    try:
+        while True:
+            page = player_table.query(**kwargs)
+            for item in page.get("Items") or []:
+                if item.get("gameId") == game_id and normalize_email(item.get("email") or "") == email_norm:
+                    return item
+            last_key = page.get("LastEvaluatedKey")
+            if not last_key:
+                return None
+            kwargs["ExclusiveStartKey"] = last_key
+    except ClientError as exc:
+        log("email_verification_player_query_failed", {
+            "errorType": type(exc).__name__, "gameId": game_id,
+        })
+        raise
+
+
+def find_verified_player(table, player_table, secret, game_id, email, key_expression, legacy_lookup=None):
+    mapping = table.get_item(
+        Key={"id": identity_id(secret, game_id, email)}, ConsistentRead=True,
+    ).get("Item")
+    if not mapping:
+        return (legacy_lookup or (
+            lambda: find_existing_player_by_email(player_table, game_id, email, key_expression)
+        ))()
+    player = player_table.get_item(
+        Key={"gameId": game_id, "playerId": int(mapping["playerId"])}, ConsistentRead=True,
+    ).get("Item")
+    if not player or normalize_email(player.get("email") or "") != normalize_email(email):
+        log("verified_player_mapping_invalid", {"gameId": game_id})
+        raise VerificationError("VerificationUnavailable", 503)
+    return player
+
+
+def resume_requirements(meta, player=None):
+    """Return server-derived missing fields and trusted values for a resume request."""
+    fields = web_participant_fields(meta.get("gameType") or "", meta.get("participantFields"))
+    needed = {"username": False, "phone": False, "consent": False, "loyaltyConsent": False}
+    values = {}
+
+    def valid_username(value):
+        return (
+            isinstance(value, str) and bool(value.strip()) and len(value.strip()) <= 100
+            and not re.search(r"[\x00-\x1f\x7f-\x9f]", value.strip())
+        )
+
+    username = player.get("username") if player else None
+    if valid_username(username):
+        values["username"] = username.strip()
+    else:
+        needed["username"] = True
+
+    phone_required = fields["phone"]["enabled"] and fields["phone"]["required"]
+    stored_phone = player.get("phone") if player else None
+    if fields["phone"]["enabled"] and is_valid_phone(stored_phone):
+        values["phone"] = stored_phone.strip()
+    elif (fields["phone"]["enabled"] and not player) or phone_required:
+        needed["phone"] = True
+
+    if not (
+        player and player.get("emailVerifiedAt")
+        and player.get("emailVerificationMethod") == "email-code"
+    ):
+        needed["consent"] = True
+
+    loyalty_version = None
+    settings = game_settings(meta)
+    if settings["enabled"]:
+        loyalty_version = settings["consentVersion"]
+        membership = (player or {}).get("kivlyMembership") or {}
+        if (membership.get("consentVersion") == loyalty_version
+                and membership.get("locationId") == settings["locationId"]):
+            values["loyaltyConsentVersion"] = loyalty_version
+        else:
+            needed["loyaltyConsent"] = True
+
+    return needed, values, loyalty_version
 
 
 def _key(secret):
@@ -142,7 +230,7 @@ def _send_code(ses, sender, email, code, language):
     )
 
 
-def request_code(table, ses, secret, game_id, values, source_ip, language="es"):
+def request_code(table, ses, secret, game_id, values, source_ip, language="es", resume=None):
     sender = os.environ.get("EMAIL_SENDER_ADDRESS")
     if not sender or not source_ip:
         raise VerificationError("VerificationUnavailable", 503)
@@ -165,6 +253,8 @@ def request_code(table, ses, secret, game_id, values, source_ip, language="es"):
         "createdAt": now,
         "expiresAt": now + CODE_TTL,
     }
+    if resume:
+        challenge["resume"] = resume
     transactions = [{
         "Update": {
             "TableName": table.name,

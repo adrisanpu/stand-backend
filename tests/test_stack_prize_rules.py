@@ -67,6 +67,56 @@ def test_mixed_rule_validation_keeps_sources_and_rejects_identity_change():
         prizes.validate_program(changed, META, conn, [{"id": "r1", "name": "Coffee"}], True)
 
 
+def test_score_rule_validation_and_inclusive_range():
+    program = deepcopy(PROGRAM)
+    program["rules"] = [{
+        "id": "score-rule", "condition": "score", "scoreOperator": "between",
+        "scoreValue": 10, "scoreMaxValue": 20,
+        "groups": [{"allocations": [{"prizeId": "pizza", "quantity": 1}]}],
+    }]
+    validated = prizes.validate_program(program, META, {"locationId": "loc"},
+                                         [{"id": "r1", "name": "Coffee"}], True)
+    assert validated["rules"][0]["scoreMaxValue"] == 20
+    rule = validated["rules"][0]
+    assert all(prizes.score_matches(rule, score) for score in (10, 15, 20))
+    assert not prizes.score_matches(rule, 9)
+    assert not prizes.score_matches(rule, 21)
+
+
+@pytest.mark.parametrize("operator,value,maximum,expected", [
+    (">", 10, None, [False, False, True]),
+    (">=", 10, None, [False, True, True]),
+    ("=", 10, None, [False, True, False]),
+    ("<=", 10, None, [True, True, False]),
+    ("<", 10, None, [True, False, False]),
+    ("between", 10, 20, [False, True, False]),
+])
+def test_score_comparison_operators(operator, value, maximum, expected):
+    rule = {"scoreOperator": operator, "scoreValue": value}
+    if maximum is not None:
+        rule["scoreMaxValue"] = maximum
+    assert [prizes.score_matches(rule, score) for score in (9, 10, 21)] == expected
+
+
+@pytest.mark.parametrize("changes", [
+    {"scoreOperator": "between", "scoreValue": 20, "scoreMaxValue": 10},
+    {"scoreOperator": "between", "scoreValue": 0},
+    {"scoreOperator": ">=", "scoreValue": True},
+    {"scoreOperator": "!=", "scoreValue": 10},
+    {"scoreOperator": ">=", "scoreValue": -1},
+    {"scoreOperator": ">=", "scoreValue": 10, "scoreMaxValue": 20},
+])
+def test_score_rule_validation_rejects_invalid_values(changes):
+    program = deepcopy(PROGRAM)
+    program["rules"] = [{
+        "id": "score-rule", "condition": "score",
+        **changes, "groups": [{"allocations": [{"prizeId": "pizza", "quantity": 1}]}],
+    }]
+    with pytest.raises(prizes.PrizeError, match="InvalidStackPrizeScore"):
+        prizes.validate_program(program, META, {"locationId": "loc"},
+                                [{"id": "r1", "name": "Coffee"}], True)
+
+
 def v2_program(mode="all"):
     return {**deepcopy(PROGRAM), "version": 2, "rules": [{
         "id": r["id"], "condition": r["condition"],
@@ -320,6 +370,29 @@ def test_zero_score_finish_persists_grant_job_atomically(rig, monkeypatch):
     assert sum(r["state"] == "available" for r in awards) == 2
     assert sum(r.get("work") == "pending" for r in awards) == 2
     assert player(rig)["type"]["STACK"]["rankAtFinish"] == 1
+
+
+@pytest.mark.parametrize("score,expected_awards", [(9, 0), (10, 1), (20, 1), (21, 0)])
+def test_score_prize_is_awarded_only_when_final_score_is_within_range(rig, monkeypatch, score, expected_awards):
+    program = deepcopy(PROGRAM)
+    program["rules"] = [{
+        "id": "score-rule", "condition": "score", "scoreOperator": "between",
+        "scoreValue": 10, "scoreMaxValue": 20,
+        "groups": [{"allocations": [{"prizeId": "pizza", "quantity": 1}]}],
+    }]
+    game = meta(rig)
+    game["stackPrizeProgram"] = program
+    rig.Table("games").put_item(Item=game)
+    prizes.start(rig, meta(rig), player(rig), ATTEMPT)
+    finish(rig, score)
+    task = next(row for row in prizes.records(rig, "ABC123") if row.get("kind") == "grant")
+    assert task["winners"][0]["score"] == score
+
+    worker = delivery_module(monkeypatch, rig)
+    worker.grant(task)
+
+    awards = [row for row in prizes.records(rig, "ABC123") if row["id"].startswith("award_")]
+    assert len(awards) == expected_awards
 
 
 def test_retried_finish_does_not_change_score_or_grant_again(rig):
@@ -887,6 +960,20 @@ def test_promotional_rules_union_groups_deduplicates_and_signs_only_committed_ow
                    "https://evil.test/image.png", "staging/" + key):
         assert prizes.image_url({**program["catalog"][0], "imageKey": unsafe}, META) is None
     assert s3.generate_presigned_url.call_count == 1
+
+
+def test_score_promotions_include_the_configured_threshold():
+    program = deepcopy(PROGRAM)
+    program["rules"] = [{
+        "id": "score-promo", "condition": "score", "scoreOperator": "between",
+        "scoreValue": 10, "scoreMaxValue": 20,
+        "groups": [{"allocations": [{"prizeId": "pizza", "quantity": 1}]}],
+    }]
+    assert prizes.promotional_rules({**META, "stackPrizeProgram": program})[0] == {
+        "condition": "score", "scoreOperator": "between", "scoreValue": 10,
+        "scoreMaxValue": 20, "names": ["Pizza"],
+        "prizes": [{"id": "pizza", "name": "Pizza", "imageUrl": None}],
+    }
 
 
 @pytest.mark.parametrize("old", [LEGACY_PROGRAM, v2_program(), PROGRAM])

@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -11,6 +12,7 @@ from stand_common.utils import log, _json_sanitize, _iso_now, normalize_email, i
 from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
     require_verified_registration, complete_registration, identity_id,
+    find_existing_player_by_email, find_verified_player,
 )
 from stand_common import kivly_registration
 
@@ -118,27 +120,7 @@ ASSIGNERS = {
 
 
 def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
-    email_norm = normalize_email(email)
-    try:
-        kwargs = {
-            "KeyConditionExpression": Key("gameId").eq(game_id),
-            "ProjectionExpression": "gameId, playerId, email, #username, joinedAt, validated, validationCode, #type",
-            "ExpressionAttributeNames": {"#type": "type", "#username": "username"},
-            "ConsistentRead": True,
-        }
-        while True:
-            page = gp_table.query(**kwargs)
-            for it in page.get("Items") or []:
-                if normalize_email(it.get("email") or "") == email_norm:
-                    return it
-            lek = page.get("LastEvaluatedKey")
-            if not lek:
-                break
-            kwargs["ExclusiveStartKey"] = lek
-    except ClientError as e:
-        log("assign_email_query_failed", {"errorType": type(e).__name__, "gameId": game_id})
-        raise
-    return None
+    return find_existing_player_by_email(gp_table, game_id, email, Key)
 
 
 WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK", "RULET4"})
@@ -211,18 +193,48 @@ def _verified_email(event, game_id, values):
 
 
 def _find_verified_player(table, game_id, email):
-    mapping = table.get_item(
-        Key={"id": identity_id(PLAYER_TOKEN_SECRET, game_id, email)}, ConsistentRead=True,
-    ).get("Item")
-    if not mapping:
-        return _find_existing_player_by_email(game_id, email)
-    player = gp_table.get_item(
-        Key={"gameId": game_id, "playerId": int(mapping["playerId"])}, ConsistentRead=True,
-    ).get("Item")
-    if not player or normalize_email(player.get("email") or "") != email:
-        log("verified_player_mapping_invalid", {"gameId": game_id})
+    return find_verified_player(
+        table, gp_table, PLAYER_TOKEN_SECRET, game_id, email, Key,
+        legacy_lookup=lambda: _find_existing_player_by_email(game_id, email),
+    )
+
+
+def _apply_resume_fields(existing, values, resume):
+    if not resume:
+        return
+    if int(existing.get("playerId", -1)) != int(resume.get("playerId", -2)):
+        raise VerificationError("VerificationSuperseded", 409)
+    allowed = {"username", "phone"}
+    fields = resume.get("fields")
+    if not isinstance(fields, list) or any(field not in allowed for field in fields):
         raise VerificationError("VerificationUnavailable", 503)
-    return player
+    for field in fields:
+        value = values.get(field)
+        if not isinstance(value, str) or not value:
+            raise VerificationError("VerificationUnavailable", 503)
+        old = existing.get(field)
+        if field == "username":
+            current_valid = (isinstance(old, str) and bool(old.strip()) and len(old.strip()) <= 100
+                             and not re.search(r"[\x00-\x1f\x7f-\x9f]", old.strip()))
+        else:
+            current_valid = kivly_registration.is_valid_phone(old)
+        if current_valid:
+            continue
+        name = f"#{field}"
+        values_by_name = {":new": value}
+        if field in existing:
+            condition = f"attribute_exists(playerId) AND {name} = :old"
+            values_by_name[":old"] = old
+        else:
+            condition = f"attribute_exists(playerId) AND attribute_not_exists({name})"
+        gp_table.update_item(
+            Key={"gameId": existing["gameId"], "playerId": int(existing["playerId"])},
+            UpdateExpression=f"SET {name} = :new",
+            ConditionExpression=condition,
+            ExpressionAttributeNames={name: field},
+            ExpressionAttributeValues=values_by_name,
+        )
+        existing[field] = value
 
 
 def _complete_verified_player(table, record, game_id, player_id):
@@ -337,6 +349,7 @@ def _handle_web_assign(event: dict) -> dict:
         return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
     membership = kivly_registration.ensure_membership(dynamo_r, meta, values)
     if existing:
+        _apply_resume_fields(existing, values, verified_record.get("resume"))
         if membership:
             gp_table.update_item(
                 Key={"gameId": game_id, "playerId": int(existing["playerId"])},
