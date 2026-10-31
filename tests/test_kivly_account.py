@@ -192,6 +192,49 @@ def test_global_disconnect_disables_existing_game_requirement(monkeypatch):
     assert effective["kivly"]["enabled"] is False
 
 
+def test_game_settings_support_temporary_bypass_for_lookup_validation():
+    meta = {
+        "gameType": "STACK",
+        "ownerUserId": "owner",
+        "participantFields": {"email": {"required": True}},
+        "kivly": {
+            "enabled": True,
+            "clubName": "Club",
+            "privacyUrl": "https://club.test/privacy",
+            "termsUrl": "https://club.test/terms",
+            "locationId": "location",
+            "consentVersion": "version",
+            "bypassValidation": True,
+        },
+    }
+    settings = kivly_settings.registration.game_settings(meta)
+    assert settings["bypassValidation"] is True
+
+
+def test_temporary_bypass_avoids_customer_lookup(monkeypatch):
+    meta = {
+        "gameType": "STACK",
+        "ownerUserId": "owner",
+        "gameId": "GAME123",
+        "participantFields": {"email": {"required": True}},
+        "kivly": {
+            "enabled": True,
+            "clubName": "Club",
+            "privacyUrl": "https://club.test/privacy",
+            "termsUrl": "https://club.test/terms",
+            "locationId": "location",
+            "consentVersion": "version",
+            "bypassValidation": True,
+        },
+    }
+    monkeypatch.setattr(kivly_settings.registration, "_required_connection", lambda *_: {"locationId": "location", "ownerId": "owner", "version": "v1"})
+    result = kivly_settings.registration.ensure_membership(MagicMock(), meta, {
+        "email": "player@test.com",
+        "loyaltyConsentVersion": "version",
+    })
+    assert result == {"locationId": "location", "customerId": "manual-bypass", "consentVersion": "version", "consentedAt": result["consentedAt"]}
+
+
 def test_account_saves_shared_club_without_replacing_credentials(monkeypatch):
     monkeypatch.setenv("USERS_TABLE", "users")
     conn = {"locationId": "location", "ownerId": "kivly-owner", "secretArn": "secret", "version": "v1"}

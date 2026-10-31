@@ -14,7 +14,7 @@ registration or any reward/card delivery.
 | --- | --- |
 | `POST /api/v1/auth/token` | Exchange server-only client credentials |
 | `GET /api/v1/integration/context` | Verify authorized business and owner scope |
-| `GET /api/v1/customers/` | Read-only access check or bounded complete email lookup |
+| `GET /api/v1/customers/` | Read-only access check or bounded, paginated `search` lookup by email |
 | `POST /api/v1/customers/` | Create a consented, email-verified STACK participant only |
 | `GET /api/v1/rewards/` | Read the active catalog for owner selection |
 | `POST /api/v1/rewards/` | Create an owner-requested reward from STACK prize settings |
@@ -30,7 +30,15 @@ the browser. The award flow uses `earn` only; uncertain writes are not
 automatically retried.
 The transport validates TLS, rejects redirects, bounds response size to 1 MiB,
 uses an eight-second per-request timeout, and never retries a request internally.
-Large businesses or slow upstream responses can fail closed within the Lambda
+Customer lookup sends the normalized email in the documented `search` query,
+then compares returned emails exactly (case-insensitive, trimmed). The search
+also matches names/phones, so partial matches are not reused. At most five pages
+of 100 **filtered results** are read, independent of the business's total customer
+population. Totals must describe those filtered results and remain consistent;
+duplicate exact emails, incomplete pagination, oversized responses and exhausted
+bounds fail closed. An earlier controlled filtered request returned an inconsistent
+total: such a response still returns `KivlySearchIncomplete`, never permission
+to create a customer. Slow upstream responses can also fail within the Lambda
 time budget; lack of a complete lookup is never treated as customer absence.
 
 ## Credentials and isolation
@@ -102,6 +110,9 @@ verification codes or request bodies.
 mocked contract tests, not live probes. Application-specific manual connection
 and registration probes have been retired. The bundled integration skill tools
 remain available, but no live requests are part of this change.
+The filtered lookup follows the bundled paginated customer contract; offline
+regressions cover businesses above 500 customers, not the deployed provider's
+search completeness or the failing business's actual customer count.
 `tests/test_stack_prize_rules.py` additionally covers idempotent stock
 reservation, AND/OR selection, partial awards, native SDK serialization,
 closure, individual redemption and uncertain-delivery handling. Live

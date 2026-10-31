@@ -74,6 +74,12 @@ def apply_account_settings(dynamo, meta):
         return meta
     conn = connection(dynamo, meta["ownerUserId"]) if (meta.get("gameType") or "").upper() == "STACK" else None
     settings = account_game_settings(meta, conn)
+    saved = meta.get("kivly") if isinstance(meta.get("kivly"), dict) else {}
+    if saved:
+        # Only preserve per-game runtime flags; the account-level connection and
+        # validation state must remain authoritative for STACK registrations.
+        extra = {key: value for key, value in saved.items() if key == "bypassValidation"}
+        settings = {**settings, **extra}
     fields = dict(meta.get("participantFields") or {})
     if settings["enabled"]:
         fields["email"] = {"required": True}
@@ -82,21 +88,23 @@ def apply_account_settings(dynamo, meta):
 
 def game_settings(meta):
     if (meta.get("gameType") or "").upper() != "STACK":
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": "", "bypassValidation": False}
     settings = meta.get("kivly")
     if settings is None:
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": "", "bypassValidation": False}
     if not isinstance(settings, dict) or type(settings.get("enabled")) is not bool:
         raise RegistrationError("KivlyConfigurationInvalid")
+    if "bypassValidation" in settings and type(settings.get("bypassValidation")) is not bool:
+        raise RegistrationError("KivlyConfigurationInvalid")
     if not settings["enabled"]:
-        return settings
+        return {**settings, "bypassValidation": bool(settings.get("bypassValidation", False))}
     if (
         not all(isinstance(settings.get(key), str) and settings[key].strip()
                    for key in ("clubName", "privacyUrl", "termsUrl", "locationId", "consentVersion"))
         or not (meta.get("participantFields") or {}).get("email", {}).get("required")
     ):
         raise RegistrationError("KivlyConfigurationInvalid")
-    return settings
+    return {**settings, "bypassValidation": bool(settings.get("bypassValidation", False))}
 
 
 def consent_version(settings):
@@ -198,6 +206,11 @@ def _ensure_membership(dynamo, meta, values):
         return None
     consent_values(meta, values)
     conn = _required_connection(dynamo, meta)
+    if settings.get("bypassValidation") is True:
+        log("kivly_registration_bypass_active", {
+            "stage": "customer_lookup", "gameId": meta.get("gameId"), "ownerUserId": meta.get("ownerUserId"),
+        })
+        return _membership(settings, "manual-bypass")
     table = _table(dynamo)
     key = _identity(meta, conn, values["email"])
     record = table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")

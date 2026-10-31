@@ -231,10 +231,16 @@ scoped to organizer, authorized location and normalized email. It is retained
 with point-in-time recovery and deliberately has **no TTL**.
 
 1. Read the saved identity, including any unresolved creation intent.
-2. Perform a complete, bounded customer listing (at most five pages of 100)
-   and match the verified email case-insensitively, even for confirmed identities.
+2. Search using the normalized verified email in `GET /api/v1/customers/?search=...`.
+   Read the complete filtered listing (at most five pages of 100 search results,
+   not all business customers) and match the email exactly, case-insensitively,
+   even for confirmed identities. Search can also return name/phone or partial
+   email matches; those do not establish membership.
 3. Reuse exactly one active match. Never update an existing customer. Duplicate,
    malformed, incomplete or oversized listings fail closed.
+   Filtered totals must agree with the returned unique rows and pagination.
+   Inconsistent totals still produce `KivlySearchIncomplete`; they are never
+   ignored to authorize a new customer POST.
 4. If absent, conditionally persist `creating` plus a random `externalId`
    **before** issuing a single customer POST.
 5. Confirm the active returned customer and exact attempt identity. Persist
