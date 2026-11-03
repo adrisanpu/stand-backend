@@ -31,15 +31,19 @@ the browser. The award flow uses `earn` only; uncertain writes are not
 automatically retried.
 The transport validates TLS, rejects redirects, bounds response size to 1 MiB,
 uses an eight-second per-request timeout, and never retries a request internally.
-Kivly can return the business-wide `total` for a filtered search. An empty
-filtered page therefore does not prove that a customer is absent. Normal
-registration resolves positive email/phone matches, rechecks both under a durable
-creation lock, and creates directly when no clear match exists; it does not
-enumerate all customers to prove absence. Pending resolution does not grant access
-to play. Duplicate exact identities and conflicting contacts fail closed. A
-lost creation response is reconciled only by a complete directory scan for its
-original `external_id`, never by inferring success from matching contacts or by
-repeating the POST.
+Filtered customer searches are paginated and bounded. Results are matched using
+normalized email and phone; broad or partial provider matches do not establish
+identity. Filtered totals may be business-wide, so a filtered miss is only a
+candidate miss, never proof that a customer is absent. Normal registration
+rechecks both contacts under a durable creation lock and uses Kivly's create
+endpoint when no clear match exists; it does not enumerate all customers to
+prove absence. Incomplete results, duplicate identities and conflicting
+contacts fail closed. Pending resolution does not grant access to play.
+
+After an uncertain customer POST or when recovering an unresolved creation
+intent, the worker scans the bounded customer directory only to reconcile the
+exact persisted `external_id`. It never infers success from matching contacts or
+repeats the POST automatically.
 
 One authorized live test observed a customer POST with the exact existing email
 and phone returning HTTP 201 with the original customer ID and `external_id`

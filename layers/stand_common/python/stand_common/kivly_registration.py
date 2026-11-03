@@ -81,6 +81,12 @@ def apply_account_settings(dynamo, meta):
         return meta
     conn = connection(dynamo, meta["ownerUserId"]) if (meta.get("gameType") or "").upper() == "STACK" else None
     settings = account_game_settings(meta, conn)
+    saved = meta.get("kivly") if isinstance(meta.get("kivly"), dict) else {}
+    if saved:
+        # Only preserve per-game runtime flags; the account-level connection and
+        # validation state must remain authoritative for STACK registrations.
+        extra = {key: value for key, value in saved.items() if key == "bypassValidation"}
+        settings = {**settings, **extra}
     fields = dict(meta.get("participantFields") or {})
     if settings["enabled"]:
         fields["email"] = {"required": True}
@@ -89,10 +95,10 @@ def apply_account_settings(dynamo, meta):
 
 def game_settings(meta):
     if (meta.get("gameType") or "").upper() != "STACK":
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": "", "bypassValidation": False}
     settings = meta.get("kivly")
     if settings is None:
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": "", "bypassValidation": False}
     if not isinstance(settings, dict) or type(settings.get("enabled")) is not bool:
         raise RegistrationError("KivlyConfigurationInvalid")
     settings = {key: value for key, value in settings.items() if key != "bypassValidation"}

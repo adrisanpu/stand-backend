@@ -295,9 +295,11 @@ with point-in-time recovery and deliberately has **no TTL**.
 1. Read the saved identity, including any unresolved creation intent.
 2. Resolve normalized email and canonical phone with scoped filtered lookups.
    Confirmed bindings can be revalidated by customer ID. Filtered results may
-   reveal a match, but their global `total` cannot establish absence. Distinct
-   email/phone identities conflict; phone-only matches with a different or blank
-   email require organizer review. Existing customer data is never overwritten.
+   reveal a match, but their total may be business-wide and cannot establish
+   absence. Search results are bounded and paginated; incomplete results fail
+   closed. Distinct email/phone identities conflict; phone-only matches with a
+   different or blank email require organizer review. Existing customer data is
+   never overwritten.
 3. If there is no clear match, recheck both contacts under the durable creation
    lock, then conditionally persist `creating` plus a random `externalId` before
    one customer POST. Normal creation does not require full-directory enumeration.
