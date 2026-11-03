@@ -165,6 +165,8 @@ class FakeTable:
             )
         if "attribute_not_exists(playerId)" in condition:
             return not exists
+        if "attribute_exists(playerId) AND kivlyMembership = :previous" in condition:
+            return exists and item.get("kivlyMembership") == values[":previous"]
         if "attribute_exists(playerId) AND attribute_not_exists(" in condition:
             attribute = condition.split("attribute_not_exists(", 1)[1].split(")", 1)[0]
             return exists and "playerId" in item and names.get(attribute, attribute) not in item
@@ -188,6 +190,9 @@ class FakeTable:
 
     @staticmethod
     def _apply_update(item, expression, values, names):
+        if expression == "SET kivlyMembership = :m":
+            item["kivlyMembership"] = deepcopy(values[":m"])
+            return
         if "ADD attempts :one" in expression:
             item["attempts"] = int(item.get("attempts", 0)) + int(values[":one"])
             return

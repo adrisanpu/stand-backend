@@ -6,8 +6,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from stand_common import kivly_registration as registration, kivly_rewards, kivly_settings
+from stand_common import kivly_participation
 from stand_common.kivly import KivlyClient, KivlyError
-from tests.email_fake import FakeDynamoError
+from tests.email_fake import FakeDynamo, FakeDynamoError
+from tests.test_email_verification import FakeKeyExpression, rig
+from tests.test_kivly_registration import club
 from tests.test_kivly_account import account_event, membership_game
 from tests.test_public_web import public_mod, SECRET
 from stand_common.utils import issue_player_token
@@ -15,10 +18,15 @@ from stand_common.utils import issue_player_token
 
 @pytest.fixture
 def reward_rig(monkeypatch):
+    monkeypatch.setenv("KIVLY_REGISTRATION_TABLE", "registrations")
+    monkeypatch.setenv("GAMEPLAYER_TABLE", "players")
+    monkeypatch.setattr(kivly_participation, "Key", FakeKeyExpression)
+    monkeypatch.setattr(kivly_participation, "ClientError", FakeDynamoError)
     game = {**membership_game(), "gameId": "ABC123", "gameType": "STACK",
             "kivlyReward": {"id": "reward-1", "name": "Coffee", "locationId": "location"}}
     player = {"gameId": "ABC123", "playerId": 7,
               "kivlyMembership": {"customerId": "customer-1", "locationId": "location",
+                                  "status": "confirmed", "phone": "+34 612345678",
                                   "consentVersion": game["kivly"]["consentVersion"]},
               "type": {"STACK": {"score": 0, "attempt": {"status": "finished"}}}}
     conn = {"locationId": "location", "ownerId": "owner", "version": "v1",
@@ -51,9 +59,20 @@ def reward_rig(monkeypatch):
     return game, player, client, table, records
 
 
+def reward_dynamo(player):
+    dynamo = FakeDynamo()
+    dynamo.seed("players", player)
+    membership = player.get("kivlyMembership") or {}
+    if membership.get("customerId") and membership.get("locationId"):
+        dynamo.seed("registrations", kivly_participation.claim_item(
+            player["gameId"], player["playerId"], membership,
+        ))
+    return dynamo
+
+
 def test_zero_score_finished_game_receives_reward_and_wallet_links_once(reward_rig):
     game, player, client, table, records = reward_rig
-    result = kivly_rewards.completion_reward(MagicMock(), game, player)
+    result = kivly_rewards.completion_reward(reward_dynamo(player), game, player)
     assert result["status"] == "confirmed"
     assert result["name"] == "Coffee"
     assert result["appleWalletUrl"].startswith("https://api.getkivly.com/")
@@ -65,7 +84,7 @@ def test_zero_score_finished_game_receives_reward_and_wallet_links_once(reward_r
         {"id": "assignment-1", "reward_id": "reward-1", "customer_id": "customer-1"},
     ]
     game["kivlyReward"] = {"id": "different-reward", "name": "New prize", "locationId": "location"}
-    again = kivly_rewards.completion_reward(MagicMock(), game, player)
+    again = kivly_rewards.completion_reward(reward_dynamo(player), game, player)
     assert again["status"] == "confirmed"
     assert again["name"] == "Coffee"
     client.earn_reward.assert_called_once()
@@ -77,7 +96,7 @@ def test_unfinished_player_cannot_receive_reward(reward_rig, blob):
     game, player, client, _, _ = reward_rig
     player["type"]["STACK"] = blob
     with pytest.raises(registration.RegistrationError, match="KivlyGameNotFinished"):
-        kivly_rewards.completion_reward(MagicMock(), game, player)
+        kivly_rewards.completion_reward(reward_dynamo(player), game, player)
     client.earn_reward.assert_not_called()
 
 
@@ -85,30 +104,30 @@ def test_reward_requires_membership(reward_rig):
     game, player, client, _, _ = reward_rig
     player["kivlyMembership"] = {}
     with pytest.raises(registration.RegistrationError, match="KivlyMembershipRequired"):
-        kivly_rewards.completion_reward(MagicMock(), game, player)
+        kivly_rewards.completion_reward(reward_dynamo(player), game, player)
     client.earn_reward.assert_not_called()
 
 
 def test_no_configured_reward_does_not_call_external_api(reward_rig):
     game, player, client, _, _ = reward_rig
     del game["kivlyReward"]
-    assert kivly_rewards.completion_reward(MagicMock(), game, player) == {"status": "none"}
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player) == {"status": "none"}
     client.earn_reward.assert_not_called()
 
 
 def test_uncertain_earn_is_pending_and_never_replayed(reward_rig):
     game, player, client, _, _ = reward_rig
     client.earn_reward.side_effect = KivlyError("KivlyUnavailable")
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "pending"
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "pending"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "pending"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "pending"
     client.earn_reward.assert_called_once()
 
 
 def test_success_response_without_redemption_record_is_confirmed(reward_rig):
     game, player, client, _, _ = reward_rig
     client.customer_rewards.side_effect = [[], []]
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "confirmed"
     client.earn_reward.assert_called_once()
     assert client.customer_rewards.call_count == 2
 
@@ -119,15 +138,15 @@ def test_success_response_with_ambiguous_redemptions_is_confirmed_once(reward_ri
         [], [{"id": "assignment-1", "reward_id": "reward-1"},
              {"id": "assignment-2", "reward_id": "reward-1"}],
     ]
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "confirmed"
     client.earn_reward.assert_called_once()
 
 
 def test_success_ack_is_not_reversed_by_post_earn_lookup_failure(reward_rig):
     game, player, client, _, _ = reward_rig
     client.customer_rewards.side_effect = [[], KivlyError("KivlyUnavailable")]
-    assert kivly_rewards.completion_reward(MagicMock(), game, player)["status"] == "confirmed"
+    assert kivly_rewards.completion_reward(reward_dynamo(player), game, player)["status"] == "confirmed"
     client.earn_reward.assert_called_once()
 
 
@@ -140,37 +159,31 @@ def test_confirmed_reward_is_still_confirmed_if_redemption_history_is_empty(rewa
     }
     client.customer_rewards.return_value = []
 
-    result = kivly_rewards.completion_reward(MagicMock(), game, player)
+    result = kivly_rewards.completion_reward(reward_dynamo(player), game, player)
 
     assert result["status"] == "confirmed"
     assert result["appleWalletUrl"] is None
     client.earn_reward.assert_not_called()
 
 
-def test_existing_customer_is_reused_without_modifying_phone(monkeypatch):
-    game = membership_game()
-    conn = {"locationId": "location", "ownerId": "owner", "version": "v1"}
-    client, table = MagicMock(), MagicMock()
-    table.get_item.return_value = {}
-    client.find_customer.return_value = {"id": "customer-1", "is_active": True}
-    monkeypatch.setattr(registration, "connection", lambda *_: conn)
-    monkeypatch.setattr(registration, "_identity", lambda *_: "customer-key")
-    monkeypatch.setattr(registration, "_client", lambda *_: client)
-    monkeypatch.setattr(registration, "_table", lambda *_: table)
-    result = registration.ensure_membership(MagicMock(), game, {
-        "email": "test@club.test", "username": "Full Name", "phone": "+34 612345678",
-        "loyaltyConsentVersion": game["kivly"]["consentVersion"],
-    })
-    assert result["customerId"] == "customer-1"
-    client.create_customer.assert_not_called()
-    assert [call[0] for call in client.method_calls] == ["find_customer"]
+def test_existing_customer_is_reused_without_modifying_phone(club):
+    from tests.test_kivly_registration import customer, request, drain
+    club["client"].rows = [customer(phone="+34 699999999")]
+    request(club)
+    assert club["client"].posts == 0
+    drain(club)
+    result = request(club)
+    assert result["customerId"] == "existing"
+    assert result["phone"] == "+34 699999999"
+    assert club["client"].rows[0]["phone"] == "+34 699999999"
+    assert club["client"].posts == 0
 
 
 def test_conditional_reservation_loser_does_not_earn(reward_rig):
     game, player, client, table, _ = reward_rig
     table.put_item.side_effect = FakeDynamoError("ConditionalCheckFailedException")
     with pytest.raises(registration.RegistrationError, match="KivlyRewardBusy"):
-        kivly_rewards.completion_reward(MagicMock(), game, player)
+        kivly_rewards.completion_reward(reward_dynamo(player), game, player)
     client.earn_reward.assert_not_called()
 
 
@@ -315,6 +328,70 @@ def test_settings_catalog_requires_game_owner(reward_rig):
     client.list_rewards.assert_not_called()
 
 
+def test_settings_catalog_reads_reward_details_for_owner(reward_rig):
+    game, _, client, _, _ = reward_rig
+    games = MagicMock()
+    games.get_item.return_value = {"Item": game}
+    detail = {"id": "reward-1", "title": "Coffee", "description": "A coffee"}
+    client.get_reward.return_value = detail
+    event = account_event()
+    event["queryStringParameters"] = {"gameId": "ABC123", "rewardId": "reward-1"}
+
+    response = kivly_settings.handle(event, "GET", MagicMock(), games, catalog=True)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"ok": True, "reward": detail}
+    client.get_reward.assert_called_once_with("location", "owner", "reward-1")
+
+
+def test_settings_catalog_updates_reward_in_external_location(reward_rig):
+    game, _, client, _, _ = reward_rig
+    games = MagicMock()
+    games.get_item.return_value = {"Item": game}
+    client.update_reward.return_value = {"id": "reward-1", "name": "Tea"}
+    payload = {
+        "gameId": "ABC123", "rewardId": "reward-1", "title": "Tea",
+        "description": "A cup of tea", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 25, "termsAndConditions": None,
+        "validFrom": None, "validUntil": None, "maxRedemptions": None,
+        "maxRedemptionsPerUser": None,
+    }
+
+    response = kivly_settings.handle(
+        account_event(payload), "PUT", MagicMock(), games, catalog=True,
+    )
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {
+        "ok": True, "reward": {"id": "reward-1", "name": "Tea"},
+    }
+    client.update_reward.assert_called_once_with(
+        "location", "owner", "reward-1", {
+            key: value for key, value in payload.items() if key not in {"gameId", "rewardId"}
+        },
+    )
+
+
+def test_settings_catalog_blocks_external_reward_updates_when_disabled(reward_rig, monkeypatch):
+    game, _, client, _, _ = reward_rig
+    games = MagicMock()
+    games.get_item.return_value = {"Item": game}
+    monkeypatch.setenv("KIVLY_EXTERNAL_WRITES_ENABLED", "false")
+    payload = {
+        "gameId": "ABC123", "rewardId": "reward-1", "title": "Tea",
+        "description": "A cup", "rewardType": "free_item", "value": 1,
+        "pointsRequired": 1,
+    }
+
+    response = kivly_settings.handle(
+        account_event(payload), "PUT", MagicMock(), games, catalog=True,
+    )
+
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"])["error"] == "KivlyWritesDisabled"
+    client.update_reward.assert_not_called()
+
+
 def test_reward_selection_can_be_removed(reward_rig):
     game, _, client, _, _ = reward_rig
     games = MagicMock()
@@ -330,6 +407,7 @@ def test_reward_selection_can_be_removed(reward_rig):
 def test_public_reward_endpoint_uses_token_player_not_client_claims(reward_rig, monkeypatch):
     game, player, client, _, _ = reward_rig
     monkeypatch.setattr(public_mod, "_get_game", lambda *_: game)
+    monkeypatch.setattr(public_mod, "dynamo_r", reward_dynamo(player))
     get_player = MagicMock(return_value=player)
     monkeypatch.setattr(public_mod, "_get_player", get_player)
     response = public_mod.lambda_handler({

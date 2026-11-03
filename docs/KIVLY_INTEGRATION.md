@@ -2,6 +2,53 @@
 
 ## Release scope
 
+### Confirmed membership and duplicate participation
+
+There is no registration bypass or validation-off mode. For an enabled STACK
+integration, registration must resolve an active Kivly customer before the
+participant receives access. Legacy `pending-reconciliation` memberships remain
+blocked; removing the bypass does not automatically repair historical data.
+`KIVLY_EXTERNAL_WRITES_ENABLED` remains an operational safety switch, not a way
+to report a successful registration without creating a customer.
+
+Email or phone can locate an existing customer. The app preserves that customer's
+data. If the two contacts identify different customers, registration stops with
+an explicit conflict. A phone-only match whose Kivly email differs or is blank
+requires organizer confirmation in the game registration review panel. No SMS
+verification or automatic customer merge is performed.
+
+Participation is unique per game, Kivly location and customer ID, not merely per
+form email. The participant creation transaction reserves that identity together
+with the player and game capacity, so simultaneous requests cannot create two
+players for one customer. Starting STACK consumes its single attempt; reentry can
+resume only that same attempt when recoverable. Finished attempts cannot restart.
+Historical multiple participants sharing a customer require review and are not
+silently picked or rewritten; existing rankings and rewards are preserved.
+
+The registration queue and scheduled recovery must be deployed together with
+the updated functions, registration table permissions and organizer review API.
+An unresolved lookup is visible as pending and cannot grant gameplay access.
+Deployment does not automatically replay historical rewards or emails. Test a
+designated authorized contact before enabling a new environment; offline tests
+are not evidence of a deployed integration or inbox delivery.
+
+Normal registration uses positive scoped email/phone lookups, then rechecks
+those contacts under a durable creation lock and calls customer creation directly
+when no clear match exists; it does not enumerate the customer directory to prove
+absence. This avoids the full-directory scan bottleneck for routine new
+registrations, but filtered lookup misses are not proof that no profile exists
+and Kivly's general deduplication behavior is not guaranteed. A bounded full
+directory scan remains only for reconciling an uncertain POST, and that recovery
+accepts only the exact persisted `external_id`. Monitor queue backlog and
+reconcile uncertain creates before a large event.
+
+A controlled live probe with one authorized test account observed HTTP 201
+returning the original customer ID and original `external_id` when the POST
+submitted the same exact email and phone with a new random `external_id`.
+The resolver accepts that returned profile only when it is active and both
+normalized contacts match, then reads it back by ID before granting membership.
+This is evidence for that one probe, not a general Kivly deduplication guarantee.
+
 The organizer connects Kivly once for the entire account. **Only STACK** uses
 that connection to require club registration in this release. EMPAREJA2, T1MER,
 RULET4 and other non-STACK games do not request club consent or call Kivly in
@@ -27,6 +74,21 @@ been deployed or that installed-wallet propagation is verified.
 
 The organizer connection route is `/v1/kivly`, handled by the game-management Lambda.
 Use the organizer's existing authenticated API client. A game ID is not needed.
+
+### Review phone-only identity matches
+
+`GET /v1/game/kivly/registrations?gameId=ABC123` lists that game's pending
+identity reviews to its authenticated owner. The organizer compares the submitted
+contact details with the proposed Kivly record and explicitly confirms whether
+they identify the same person.
+
+`POST /v1/game/kivly/registrations?gameId=ABC123` accepts `{"requestId":"..."}`.
+The server resolves the candidate from its saved request; it never trusts a
+customer ID supplied by the browser. Approval revalidates the connection and
+customer, records the actor and does not modify Kivly contact data. The participant
+then retries the verified registration; the normal single-participation check
+still applies. Conflicts between two different customer records are not merge
+requests and cannot be approved through this action.
 
 ### Read connection: `GET /v1/kivly`
 
@@ -231,31 +293,34 @@ scoped to organizer, authorized location and normalized email. It is retained
 with point-in-time recovery and deliberately has **no TTL**.
 
 1. Read the saved identity, including any unresolved creation intent.
-2. Search using the normalized verified email in `GET /api/v1/customers/?search=...`.
-   Read the complete filtered listing (at most five pages of 100 search results,
-   not all business customers) and match the email exactly, case-insensitively,
-   even for confirmed identities. Search can also return name/phone or partial
-   email matches; those do not establish membership.
-3. Reuse exactly one active match. Never update an existing customer. Duplicate,
-   malformed, incomplete or oversized listings fail closed.
-   Filtered totals must agree with the returned unique rows and pagination.
-   Inconsistent totals still produce `KivlySearchIncomplete`; they are never
-   ignored to authorize a new customer POST.
-4. If absent, conditionally persist `creating` plus a random `externalId`
-   **before** issuing a single customer POST.
-5. Confirm the active returned customer and exact attempt identity. Persist
+2. Resolve normalized email and canonical phone with scoped filtered lookups.
+   Confirmed bindings can be revalidated by customer ID. Filtered results may
+   reveal a match, but their global `total` cannot establish absence. Distinct
+   email/phone identities conflict; phone-only matches with a different or blank
+   email require organizer review. Existing customer data is never overwritten.
+3. If there is no clear match, recheck both contacts under the durable creation
+   lock, then conditionally persist `creating` plus a random `externalId` before
+   one customer POST. Normal creation does not require full-directory enumeration.
+4. Validate the scoped POST response as active with a valid ID and both submitted
+   contacts. A different returned `external_id` is treated as an existing profile
+   only when both contacts match; read that ID back before confirmation. Contact
+   mismatches and separate email/phone profiles fail closed without membership.
+5. On an uncertain POST, reconcile only by a complete directory scan for the
+   exact persisted `external_id`; contact matches alone cannot establish that the
+   uncertain request succeeded. Never repeat the POST automatically. Persist
    confirmation before granting membership, and recheck the account connection.
 
 Deleting a STAND player removes that event's participant (including its stored
-membership) and verified-email mapping. The same email can rejoin with a fresh
-verification and consent, under a new player ID; old player tokens cannot recover
-the replacement. It never deletes Kivly customers, rewards or other events'
+membership) and verified-email mapping. The durable Kivly participation claim
+is not removed: deleting a participant must not grant an extra attempt for the
+same customer. A claim pointing to a removed participant requires explicit
+review instead of creating a replacement. It never deletes Kivly customers, rewards or other events'
 participants. Shared registration records remain to protect unresolved writes.
-On registration, an active customer is reused without modification. If a
-previously confirmed customer was deleted externally, a complete lookup proving
-absence permits a conditional replacement of that confirmed record with one new
-creation intent. Concurrent joins cannot issue a second POST; an uncertain
-creation intent is never reset by deleting a participant.
+On registration, an active customer is reused without modification. A missing
+or unreadable previously confirmed customer is not by itself proof of safe
+absence and does not reset a confirmed or uncertain creation intent; investigate
+the durable identity before any explicit recovery. Concurrent joins cannot issue
+a second POST; an uncertain creation intent is never reset by deleting a participant.
 
 An uncertain POST result leaves its intent permanently recorded. Retrying may
 confirm an existing customer only if its `external_id` exactly matches that

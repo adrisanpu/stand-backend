@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import json
 import os
-import uuid
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -22,6 +21,14 @@ class RegistrationError(Exception):
 
 def _code(error):
     return error.response.get("Error", {}).get("Code")
+
+
+PENDING_CUSTOMER_ID = "pending-reconciliation"
+
+
+def is_pending_membership(player):
+    membership = player.get("kivlyMembership") or {}
+    return membership.get("customerId") == PENDING_CUSTOMER_ID
 
 
 def _table(dynamo):
@@ -74,12 +81,6 @@ def apply_account_settings(dynamo, meta):
         return meta
     conn = connection(dynamo, meta["ownerUserId"]) if (meta.get("gameType") or "").upper() == "STACK" else None
     settings = account_game_settings(meta, conn)
-    saved = meta.get("kivly") if isinstance(meta.get("kivly"), dict) else {}
-    if saved:
-        # Only preserve per-game runtime flags; the account-level connection and
-        # validation state must remain authoritative for STACK registrations.
-        extra = {key: value for key, value in saved.items() if key == "bypassValidation"}
-        settings = {**settings, **extra}
     fields = dict(meta.get("participantFields") or {})
     if settings["enabled"]:
         fields["email"] = {"required": True}
@@ -88,23 +89,22 @@ def apply_account_settings(dynamo, meta):
 
 def game_settings(meta):
     if (meta.get("gameType") or "").upper() != "STACK":
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": "", "bypassValidation": False}
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
     settings = meta.get("kivly")
     if settings is None:
-        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": "", "bypassValidation": False}
+        return {"enabled": False, "clubName": "", "privacyUrl": "", "termsUrl": ""}
     if not isinstance(settings, dict) or type(settings.get("enabled")) is not bool:
         raise RegistrationError("KivlyConfigurationInvalid")
-    if "bypassValidation" in settings and type(settings.get("bypassValidation")) is not bool:
-        raise RegistrationError("KivlyConfigurationInvalid")
+    settings = {key: value for key, value in settings.items() if key != "bypassValidation"}
     if not settings["enabled"]:
-        return {**settings, "bypassValidation": bool(settings.get("bypassValidation", False))}
+        return settings
     if (
         not all(isinstance(settings.get(key), str) and settings[key].strip()
                    for key in ("clubName", "privacyUrl", "termsUrl", "locationId", "consentVersion"))
         or not (meta.get("participantFields") or {}).get("email", {}).get("required")
     ):
         raise RegistrationError("KivlyConfigurationInvalid")
-    return {**settings, "bypassValidation": bool(settings.get("bypassValidation", False))}
+    return settings
 
 
 def consent_version(settings):
@@ -206,107 +206,14 @@ def _ensure_membership(dynamo, meta, values):
         return None
     consent_values(meta, values)
     conn = _required_connection(dynamo, meta)
-    if settings.get("bypassValidation") is True:
-        log("kivly_registration_bypass_active", {
-            "stage": "customer_lookup", "gameId": meta.get("gameId"), "ownerUserId": meta.get("ownerUserId"),
-        })
-        return _membership(settings, "manual-bypass")
-    table = _table(dynamo)
-    key = _identity(meta, conn, values["email"])
-    record = table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")
-    confirmed = record is not None and record.get("state") == "confirmed"
-    if confirmed:
-        if not isinstance(record.get("customerId"), str) or not record["customerId"]:
-            raise RegistrationError("KivlyReconciliationRequired", 409)
-    elif record and (record.get("state") != "creating" or not record.get("externalId")):
-        raise RegistrationError("KivlyReconciliationRequired", 409)
-    client = _client(conn)
-    try:
-        customer = client.find_customer(conn["locationId"], conn["ownerId"], values["email"])
-    except KivlyError as exc:
-        _log_upstream_failure("customer_lookup", exc)
-        raise
-    log("kivly_registration_lookup_completed", {
-        "stage": "customer_lookup", "found": customer is not None,
-    })
-    if record and not confirmed:
-        # Recover a lost POST response only through the exact attempt identity.
-        if not customer or customer.get("external_id") != record.get("externalId"):
-            raise RegistrationError("KivlyReconciliationRequired", 409)
-    elif customer is None:
-        if os.environ.get("KIVLY_EXTERNAL_WRITES_ENABLED", "true").lower() != "true":
-            log("kivly_registration_write_blocked", {
-                "stage": "customer_create", "code": "KivlyWritesDisabled",
-            })
-            raise RegistrationError("KivlyWritesDisabled", 503)
-        intent = {"id": key, "state": "creating", "externalId": "stand-" + uuid.uuid4().hex, "createdAt": _iso_now()}
-        try:
-            if confirmed:
-                # Only a complete lookup may replace a confirmed but deleted customer.
-                table.put_item(
-                    Item=intent, ConditionExpression="#s = :confirmed AND customerId = :previous",
-                    ExpressionAttributeNames={"#s": "state"},
-                    ExpressionAttributeValues={":confirmed": "confirmed", ":previous": record["customerId"]},
-                )
-            else:
-                table.put_item(Item=intent, ConditionExpression="attribute_not_exists(id)")
-        except ClientError as exc:
-            if _code(exc) == "ConditionalCheckFailedException":
-                raise RegistrationError("KivlyRegistrationBusy", 409) from None
-            raise
-        record, confirmed = intent, False
-        try:
-            customer = client.create_customer(
-                conn["locationId"], conn["ownerId"], values["username"], values["email"], record["externalId"],
-                **({"phone": values["phone"]} if values.get("phone") else {}),
-            )
-        except KivlyError as exc:
-            # The intent is never removed or expired, even if the response was lost.
-            _log_upstream_failure("customer_create", exc)
-            raise RegistrationError("KivlyReconciliationRequired", 409) from None
-    if customer.get("is_active") is not True:
-        raise RegistrationError("KivlyCustomerInvalid", 409)
-    # Existing customers are reused, never modified. Concurrent lookups of an
-    # existing customer can safely converge on the same confirmed identity.
-    if record:
-        condition = ("#s = :expected AND customerId = :previous" if confirmed
-                     else "#s = :expected AND externalId = :external")
-        previous = ({":previous": record["customerId"]} if confirmed
-                    else {":external": record["externalId"]})
-        table.update_item(
-            Key={"id": key},
-            UpdateExpression="SET #s = :s, customerId = :c, confirmedAt = :at",
-            ConditionExpression=condition,
-            ExpressionAttributeNames={"#s": "state"},
-            ExpressionAttributeValues={":s": "confirmed", ":c": customer["id"], ":at": _iso_now(),
-                                       ":expected": "confirmed" if confirmed else "creating", **previous},
-        )
-    else:
-        try:
-            table.put_item(
-                Item={"id": key, "state": "confirmed", "customerId": customer["id"], "confirmedAt": _iso_now()},
-                ConditionExpression="attribute_not_exists(id)",
-            )
-        except ClientError as exc:
-            if _code(exc) == "ConditionalCheckFailedException":
-                raise RegistrationError("KivlyRegistrationBusy", 409) from None
-            raise
-    # Re-read owner connection so a concurrent disconnect cannot grant access.
-    current = _required_connection(dynamo, meta)
-    if current["version"] != conn["version"]:
-        raise RegistrationError("KivlyConnectionChanged", 409)
-    membership = _membership(settings, customer["id"])
-    phone = customer.get("phone")
-    if is_valid_phone(phone):
-        membership["phone"] = phone
-    else:
-        log("kivly_customer_phone_unavailable", {"code": "KivlyPhoneRequired"})
-    return membership
+    from stand_common.kivly_resolver import request_membership
+    return request_membership(dynamo, meta, conn, settings, values)
 
 
 def _membership(settings, customer_id):
     return {"locationId": settings["locationId"], "customerId": customer_id,
-            "consentVersion": settings["consentVersion"], "consentedAt": _iso_now()}
+            "consentVersion": settings["consentVersion"], "consentedAt": _iso_now(),
+            "status": "confirmed"}
 
 
 def require_player(dynamo, meta, player):
@@ -319,8 +226,13 @@ def require_player(dynamo, meta, player):
         membership.get("locationId") != settings["locationId"]
         or membership.get("consentVersion") != settings["consentVersion"]
         or not membership.get("customerId")
+        or membership.get("customerId") == PENDING_CUSTOMER_ID
+        or membership.get("status", "confirmed") != "confirmed"
+        or not is_valid_phone(membership.get("phone"))
     ):
         raise RegistrationError("KivlyMembershipRequired", 403)
+    from stand_common.kivly_participation import require_unique_player
+    require_unique_player(dynamo, player)
 
 
 def error_response(error):

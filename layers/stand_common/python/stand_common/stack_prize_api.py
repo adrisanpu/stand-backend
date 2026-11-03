@@ -124,7 +124,8 @@ def response(dynamo, meta):
     awards = [{"id": r["id"], "playerId": r["playerId"], "name": r["prize"]["name"],
                "source": r["prize"]["source"], "condition": r["condition"], "state": r["state"],
                "deliveryChannel": r.get("deliveryChannel", "wallet"),
-               "emailState": r.get("emailState"), "emailError": r.get("emailError"),
+               "emailState": prizes.email_delivery_state(r), "emailError": r.get("emailError"),
+               "emailAcceptedAt": r.get("emailAcceptedAt"),
                "lastError": r.get("lastError"), "lastErrorStage": r.get("lastErrorStage"),
                "lastErrorHttpStatus": r.get("lastErrorHttpStatus")}
               for r in rows if r["id"].startswith("award_")]

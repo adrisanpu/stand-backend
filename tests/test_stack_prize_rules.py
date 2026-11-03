@@ -516,6 +516,7 @@ def test_finish_to_delivery_runs_from_queue_without_scheduler(rig, monkeypatch):
         redemptions.append({"id": str(len(redemptions)), "reward_id": "r1"})
         return {"success": True}
     client.earn_reward.side_effect = earn
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
@@ -640,6 +641,7 @@ def test_worker_earns_once_without_browser_and_handles_multiple_identical_reward
         redemptions.append({"id": str(len(redemptions)), "reward_id": "r1"})
         return {"success": True}
     client.earn_reward.side_effect = earn
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
     for row in prizes.records(rig, "ABC123"):
@@ -661,6 +663,7 @@ def test_success_ack_confirms_even_when_kivly_redemption_history_is_empty(rig, m
     client = MagicMock()
     client.customer_rewards.return_value = []
     client.earn_reward.return_value = {"success": True, "message": "Reward earned"}
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
 
@@ -682,6 +685,7 @@ def test_confirmed_award_is_not_requested_again(rig, monkeypatch):
     client = MagicMock()
     client.customer_rewards.return_value = []
     client.earn_reward.return_value = {"success": True}
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
 
@@ -701,6 +705,7 @@ def test_uncertain_earn_is_never_replayed(rig, monkeypatch):
     client = MagicMock()
     client.customer_rewards.return_value = []
     client.earn_reward.side_effect = worker.registration.KivlyError("KivlyUnavailable")
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
     worker.deliver(row)
@@ -872,6 +877,7 @@ def test_unconfirmed_earn_response_requires_reconciliation_and_is_not_replayed(r
     client = MagicMock()
     client.customer_rewards.return_value = []
     client.earn_reward.return_value = {"success": False}
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
     event = {"Records": [{"messageId": "message",
@@ -896,6 +902,7 @@ def test_read_only_delivery_mode_keeps_award_queued_without_kivly_requests(rig, 
     rig.Table("prizes").put_item(Item=row)
     client = MagicMock()
     client.customer_rewards.return_value = []
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
 
@@ -1173,6 +1180,7 @@ def test_worker_defers_pre_earn_failures_with_visible_error_and_recovers(rig, mo
     client = MagicMock()
     client.customer_rewards.side_effect = [[], [{"id": "new", "reward_id": "r1"}]]
     client.earn_reward.return_value = {"success": True}
+    client.get_customer.return_value = {"id": "customer", "is_active": True, "phone": "+34123456789"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
     assert worker.lambda_handler(event, None) == {"batchItemFailures": []}

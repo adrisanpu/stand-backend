@@ -14,11 +14,12 @@ registration or any reward/card delivery.
 | --- | --- |
 | `POST /api/v1/auth/token` | Exchange server-only client credentials |
 | `GET /api/v1/integration/context` | Verify authorized business and owner scope |
-| `GET /api/v1/customers/` | Read-only access check or bounded, paginated `search` lookup by email |
+| `GET /api/v1/customers/` | Read-only checks and paginated identity resolution by email and phone |
+| `GET /api/v1/customers/{customer_id}` | Revalidate a confirmed identity without relying on its current email |
 | `POST /api/v1/customers/` | Create a consented, email-verified STACK participant only |
 | `GET /api/v1/rewards/` | Read the active catalog for owner selection |
 | `POST /api/v1/rewards/` | Create an owner-requested reward from STACK prize settings |
-| `GET /api/v1/redemptions/customer/{customer_id}` | Read a customer's reward assignments and returned Wallet links |
+| `GET /api/v1/redemptions/customer/{customer_id}` | Read redemption history, not an inventory of unredeemed awards |
 | `POST /api/v1/redemptions/rewards/earn` | Assign an earned STACK unit from the server-side outbox |
 
 Customer POST is never part of connect/status. It carries only `name`, `email`,
@@ -30,16 +31,29 @@ the browser. The award flow uses `earn` only; uncertain writes are not
 automatically retried.
 The transport validates TLS, rejects redirects, bounds response size to 1 MiB,
 uses an eight-second per-request timeout, and never retries a request internally.
-Customer lookup sends the normalized email in the documented `search` query,
-then compares returned emails exactly (case-insensitive, trimmed). The search
-also matches names/phones, so partial matches are not reused. At most five pages
-of 100 **filtered results** are read, independent of the business's total customer
-population. Totals must describe those filtered results and remain consistent;
-duplicate exact emails, incomplete pagination, oversized responses and exhausted
-bounds fail closed. An earlier controlled filtered request returned an inconsistent
-total: such a response still returns `KivlySearchIncomplete`, never permission
-to create a customer. Slow upstream responses can also fail within the Lambda
-time budget; lack of a complete lookup is never treated as customer absence.
+Kivly can return the business-wide `total` for a filtered search. An empty
+filtered page therefore does not prove that a customer is absent. Normal
+registration resolves positive email/phone matches, rechecks both under a durable
+creation lock, and creates directly when no clear match exists; it does not
+enumerate all customers to prove absence. Pending resolution does not grant access
+to play. Duplicate exact identities and conflicting contacts fail closed. A
+lost creation response is reconciled only by a complete directory scan for its
+original `external_id`, never by inferring success from matching contacts or by
+repeating the POST.
+
+One authorized live test observed a customer POST with the exact existing email
+and phone returning HTTP 201 with the original customer ID and `external_id`
+despite a new submitted `external_id`. The resolver accepts this response only
+when both normalized contacts and active status match, and verifies the returned
+ID with a scoped read. This single probe is evidence of that observed case, not
+a general provider guarantee; a returned customer with mismatching contacts is
+blocked from membership.
+
+Email and phone pointing to different customers produce an identity conflict.
+A phone-only match with a different or blank Kivly email requires the authenticated
+organizer to confirm the proposed identity. Approval never edits the Kivly record.
+Customer creation, lookup and operator approval remain scoped to the current
+account connection and consent; no browser-supplied customer ID grants membership.
 
 ## Credentials and isolation
 
@@ -107,12 +121,11 @@ verification codes or request bodies.
 
 `tests/test_kivly_client.py`, `tests/test_kivly_account.py`,
 `tests/test_kivly_registration.py` and `tests/test_kivly_rewards.py` are offline
-mocked contract tests, not live probes. Application-specific manual connection
-and registration probes have been retired. The bundled integration skill tools
-remain available, but no live requests are part of this change.
-The filtered lookup follows the bundled paginated customer contract; offline
-regressions cover businesses above 500 customers, not the deployed provider's
-search completeness or the failing business's actual customer count.
+mocked contract tests, not general live-provider guarantees. One separately
+authorized test-account probe observed the exact existing-email-and-phone POST
+reuse described above; it did not test arbitrary Kivly accounts or establish a
+general deduplication guarantee. Filtered lookup completeness and broader live
+behavior remain unverified.
 `tests/test_stack_prize_rules.py` additionally covers idempotent stock
 reservation, AND/OR selection, partial awards, native SDK serialization,
 closure, individual redemption and uncertain-delivery handling. Live

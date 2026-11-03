@@ -192,7 +192,7 @@ def test_global_disconnect_disables_existing_game_requirement(monkeypatch):
     assert effective["kivly"]["enabled"] is False
 
 
-def test_game_settings_support_temporary_bypass_for_lookup_validation():
+def test_game_settings_ignore_legacy_bypass_without_propagating_it():
     meta = {
         "gameType": "STACK",
         "ownerUserId": "owner",
@@ -208,10 +208,10 @@ def test_game_settings_support_temporary_bypass_for_lookup_validation():
         },
     }
     settings = kivly_settings.registration.game_settings(meta)
-    assert settings["bypassValidation"] is True
+    assert "bypassValidation" not in settings
 
 
-def test_temporary_bypass_avoids_customer_lookup(monkeypatch):
+def test_legacy_bypass_does_not_grant_membership(monkeypatch):
     meta = {
         "gameType": "STACK",
         "ownerUserId": "owner",
@@ -228,11 +228,28 @@ def test_temporary_bypass_avoids_customer_lookup(monkeypatch):
         },
     }
     monkeypatch.setattr(kivly_settings.registration, "_required_connection", lambda *_: {"locationId": "location", "ownerId": "owner", "version": "v1"})
-    result = kivly_settings.registration.ensure_membership(MagicMock(), meta, {
-        "email": "player@test.com",
-        "loyaltyConsentVersion": "version",
-    })
-    assert result == {"locationId": "location", "customerId": "manual-bypass", "consentVersion": "version", "consentedAt": result["consentedAt"]}
+    with pytest.raises(kivly_settings.registration.RegistrationError, match="KivlyPhoneRequired"):
+        kivly_settings.registration.ensure_membership(MagicMock(), meta, {
+            "email": "player@test.com", "loyaltyConsentVersion": "version",
+        })
+
+
+def test_pending_legacy_membership_cannot_play(monkeypatch):
+    meta = {
+        "gameType": "STACK", "ownerUserId": "owner", "gameId": "GAME123",
+        "participantFields": {"email": {"required": True}},
+        "kivly": {
+            "enabled": True, "clubName": "Club", "privacyUrl": "https://club.test/privacy",
+            "termsUrl": "https://club.test/terms", "locationId": "location", "consentVersion": "version",
+        },
+    }
+    registration = kivly_settings.registration
+    monkeypatch.setattr(registration, "_required_connection", lambda *_: {"locationId": "location"})
+    result = {"status": "pending", "customerId": "pending-reconciliation",
+              "locationId": "location", "consentVersion": "version", "phone": "+34 612345678"}
+    assert registration.is_pending_membership({"kivlyMembership": result})
+    with pytest.raises(registration.RegistrationError, match="KivlyMembershipRequired"):
+        registration.require_player(MagicMock(), meta, {"kivlyMembership": result})
 
 
 def test_account_saves_shared_club_without_replacing_credentials(monkeypatch):
@@ -270,8 +287,11 @@ def test_shared_storefront_save_and_get_preserve_legal_consent_and_membership(mo
     assert after["consentVersion"] == before["consentVersion"]
     game = {"ownerUserId": "owner", "gameType": "STACK", "kivly": after,
             "participantFields": {"email": {"required": True}}}
+    from stand_common import kivly_participation
+    monkeypatch.setattr(kivly_participation, "require_unique_player", lambda *_: None)
     registration.require_player(dynamo, game, {"kivlyMembership": {
         "customerId": "customer", "locationId": "location", "consentVersion": before["consentVersion"],
+        "phone": "+34 612345678",
     }})
     client = MagicMock()
     client.get_context.return_value = type("Context", (), {
@@ -381,57 +401,35 @@ def test_membership_still_requires_current_consent(monkeypatch):
     assert error.value.code == "KivlyMembershipRequired"
 
 
-def test_confirmed_membership_is_reused_without_external_creation(monkeypatch):
+def test_membership_dispatches_to_durable_resolver_with_current_scope(monkeypatch):
     game = membership_game()
     conn = {"locationId": "location", "ownerId": "kivly-owner", "version": "v1"}
     monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
-    monkeypatch.setattr(kivly_settings.registration, "_identity", lambda *_: "customer-key")
-    table, client = MagicMock(), MagicMock()
-    table.get_item.return_value = {"Item": {"state": "confirmed", "customerId": "customer-1"}}
-    monkeypatch.setattr(kivly_settings.registration, "_table", lambda *_: table)
-    client.find_customer.return_value = {"id": "customer-1", "is_active": True}
-    monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
-    result = kivly_settings.registration.ensure_membership(
-        MagicMock(), game,
-        {"email": "test@club.test", "loyaltyConsentVersion": game["kivly"]["consentVersion"]},
-    )
-    assert result["customerId"] == "customer-1"
-    assert result["locationId"] == "location"
-    client.find_customer.assert_called_once_with("location", "kivly-owner", "test@club.test")
-    client.create_customer.assert_not_called()
-    table.put_item.assert_not_called()
+    from stand_common import kivly_resolver
+    resolver = MagicMock(side_effect=kivly_settings.registration.RegistrationError(
+        "KivlyRegistrationPending", 503, 5))
+    monkeypatch.setattr(kivly_resolver, "request_membership", resolver)
+    dynamo = MagicMock()
+    values = {"email": "test@club.test", "phone": "+34 612345678",
+              "loyaltyConsentVersion": game["kivly"]["consentVersion"]}
+    with pytest.raises(kivly_settings.registration.RegistrationError, match="KivlyRegistrationPending"):
+        kivly_settings.registration.ensure_membership(dynamo, game, values)
+    resolver.assert_called_once_with(dynamo, game, conn, game["kivly"], values)
 
 
-@pytest.mark.parametrize("phone", [None, "+34 612345678"])
-def test_new_membership_is_created_once_for_the_connected_business(monkeypatch, phone):
+@pytest.mark.parametrize("phone", [None, "", "invalid"])
+def test_membership_rejects_missing_phone_before_external_requests(monkeypatch, phone):
     game = membership_game()
     conn = {"locationId": "location", "ownerId": "kivly-owner", "version": "v1"}
     monkeypatch.setattr(kivly_settings.registration, "connection", lambda *_: conn)
-    monkeypatch.setattr(kivly_settings.registration, "_identity", lambda *_: "customer-key")
-    table, client = MagicMock(), MagicMock()
-    table.get_item.return_value = {}
-    client.find_customer.return_value = None
-    client.create_customer.return_value = {"id": "customer-1", "is_active": True}
-    monkeypatch.setattr(kivly_settings.registration, "_table", lambda *_: table)
+    client = MagicMock()
     monkeypatch.setattr(kivly_settings.registration, "_client", lambda *_: client)
-
-    result = kivly_settings.registration.ensure_membership(
-        MagicMock(), game,
-        {"email": "test@club.test", "username": "Test",
-         **({"phone": phone} if phone else {}),
-         "loyaltyConsentVersion": game["kivly"]["consentVersion"]},
-    )
-
-    intent = table.put_item.call_args.kwargs
-    assert intent["ConditionExpression"] == "attribute_not_exists(id)"
-    assert intent["Item"]["state"] == "creating"
-    client.create_customer.assert_called_once_with(
-        "location", "kivly-owner", "Test", "test@club.test", intent["Item"]["externalId"],
-        **({"phone": phone} if phone else {}),
-    )
-    assert table.update_item.call_args.kwargs["ExpressionAttributeValues"][":s"] == "confirmed"
-    assert result["customerId"] == "customer-1"
-    kivly_settings.registration.require_player(MagicMock(), game, {"kivlyMembership": result})
+    with pytest.raises(kivly_settings.registration.RegistrationError, match="KivlyPhoneRequired"):
+        kivly_settings.registration.ensure_membership(
+            MagicMock(), game, {"email": "test@club.test", "username": "Test", "phone": phone,
+                                "loyaltyConsentVersion": game["kivly"]["consentVersion"]},
+        )
+    client.assert_not_called()
 
 
 @pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])

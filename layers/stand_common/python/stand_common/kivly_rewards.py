@@ -50,8 +50,10 @@ def completion_reward(dynamo, meta, player):
     if not registration.game_settings(meta)["enabled"]:
         raise registration.RegistrationError("KivlyConnectionRequired", 409)
     registration.require_player(dynamo, meta, player)
+    if registration.is_pending_membership(player):
+        return {"status": "none"}
     conn = registration._required_connection(dynamo, meta)
-    customer_id = player["kivlyMembership"]["customerId"]
+    customer_id =  player["kivlyMembership"]["customerId"]
     table = registration._table(dynamo)
     key = "reward:{}:{}".format(player["gameId"], player["playerId"])
     record = table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")

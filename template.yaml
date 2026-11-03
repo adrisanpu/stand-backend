@@ -81,11 +81,66 @@ Globals:
         STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
         PLAYER_TOKEN_SECRET: !Ref PlayerTokenSecret
         STACK_PRIZES_TABLE: !Ref StandStackPrizesTable
+        KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
+        KIVLY_REGISTRATION_QUEUE: !Ref StandKivlyRegistrationQueue
         KIVLY_EXTERNAL_WRITES_ENABLED: !Ref KivlyExternalWritesEnabled
         STACK_REWARD_EMAIL_ENABLED: !Ref StackRewardEmailEnabled
 
 
 Resources:
+
+  StandKivlyRegistrationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  StandKivlyRegistrationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt StandKivlyRegistrationDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  StandKivlyRegistrationWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stand-${Environment}-kivly-registration"
+      CodeUri: src/stand_kivly_registration/
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref StandCommonLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StandKivlyRegistrationTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StandProdGameTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StandProdUserTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt StandKivlyRegistrationQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+      Events:
+        Resolve:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt StandKivlyRegistrationQueue.Arn
+            BatchSize: 1
+            ScalingConfig:
+              MaximumConcurrency: 2
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+        Recover:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
 
   StandStackPrizesTable:
     Type: AWS::DynamoDB::Table
@@ -151,6 +206,7 @@ Resources:
         Variables:
           STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
           EMAIL_SENDER_ADDRESS: !Ref EmailSenderAddress
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref StandStackPrizesTable
@@ -172,6 +228,9 @@ Resources:
               Condition:
                 StringEquals:
                   ses:FromAddress: !Ref EmailSenderAddress
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${UserMediaBucket.Arn}/users/*/logos/*"
       Events:
         RecoverOutbox:
           Type: Schedule
@@ -264,12 +323,17 @@ Resources:
                 - "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}"
                 - TableName: !Ref StandProdCatalogTable
               - !GetAtt StandEmailVerificationTable.Arn
+              - !GetAtt StandKivlyRegistrationTable.Arn
               - !GetAtt StandStackPrizesTable.Arn
               - !Sub "${StandStackPrizesTable.Arn}/index/pending-work"
           - Sid: StackPrizeEnqueue
             Effect: Allow
             Action: sqs:SendMessage
             Resource: !GetAtt StandStackPrizeQueue.Arn
+          - Sid: KivlyRegistrationEnqueue
+            Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt StandKivlyRegistrationQueue.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -817,12 +881,30 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/kivly/rewards
             Method: POST
+        GameKivlyRewardsPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly/rewards
+            Method: PUT
         StackPrizesGet:
           Type: HttpApi
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/game/stack/prizes
             Method: GET
+        KivlyRegistrationsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly/registrations
+            Method: GET
+        KivlyRegistrationsApprove:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/kivly/registrations
+            Method: POST
         StackPrizesPut:
           Type: HttpApi
           Properties:

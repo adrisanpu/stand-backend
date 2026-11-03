@@ -229,4 +229,9 @@ def response_status(result: dict) -> int:
         "StackClosing": 409,
         "StackClosed": 409,
         "InvalidStackConfig": 400,
+        "KivlyMembershipRequired": 403,
+        "KivlyDuplicateParticipation": 409,
+        "KivlyAlreadyPlayed": 409,
+        "KivlyConnectionRequired": 409,
+        "KivlyUnavailable": 503,
     }.get(result.get("error"), 400)

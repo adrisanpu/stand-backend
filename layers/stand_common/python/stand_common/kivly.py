@@ -28,6 +28,78 @@ def reward_image_url(value):
     return None
 
 
+def _reward_payload(reward, *, allow_optional_null=False):
+    required = {"title", "description", "rewardType", "value", "pointsRequired"}
+    optional = {
+        "image", "termsAndConditions", "validFrom", "validUntil",
+        "maxRedemptions", "maxRedemptionsPerUser",
+    }
+    if (
+        not isinstance(reward, dict) or not required <= set(reward)
+        or set(reward) - required - optional
+        or not _text(reward.get("title"), 200)
+        or not _text(reward.get("description"), 2048)
+        or not isinstance(reward.get("rewardType"), str)
+        or reward.get("rewardType") not in {"discount_percentage", "discount_fixed", "free_item"}
+        or not _finite_number(reward.get("value"))
+        or not isinstance(reward.get("pointsRequired"), int)
+        or isinstance(reward.get("pointsRequired"), bool)
+        or reward["pointsRequired"] < 0
+    ):
+        raise KivlyError("KivlyRewardInvalid")
+
+    payload = {
+        "title": reward["title"].strip(),
+        "description": reward["description"].strip(),
+        "rewardType": reward["rewardType"],
+        "value": reward["value"],
+        "pointsRequired": reward["pointsRequired"],
+    }
+    if "image" in reward:
+        image = reward["image"]
+        if image is None:
+            payload["image"] = None
+        elif not reward_image_url(image):
+            raise KivlyError("KivlyRewardInvalid")
+        else:
+            payload["image"] = image
+    if "termsAndConditions" in reward:
+        terms = reward["termsAndConditions"]
+        if terms is None and allow_optional_null:
+            payload["termsAndConditions"] = None
+        elif not _text(terms, 4096):
+            raise KivlyError("KivlyRewardInvalid")
+        else:
+            payload["termsAndConditions"] = terms.strip()
+    for key in ("validFrom", "validUntil"):
+        if key not in reward:
+            continue
+        if reward[key] is None and allow_optional_null:
+            payload[key] = None
+            continue
+        parsed = _reward_datetime(reward[key])
+        if parsed is None:
+            raise KivlyError("KivlyRewardInvalid")
+        payload[key] = parsed.isoformat()
+    if (
+        payload.get("validFrom") is not None
+        and payload.get("validUntil") is not None
+        and _reward_datetime(payload["validFrom"]) > _reward_datetime(payload["validUntil"])
+    ):
+        raise KivlyError("KivlyRewardInvalid")
+    for key in ("maxRedemptions", "maxRedemptionsPerUser"):
+        if key not in reward:
+            continue
+        value = reward[key]
+        if value is None and allow_optional_null:
+            payload[key] = None
+        elif not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise KivlyError("KivlyRewardInvalid")
+        else:
+            payload[key] = value
+    return payload
+
+
 class KivlyError(Exception):
     def __init__(self, code, http_status=None, retry_after=None):
         super().__init__(code)
@@ -220,7 +292,7 @@ class KivlyClient:
             requests_per_hour=result["requests_per_hour"], resources=tuple(result["resources"]),
         )
 
-    def _customers(self, location_id, owner_id, *, page=None, customer=None, search=None):
+    def _customers(self, location_id, owner_id, *, page=None, customer=None, search=None, limit=100):
         token = self._authenticate()
         if token.location_id != location_id or token.owner_id != owner_id:
             raise KivlyError("KivlyScopeMismatch")
@@ -234,7 +306,7 @@ class KivlyClient:
             headers["Content-Type"] = "application/json"
             data = json.dumps(customer).encode("utf-8")
         else:
-            query = {"page": page, "limit": 100, "include_balance": "false"}
+            query = {"page": page, "limit": limit, "include_balance": "false"}
             if search is not None:
                 query["search"] = search
             url += "?" + urlencode(query)
@@ -246,15 +318,30 @@ class KivlyClient:
 
     def _scoped_request(
         self, location_id, owner_id, path, *, body=None, response_type=dict,
-        expected_status=200,
+        expected_status=200, method=None,
     ):
         token = self._authenticate()
         if token.location_id != location_id or token.owner_id != owner_id:
             raise KivlyError("KivlyScopeMismatch")
         base_path = path.partition("?")[0] if isinstance(path, str) else ""
-        if not (base_path == "/api/v1/rewards/"
+        reward_detail_path = (
+            base_path.startswith("/api/v1/rewards/")
+            and base_path.count("/") == 4 and not base_path.endswith("/")
+        )
+        if not (base_path == "/api/v1/rewards/" or reward_detail_path
+                or base_path.startswith("/api/v1/customers/")
                 or base_path.startswith("/api/v1/redemptions/customer/")
                 or base_path == "/api/v1/redemptions/rewards/earn"):
+            raise KivlyError("KivlyRequestNotAllowed")
+        request_method = method or ("POST" if body is not None else "GET")
+        if request_method not in ("GET", "POST", "PUT") or (
+            request_method == "GET" and body is not None
+        ) or (request_method != "GET" and body is None):
+            raise KivlyError("KivlyRequestNotAllowed")
+        if (
+            reward_detail_path and request_method not in ("GET", "PUT")
+            or base_path == "/api/v1/rewards/" and request_method not in ("GET", "POST")
+        ):
             raise KivlyError("KivlyRequestNotAllowed")
         headers = {
             "Accept": "application/json", "User-Agent": "Stand-Kivly/1.0",
@@ -263,7 +350,7 @@ class KivlyClient:
         if body is not None:
             headers["Content-Type"] = "application/json"
         return self._send_request(
-            Request(BASE_URL + path, method="POST" if body is not None else "GET",
+            Request(BASE_URL + path, method=request_method,
                     headers=headers, data=json.dumps(body).encode() if body is not None else None),
             expected_status=expected_status,
             response_type=response_type,
@@ -308,59 +395,7 @@ class KivlyClient:
         raise KivlyError("KivlyCatalogIncomplete")
 
     def create_reward(self, location_id, owner_id, reward):
-        required = {"title", "description", "rewardType", "value", "pointsRequired"}
-        optional = {
-            "image", "termsAndConditions", "validFrom", "validUntil",
-            "maxRedemptions", "maxRedemptionsPerUser",
-        }
-        reward_types = {
-            "discount_percentage", "discount_fixed", "free_item",
-        }
-        if (
-            not isinstance(reward, dict) or not required <= set(reward)
-            or set(reward) - required - optional
-            or not _text(reward.get("title"), 200)
-            or not _text(reward.get("description"), 2048)
-            or not isinstance(reward.get("rewardType"), str)
-            or reward["rewardType"] not in reward_types
-            or not _finite_number(reward.get("value"))
-            or not isinstance(reward.get("pointsRequired"), int)
-            or isinstance(reward.get("pointsRequired"), bool)
-            or reward["pointsRequired"] < 0
-        ):
-            raise KivlyError("KivlyRewardInvalid")
-
-        payload = {
-            "title": reward["title"].strip(),
-            "description": reward["description"].strip(),
-            "rewardType": reward["rewardType"],
-            "value": reward["value"],
-            "pointsRequired": reward["pointsRequired"],
-        }
-        if "image" in reward:
-            if reward["image"] is not None and not reward_image_url(reward["image"]):
-                raise KivlyError("KivlyRewardInvalid")
-            payload["image"] = reward["image"]
-        if "termsAndConditions" in reward:
-            if not _text(reward["termsAndConditions"], 4096):
-                raise KivlyError("KivlyRewardInvalid")
-            payload["termsAndConditions"] = reward["termsAndConditions"].strip()
-        for key in ("validFrom", "validUntil"):
-            if key in reward:
-                parsed = _reward_datetime(reward[key])
-                if parsed is None:
-                    raise KivlyError("KivlyRewardInvalid")
-                payload[key] = parsed.isoformat()
-        if ("validFrom" in payload and "validUntil" in payload
-                and _reward_datetime(payload["validFrom"]) > _reward_datetime(payload["validUntil"])):
-            raise KivlyError("KivlyRewardInvalid")
-        for key in ("maxRedemptions", "maxRedemptionsPerUser"):
-            if key in reward:
-                value = reward[key]
-                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                    raise KivlyError("KivlyRewardInvalid")
-                payload[key] = value
-
+        payload = _reward_payload(reward)
         token = self._authenticate()
         if token.location_id != location_id or token.owner_id != owner_id:
             raise KivlyError("KivlyScopeMismatch")
@@ -392,6 +427,109 @@ class KivlyClient:
         ):
             raise KivlyError("KivlyRewardCreationUncertain", 201)
         return {"id": result["id"], "name": result["title"]}
+
+    def get_reward(self, location_id, owner_id, reward_id):
+        if not _text(reward_id, 512):
+            raise KivlyError("KivlyRewardInvalid")
+        result = self._scoped_request(
+            location_id, owner_id,
+            "/api/v1/rewards/" + quote(reward_id, safe=""),
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("id") != reward_id
+            or not _text(result.get("title"), 200)
+            or not _text(result.get("description"), 2048)
+            or not isinstance(result.get("reward_type"), str)
+            or result.get("reward_type") not in {"discount_percentage", "discount_fixed", "free_item"}
+            or not _finite_number(result.get("value"))
+            or not isinstance(result.get("points_required"), int)
+            or isinstance(result.get("points_required"), bool)
+            or result["points_required"] < 0
+        ):
+            raise KivlyError("KivlyRewardInvalid")
+        detail = {
+            "id": reward_id,
+            "title": result["title"],
+            "description": result["description"],
+            "rewardType": result["reward_type"],
+            "value": result["value"],
+            "pointsRequired": result["points_required"],
+        }
+        optional_fields = {
+            "termsAndConditions": ("terms_and_conditions", str, 4096),
+            "validFrom": ("valid_from", str, None),
+            "validUntil": ("valid_until", str, None),
+            "maxRedemptions": ("max_redemptions", int, None),
+            "maxRedemptionsPerUser": ("max_redemptions_per_user", int, None),
+        }
+        for field_name, (source, expected_type, maximum) in optional_fields.items():
+            value = result.get(source)
+            if value is not None and (
+                not isinstance(value, expected_type)
+                or isinstance(value, bool) and expected_type is int
+                or maximum is not None and len(value) > maximum
+                or expected_type is str and bool(value) and not _text(value, maximum or 4096)
+            ):
+                raise KivlyError("KivlyRewardInvalid")
+            if field_name in ("validFrom", "validUntil") and value is not None:
+                parsed = _reward_datetime(value)
+                if parsed is None:
+                    raise KivlyError("KivlyRewardInvalid")
+                value = parsed.isoformat()
+            detail[field_name] = value
+        for key in ("maxRedemptions", "maxRedemptionsPerUser"):
+            if detail[key] is not None and detail[key] < 1:
+                raise KivlyError("KivlyRewardInvalid")
+        if (
+            detail["validFrom"] is not None and detail["validUntil"] is not None
+            and _reward_datetime(detail["validFrom"]) > _reward_datetime(detail["validUntil"])
+        ):
+            raise KivlyError("KivlyRewardInvalid")
+        image = result.get("image")
+        if image is not None and not reward_image_url(image):
+            raise KivlyError("KivlyRewardInvalid")
+        detail["image"] = image
+        return detail
+
+    def update_reward(self, location_id, owner_id, reward_id, reward):
+        if not _text(reward_id, 512):
+            raise KivlyError("KivlyRewardInvalid")
+        payload = _reward_payload(reward, allow_optional_null=True)
+        token = self._authenticate()
+        if token.location_id != location_id or token.owner_id != owner_id:
+            raise KivlyError("KivlyScopeMismatch")
+        try:
+            result = self._scoped_request(
+                location_id, owner_id,
+                "/api/v1/rewards/" + quote(reward_id, safe=""),
+                body=payload, method="PUT",
+            )
+        except KivlyError as exc:
+            if exc.code in ("KivlyUnavailable", "KivlyResponseInvalid") or (
+                exc.http_status is not None and exc.http_status >= 500
+            ):
+                raise KivlyError(
+                    "KivlyRewardUpdateUncertain", exc.http_status, exc.retry_after,
+                ) from None
+            raise
+        if (
+            not isinstance(result, dict)
+            or result.get("id") != reward_id
+            or not _text(result.get("title"), 200)
+            or not _text(result.get("description"), 2048)
+            or not isinstance(result.get("reward_type"), str)
+            or result["reward_type"] != payload["rewardType"]
+            or not _finite_number(result.get("value"))
+            or result["value"] != payload["value"]
+            or not _text(result.get("point_type"), 64)
+            or not isinstance(result.get("points_required"), int)
+            or isinstance(result.get("points_required"), bool)
+            or result["points_required"] != payload["pointsRequired"]
+            or not _text(result.get("status"), 64)
+        ):
+            raise KivlyError("KivlyRewardUpdateUncertain", 200)
+        return {"id": reward_id, "name": result["title"]}
 
     def customer_rewards(self, location_id, owner_id, customer_id):
         if not _text(customer_id, 512):
@@ -432,7 +570,8 @@ class KivlyClient:
             raise KivlyError("KivlyCustomerInvalid")
         email = email.strip().casefold()
         # Search is broad (name/email/phone); only exact email matches qualify.
-        # A complete filtered listing is still required to rule out duplicates.
+        # A miss is only a candidate miss, never authoritative creation evidence:
+        # filtered totals are global and filters may omit existing customers.
         seen, matches = set(), []
         total = None
         for page in range(1, 6):
@@ -440,7 +579,7 @@ class KivlyClient:
             rows = result.get("data")
             if (
                 not isinstance(rows, list) or len(rows) > 100
-                or type(result.get("total")) is not int or result["total"] < 0
+                or type(result.get("total")) is not int or result["total"] < len(rows)
                 or type(result.get("page")) is not int or result["page"] != page
                 or type(result.get("limit")) is not int or result["limit"] != 100
                 or type(result.get("has_next")) is not bool
@@ -463,8 +602,6 @@ class KivlyClient:
                 if (row.get("email") or "").strip().casefold() == email:
                     matches.append(row)
             if not result["has_next"]:
-                if len(seen) != total:
-                    raise KivlyError("KivlySearchIncomplete")
                 if len(matches) > 1:
                     raise KivlyError("KivlyDuplicateCustomers")
                 return matches[0] if matches else None
@@ -472,7 +609,49 @@ class KivlyClient:
                 raise KivlyError("KivlySearchIncomplete")
         raise KivlyError("KivlySearchIncomplete")
 
-    def create_customer(self, location_id, owner_id, name, email, external_id, phone=None):
+    def list_customers_page(self, location_id, owner_id, page, *, search=None, limit=250):
+        """One bounded page; filtered totals are global, not the result count."""
+        if type(page) is not int or page < 1 or limit not in (100, 250):
+            raise KivlyError("KivlySearchIncomplete")
+        result = self._customers(location_id, owner_id, page=page, search=search, limit=limit)
+        rows = result.get("data")
+        if (
+            not isinstance(rows, list) or len(rows) > limit
+            or type(result.get("total")) is not int or result["total"] < len(rows)
+            or type(result.get("page")) is not int or result["page"] != page
+            or type(result.get("limit")) is not int or result["limit"] != limit
+            or type(result.get("has_next")) is not bool
+            or type(result.get("has_previous")) is not bool
+            or result["has_previous"] != (page > 1)
+            or (result["has_next"] and not rows)
+        ):
+            raise KivlyError("KivlySearchIncomplete")
+        seen = set()
+        for row in rows:
+            if (not isinstance(row, dict) or not _text(row.get("id"), 512)
+                    or row["id"] in seen
+                    or any(row.get(key) is not None and not isinstance(row[key], str)
+                           for key in ("email", "phone", "external_id"))):
+                raise KivlyError("KivlyResponseInvalid")
+            seen.add(row["id"])
+        return result
+
+    def get_customer(self, location_id, owner_id, customer_id):
+        if not _text(customer_id, 512):
+            raise KivlyError("KivlyCustomerInvalid")
+        result = self._scoped_request(
+            location_id, owner_id, "/api/v1/customers/" + quote(customer_id, safe=""),
+        )
+        if (result.get("id") != customer_id or result.get("is_active") is not True
+                or any(result.get(key) is not None and not isinstance(result[key], str)
+                       for key in ("email", "phone", "external_id"))):
+            raise KivlyError("KivlyCustomerInvalid")
+        return result
+
+    def create_customer(
+        self, location_id, owner_id, name, email, external_id, phone=None, *,
+        allow_external_id_reuse=False,
+    ):
         if not all(_text(value, limit) for value, limit in (
             (name, 100), (email, 254), (external_id, 128),
         )):
@@ -485,6 +664,10 @@ class KivlyClient:
                 raise KivlyError("KivlyCustomerInvalid")
             customer["phone"] = phone
         result = self._customers(location_id, owner_id, customer=customer)
+        if allow_external_id_reuse:
+            if not _text(result.get("external_id"), 128):
+                raise KivlyError("KivlyCustomerInvalid")
+            return result
         if (
             not _text(result.get("id"), 512)
             or not isinstance(result.get("email"), str)
