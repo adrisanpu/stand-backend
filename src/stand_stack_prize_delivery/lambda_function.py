@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from urllib.parse import urlencode
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -10,7 +11,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from stand_common import kivly_registration as registration
 from stand_common import stack_prizes as prizes
 from stand_common.reward_email import build_message
-from stand_common.utils import is_valid_email, is_valid_phone, log
+from stand_common.utils import _iso_now, is_valid_email, is_valid_phone, log
 
 dynamo = boto3.resource("dynamodb")
 
@@ -22,6 +23,122 @@ class DeliveryFailure(Exception):
         self.http_status = getattr(error, "http_status", None)
         self.retry_after = getattr(error, "retry_after", None)
         self.stage = stage
+
+
+class RewardEmailAssetError(Exception):
+    pass
+
+
+def _award_player(dynamo, row):
+    return dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
+        Key={"gameId": row["gameId"], "playerId": row["playerId"]}, ConsistentRead=True,
+    ).get("Item") or {}
+
+
+def _valid_customer_id(value):
+    return (isinstance(value, str) and bool(value.strip()) and value == value.strip()
+            and value != registration.PENDING_CUSTOMER_ID)
+
+
+def _confirmed_membership(player, row):
+    membership = player.get("kivlyMembership") or {}
+    return (
+        _valid_customer_id(row.get("customerId"))
+        and membership.get("locationId") == row["prize"]["locationId"]
+        and membership.get("customerId") == row["customerId"]
+        and _valid_customer_id(membership.get("customerId"))
+    )
+
+
+def _block_award(key, row, reason):
+    update = "SET #s = :blocked"
+    values = {":blocked": "connection_required", ":queued": "queued"}
+    if row.get("deliveryChannel") == "email":
+        update += ", emailState = :email_blocked, emailError = :error"
+        values[":email_blocked"] = "blocked"
+        values[":error"] = reason
+    update += " REMOVE #w, dueAt"
+    try:
+        prizes.table(dynamo).update_item(
+            Key=key, UpdateExpression=update, ConditionExpression="#s = :queued",
+            ExpressionAttributeNames={"#s": "state"}, ExpressionAttributeValues=values,
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
+def _customer_by_confirmed_id(client, conn, row, player):
+    if not _confirmed_membership(player, row):
+        return None
+    try:
+        customer = client.get_customer(conn["locationId"], conn["ownerId"], row["customerId"])
+    except registration.KivlyError as exc:
+        if getattr(exc, "http_status", None) == 404 or getattr(exc, "code", "") in (
+            "KivlyCustomerNotFound", "KivlyCustomerInvalid",
+        ):
+            return None
+        raise
+    if (not isinstance(customer, dict) or customer.get("id") != row["customerId"]
+            or customer.get("is_active") is not True):
+        return None
+    return customer
+
+
+def _selected_logo(dynamo, owner):
+    users_table = os.environ.get("USERS_TABLE")
+    bucket = os.environ.get("USER_MEDIA_BUCKET")
+    if not users_table or not bucket:
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    user = dynamo.Table(users_table).get_item(
+        Key={"userId": owner}, ConsistentRead=True, ProjectionExpression="media",
+    ).get("Item")
+    media = user.get("media") if isinstance(user, dict) else None
+    logo = media.get("logo") if isinstance(media, dict) else None
+    items = logo.get("items") if isinstance(logo, dict) else None
+    selected_id = logo.get("selectedId") if isinstance(logo, dict) else None
+    selected = next((item for item in items if isinstance(item, dict)
+                     and item.get("id") == selected_id), None) if isinstance(items, list) else None
+    key = selected.get("key") if selected else None
+    if (not isinstance(owner, str) or not owner or not isinstance(key, str)
+            or not key.startswith(f"users/{owner}/logos/") or len(key) > 1024):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+    body = response.get("Body")
+    try:
+        size = response.get("ContentLength")
+        if (response.get("ContentType") != "image/png" or type(size) is not int
+                or not 0 < size <= 5 * 1024 * 1024 or body is None):
+            raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+        data = body.read(5 * 1024 * 1024 + 1)
+    finally:
+        if body is not None:
+            body.close()
+    if (not isinstance(data, bytes) or len(data) != size
+            or not data.startswith(b"\x89PNG\r\n\x1a\n")):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    return data
+
+
+def _email_branding(dynamo, row, conn, context, customer):
+    if (context.location_id != conn["locationId"]
+            or context.owner_id != conn["ownerId"]):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item")
+    if (not meta or meta.get("ownerUserId") != row["ownerUserId"]
+            or meta.get("gameType") != "STACK"):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    program = meta.get("stackPrizeProgram") or prizes.legacy_program(meta)
+    origin = prizes.resolved_storefront(program, conn)
+    if not origin:
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    wallet_url = origin + "/add-to-wallet?" + urlencode({
+        "customer_id": customer["id"], "location_id": conn["locationId"],
+    })
+    logo_png = _selected_logo(dynamo, row["ownerUserId"])
+    return context.location_name, wallet_url, logo_png
 
 
 def dispatch():
@@ -121,6 +238,10 @@ def deliver(row):
         client = registration._client(conn)
     except (registration.RegistrationError, registration.KivlyError) as exc:
         raise DeliveryFailure("connection", exc) from None
+    player = _award_player(dynamo, row)
+    if not _confirmed_membership(player, row):
+        _block_award(key, row, "KivlyMembershipRequired")
+        return
     if os.environ.get("KIVLY_EXTERNAL_WRITES_ENABLED", "true").lower() != "true":
         log("stack_prize_delivery_read_only", {"stage": "earn", "result": "skipped"})
         try:
@@ -132,6 +253,13 @@ def deliver(row):
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
+        return
+    try:
+        customer = _customer_by_confirmed_id(client, conn, row, player)
+    except registration.KivlyError as exc:
+        raise DeliveryFailure("customer_lookup", exc) from None
+    if not customer:
+        _block_award(key, row, "KivlyCustomerInvalid")
         return
     try:
         prizes.table(dynamo).update_item(
@@ -170,7 +298,7 @@ def deliver(row):
         })
     else:
         if row.get("deliveryChannel") == "email":
-            update = "SET #s = :s, emailState = :pending, #w = :pending, dueAt = :now REMOVE redemptionId, lastError, lastErrorStage, lastErrorHttpStatus"
+            update = "SET #s = :s, emailState = :pending, #w = :pending, dueAt = :now REMOVE emailError, redemptionId, lastError, lastErrorStage, lastErrorHttpStatus"
             values = {":s": state, ":pending": "pending", ":now": 0}
         else:
             update = "SET #s = :s REMOVE redemptionId, #w, dueAt, lastError, lastErrorStage, lastErrorHttpStatus"
@@ -182,9 +310,16 @@ def deliver(row):
     )
 
 
-def email_status(key, state, error=None, attempts=0, retry=False):
+def email_status(key, state, error=None, attempts=0, retry=False, message_id=None):
     update = "SET emailState = :state, emailError = :error"
     values = {":state": state, ":error": error}
+    if attempts:
+        update += ", emailAttempts = :attempts"
+        values[":attempts"] = attempts
+    if message_id:
+        update += ", emailMessageId = :message, emailAcceptedAt = :accepted"
+        values[":message"] = message_id
+        values[":accepted"] = _iso_now()
     if retry:
         update += ", dueAt = :later"
         values[":later"] = int(time.time()) + 60 * max(1, attempts)
@@ -215,19 +350,7 @@ def notify(row):
         )
         return
     attempts = int(row.get("emailAttempts", 0)) + 1
-    try:
-        prizes.table(dynamo).update_item(
-            Key=key, UpdateExpression="SET emailState = :sending, emailAttempts = :attempts",
-            ConditionExpression="emailState = :pending",
-            ExpressionAttributeValues={":sending": "sending", ":pending": "pending", ":attempts": attempts},
-        )
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return
-        raise
-    player = dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
-        Key={"gameId": row["gameId"], "playerId": row["playerId"]}, ConsistentRead=True,
-    ).get("Item") or {}
+    player = _award_player(dynamo, row)
     email = player.get("email")
     if not player.get("emailVerifiedAt") or not is_valid_email(email or ""):
         email_status(key, "failed", "VerifiedEmailRequired")
@@ -241,19 +364,44 @@ def notify(row):
         if not conn or conn["locationId"] != row["prize"]["locationId"]:
             email_status(key, "failed", "KivlyConnectionChanged")
             return
-        customer = registration._client(conn).find_customer(conn["locationId"], conn["ownerId"], email)
+        client = registration._client(conn)
+        customer = _customer_by_confirmed_id(client, conn, row, player)
+        context = client.get_context()
     except (registration.RegistrationError, registration.KivlyError) as exc:
-        email_status(key, "pending" if attempts < 3 else "failed",
-                     getattr(exc, "code", "KivlyUnavailable"), attempts, retry=attempts < 3)
+        retry = attempts < 3
+        email_status(key, "pending" if retry else "failed",
+                     getattr(exc, "code", "KivlyUnavailable"), attempts, retry=retry)
         return
-    if not customer or customer.get("id") != row["customerId"] or customer.get("is_active") is not True:
+    if not customer:
         email_status(key, "failed", "KivlyCustomerInvalid")
         return
     phone = customer.get("phone")
     if not is_valid_phone(phone):
         email_status(key, "failed", "KivlyPhoneRequired")
         return
-    message = build_message(sender, email, player.get("username") or "", row["prize"], phone)
+    try:
+        club_name, wallet_url, logo_png = _email_branding(dynamo, row, conn, context, customer)
+        message = build_message(
+            sender, email, player.get("username") or "", row["prize"], phone,
+            club_name=club_name, wallet_url=wallet_url, logo_png=logo_png,
+        )
+    except Exception:
+        email_status(key, "failed", "RewardEmailAssetsUnavailable")
+        return
+    try:
+        prizes.table(dynamo).update_item(
+            Key=key, UpdateExpression="SET emailState = :sending, emailAttempts = :attempts",
+            ConditionExpression="emailState = :pending AND #s = :confirmed",
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={
+                ":sending": "sending", ":pending": "pending", ":attempts": attempts,
+                ":confirmed": "confirmed",
+            },
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return
+        raise
     try:
         result = boto3.client(
             "ses", region_name="us-east-1",
@@ -282,7 +430,7 @@ def notify(row):
     if not isinstance(result.get("MessageId"), str) or not result["MessageId"]:
         email_status(key, "reconciliation_required", "RewardEmailUncertain")
         return
-    email_status(key, "accepted")
+    email_status(key, "accepted", message_id=result["MessageId"])
 
 
 def lambda_handler(event, context):

@@ -501,7 +501,7 @@ def award_units(meta, player, rule, prize, quantity, job_id=None):
         if prize["source"] == "kivly":
             row["deliveryChannel"] = delivery_channel(player)
             if row["deliveryChannel"] == "email":
-                row["emailState"] = "pending"
+                row["emailState"] = "blocked"
             membership = player.get("kivlyMembership") or {}
             if membership.get("locationId") != prize["locationId"] or not membership.get("customerId"):
                 row["state"] = "connection_required"
@@ -698,6 +698,13 @@ def delivery_channel(player):
     return (attempt.get("prizeProgram") or {}).get("deliveryChannel", "wallet")
 
 
+def email_delivery_state(award):
+    if (award.get("deliveryChannel", "wallet") == "email"
+            and award.get("state") != "confirmed"):
+        return "blocked"
+    return award.get("emailState")
+
+
 def wallet_link(dynamo, meta, player):
     if delivery_channel(player) == "email":
         return None
@@ -722,7 +729,7 @@ def public_awards(dynamo, meta, player, issue_token):
         awards.append({"id": row["id"], "source": prize["source"], "name": prize["name"],
                        "imageUrl": image_url(prize, meta), "condition": row["condition"], "state": row["state"],
                        "deliveryChannel": row.get("deliveryChannel", "wallet"),
-                       "emailState": row.get("emailState"), "emailError": row.get("emailError"),
+                       "emailState": email_delivery_state(row), "emailError": row.get("emailError"),
                        "token": issue_token(row["id"]) if prize["source"] == "stand" and row["state"] == "available" else None})
     channel = delivery_channel(player)
     return {"awards": awards, "walletUrl": wallet_link(dynamo, meta, player), "deliveryChannel": channel,

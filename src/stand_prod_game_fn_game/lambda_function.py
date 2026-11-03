@@ -6,7 +6,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
-from stand_common import kivly_settings, stack_prize_api, stack_prizes
+from stand_common import kivly_settings, stack_prize_api, stack_prizes, kivly_registration_api
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
@@ -893,6 +893,7 @@ def _handle_post(event):
         if game_type == "STACK":
             item["type"] = {"STACK": stack_config}
             item["requiresValidation"] = False
+        item["kivly"] = {"enabled": False}
         
         try:
             games_table.put_item(
@@ -1523,6 +1524,8 @@ def lambda_handler(event, context):
             return _resp(204, "")
 
         path = _get_path(event).rstrip("/")
+        if path.endswith("/v1/game/kivly/registrations"):
+            return kivly_registration_api.handle(event, method, dynamodb)
         if path.endswith("/v1/game/stack/prizes"):
             return stack_prize_api.handle(
                 event, method, dynamodb, lambda owner: _is_user_pro(_get_user(owner)),

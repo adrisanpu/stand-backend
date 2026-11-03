@@ -1,6 +1,7 @@
 import json
 from email import policy
 from email.parser import BytesParser
+from io import BytesIO
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +14,11 @@ from stand_common.utils import normalize_participant_fields, web_participant_fie
 from tests.email_fake import FakeDynamoError
 from tests.test_stack_prize_rules import (
     rig, meta, player, delivery_module, PROGRAM, ATTEMPT,
+)
+
+TEST_LOGO_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + b"\x00" * 13 + b"\x00" * 4
+    + b"\x00\x00\x00\x00IEND\xaeB`\x82"
 )
 
 
@@ -82,12 +88,17 @@ def email_rig(rig, monkeypatch):
     rig.Table("prizes").put_item(Item=row)
     client, ses = MagicMock(), MagicMock()
     client.earn_reward.return_value = {"success": True}
-    client.find_customer.return_value = {
+    client.get_customer.return_value = {
         "id": "customer", "is_active": True, "phone": "+34 999999999",
     }
+    client.get_context.return_value = MagicMock(location_name="Club & Pizza")
     ses.send_raw_email.return_value = {"MessageId": "message-1"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
+    branding = ("Club & Pizza",
+                "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc",
+                TEST_LOGO_PNG)
+    monkeypatch.setattr(worker, "_email_branding", lambda *_: branding)
     monkeypatch.setattr(worker.boto3, "client", lambda *_, **__: ses)
     return worker, rig, row, client, ses
 
@@ -117,14 +128,29 @@ def test_email_is_sent_after_earn_once_using_kivly_phone_not_form(email_rig, mon
     process(worker, row)
     assert payloads == ["+34 999999999"]
     assert stored(rig, row)["emailState"] == "accepted"
+    assert stored(rig, row)["emailMessageId"] == "message-1"
+    assert stored(rig, row)["emailAcceptedAt"]
     assert "work" not in stored(rig, row)
     client.earn_reward.assert_called_once()
     ses.send_raw_email.assert_called_once()
+    client.get_customer.assert_called_with("loc", "owner", "customer")
+    client.find_customer.assert_not_called()
     sent = ses.send_raw_email.call_args.kwargs
     assert sent["Destinations"] == ["verified@example.test"]
+    message = BytesParser(policy=policy.default).parsebytes(sent["RawMessage"]["Data"])
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert "Club &amp; Pizza" in html
+    assert "add-to-wallet?customer_id=customer&amp;location_id=loc" in html
+    assert "cid:club-logo" in html and "cid:reward-qr" in html
+    qr_payload = next(part for part in message.walk()
+                      if part.get_content_type() == "image/png"
+                      and str(part["Content-ID"]) == "<reward-qr>")
+    assert qr_payload.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
     public = prizes.public_awards(rig, meta(rig), player(rig), lambda _: "token")
     assert public["walletUrl"] is None and public["walletExpected"] is False
     assert public["awards"][0]["emailState"] == "accepted"
+    owner = json.loads(stack_prize_api.response(rig, meta(rig))["body"])
+    assert owner["awards"][0]["emailAcceptedAt"] == stored(rig, row)["emailAcceptedAt"]
     assert "+34" not in json.dumps(public)
     assert "verified@example.test" not in json.dumps(public)
 
@@ -145,10 +171,104 @@ def test_mail_has_inline_png_text_and_escaped_content():
     assert image.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_spanish_club_mail_contains_wallet_link_and_phone_qr(monkeypatch):
+    payloads = []
+    original = qrcode.QRCode.add_data
+
+    def capture(self, data, *args, **kwargs):
+        payloads.append(data)
+        return original(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(qrcode.QRCode, "add_data", capture)
+    wallet = "https://club.kivly.store/add-to-wallet?customer_id=customer&location_id=loc"
+    raw = build_message(
+        "sender@example.test", "player@example.test", "<Player>",
+        {"name": "Coffee"}, "+34123456789", club_name="Club & Pizza", wallet_url=wallet,
+    )
+    message = BytesParser(policy=policy.default).parsebytes(raw)
+    html = message.get_body(preferencelist=("html",)).get_content()
+    text = message.get_body(preferencelist=("plain",)).get_content()
+    assert str(message["Subject"]) == "Tu premio en Club & Pizza: Coffee"
+    assert wallet in text
+    assert 'href="' + wallet.replace("&", "&amp;") + '"' in html
+    assert "Club &amp; Pizza" in html and "&lt;Player&gt;" in html
+    assert 'src="cid:reward-qr"' in html
+    assert "Your reward" not in text
+    assert "no necesitas instalar una wallet" in text
+    assert payloads == ["+34123456789"]
+    image = next(p for p in message.walk() if p.get_content_type() == "image/png")
+    assert image["Content-ID"] == "<reward-qr>"
+    assert image.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_branded_mail_embeds_logo_and_large_qr_without_remote_images():
+    original = BytesParser(policy=policy.default).parsebytes(build_message(
+        "sender@example.test", "player@example.test", "Player",
+        {"name": "Coffee"}, "+34123456789",
+    ))
+    logo = next(p for p in original.walk() if p.get_content_type() == "image/png")
+    logo_bytes = logo.get_payload(decode=True)
+    message = BytesParser(policy=policy.default).parsebytes(build_message(
+        "sender@example.test", "player@example.test", "Player",
+        {"name": "Coffee", "imageUrl": "https://images.example.test/photo.png"},
+        "+34123456789", club_name="Club",
+        wallet_url="https://club.kivly.store/add-to-wallet?customer_id=c&location_id=l",
+        logo_png=logo_bytes,
+    ))
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert 'src="cid:club-logo"' in html
+    assert 'src="cid:reward-qr" width="280" height="280"' in html
+    assert "Tu premio te espera" in html
+    assert 'role="presentation"' in html
+    assert "images.example.test" not in html
+    images = [p for p in message.walk() if p.get_content_type() == "image/png"]
+    assert {str(p["Content-ID"]) for p in images} == {"<club-logo>", "<reward-qr>"}
+    assert all(p.get_content_disposition() == "inline" for p in images)
+    embedded_logo = next(p for p in images if str(p["Content-ID"]) == "<club-logo>")
+    assert embedded_logo.get_payload(decode=True) == logo_bytes
+
+
+@pytest.mark.parametrize("logo", [b"", b"not PNG", "image.png", b"\x89PNG\r\n\x1a\n"])
+def test_club_mail_rejects_invalid_logo(logo):
+    with pytest.raises(ValueError, match="InvalidRewardEmailLogo"):
+        build_message(
+            "sender@example.test", "player@example.test", "Player",
+            {"name": "Coffee"}, "+34123456789", club_name="Club", logo_png=logo,
+        )
+
+
+@pytest.mark.parametrize("wallet", [
+    "javascript:alert(1)",
+    "http://club.kivly.store/add-to-wallet?customer_id=c&location_id=l",
+    "https://evil.test/add-to-wallet?customer_id=c&location_id=l",
+    "https://club.kivly.store/login?customer_id=c&location_id=l",
+    "https://club.kivly.store/add-to-wallet?customer_id=c",
+    "https://club.kivly.store/add-to-wallet?customer_id=c&location_id=l&redirect=evil",
+    "https://club.kivly.store/add-to-wallet?customer_id=c&customer_id=d&location_id=l",
+    "https://club.kivly.store/add-to-wallet?customer_id=%0A&location_id=l",
+    "https://club.kivly.store/add-to-wallet?customer_id=c&location_id=l#fragment",
+])
+def test_club_mail_rejects_invalid_wallet_link(wallet):
+    with pytest.raises(ValueError, match="InvalidRewardWalletLink"):
+        build_message(
+            "sender@example.test", "player@example.test", "Player",
+            {"name": "Coffee"}, "+34123456789", club_name="Club", wallet_url=wallet,
+        )
+
+
+@pytest.mark.parametrize("club", ["", " ", "Club\nInjected", "x" * 201, 123])
+def test_club_mail_rejects_invalid_club_name(club):
+    with pytest.raises(ValueError, match="InvalidRewardEmailClub"):
+        build_message(
+            "sender@example.test", "player@example.test", "Player",
+            {"name": "Coffee"}, "+34123456789", club_name=club,
+        )
+
+
 @pytest.mark.parametrize("phone", [None, "", "invalid"])
 def test_missing_kivly_phone_never_falls_back_to_form_or_reassigns(email_rig, phone):
     worker, rig, row, client, ses = email_rig
-    client.find_customer.return_value["phone"] = phone
+    client.get_customer.return_value["phone"] = phone
     process(worker, row)
     process(worker, row)
     assert stored(rig, row)["state"] == "confirmed"
@@ -230,7 +350,7 @@ def test_throttling_retries_are_bounded_without_reassigning(email_rig):
 
 def test_operator_can_retry_failed_email_after_fix_without_earning_again(email_rig, monkeypatch):
     worker, rig, row, client, ses = email_rig
-    client.find_customer.return_value["phone"] = None
+    client.get_customer.return_value["phone"] = None
     process(worker, row)
     process(worker, row)
     monkeypatch.setattr(stack_prize_api, "_get_claims", lambda _: {"sub": "owner"})
@@ -239,7 +359,7 @@ def test_operator_can_retry_failed_email_after_fix_without_earning_again(email_r
     event = {"body": json.dumps(body)}
     response = stack_prize_api.handle(event, "POST", rig, lambda _: True, None)
     assert response["statusCode"] == 200
-    client.find_customer.return_value["phone"] = "+34123456789"
+    client.get_customer.return_value["phone"] = "+34123456789"
     process(worker, row)
     assert stored(rig, row)["emailState"] == "accepted"
     assert stack_prize_api.handle(event, "POST", rig, lambda _: True, None)["statusCode"] == 409
@@ -265,3 +385,122 @@ def test_disabled_email_remains_pending_and_does_not_send(email_rig, monkeypatch
     assert stored(rig, row)["emailState"] == "pending"
     assert stored(rig, row)["work"] == "pending"
     ses.send_raw_email.assert_not_called()
+
+
+def test_email_is_blocked_until_confirmed_and_pending_marker_cannot_earn(email_rig):
+    worker, rig, row, client, ses = email_rig
+    row["customerId"] = "pending-reconciliation"
+    rig.Table("players").put_item(Item={
+        **player(rig), "kivlyMembership": {
+            "locationId": "loc", "customerId": "pending-reconciliation",
+        },
+    })
+    worker.deliver(row)
+    saved = stored(rig, row)
+    assert saved["state"] == "connection_required"
+    assert saved["emailState"] == "blocked"
+    assert saved["emailError"] == "KivlyMembershipRequired"
+    public = prizes.public_awards(rig, meta(rig), player(rig), lambda _: "token")
+    assert public["awards"][0]["emailState"] == "blocked"
+    client.get_customer.assert_not_called()
+    client.earn_reward.assert_not_called()
+    ses.send_raw_email.assert_not_called()
+
+
+def test_inactive_customer_by_confirmed_id_cannot_be_earned_or_emailed(email_rig):
+    worker, rig, row, client, ses = email_rig
+    client.get_customer.return_value["is_active"] = False
+    worker.deliver(row)
+    saved = stored(rig, row)
+    assert saved["state"] == "connection_required"
+    assert saved["emailState"] == "blocked"
+    client.earn_reward.assert_not_called()
+    ses.send_raw_email.assert_not_called()
+
+
+def test_missing_branded_assets_fail_without_sending_or_fallback(email_rig, monkeypatch):
+    worker, rig, row, client, ses = email_rig
+    def missing_branding(*_):
+        raise worker.RewardEmailAssetError()
+    monkeypatch.setattr(worker, "_email_branding", missing_branding)
+    process(worker, row)
+    process(worker, row)
+    saved = stored(rig, row)
+    assert saved["state"] == "confirmed"
+    assert saved["emailState"] == "failed"
+    assert saved["emailError"] == "RewardEmailAssetsUnavailable"
+    assert client.earn_reward.call_count == 1
+    ses.send_raw_email.assert_not_called()
+
+
+def test_award_email_state_is_blocked_before_confirmation(rig):
+    player_row = player(rig)
+    player_row["type"]["STACK"]["attempt"] = {"prizeProgram": {"deliveryChannel": "email"}}
+    row = prizes.award_units(meta(rig), player_row, {"id": "done", "condition": "completed"},
+                             PROGRAM["catalog"][1], 1)[0]
+    assert row["state"] == "queued"
+    assert row["emailState"] == "blocked"
+    assert prizes.email_delivery_state(row) == "blocked"
+
+
+def test_selected_owner_logo_is_required_and_owner_scoped(rig, monkeypatch):
+    worker = delivery_module(monkeypatch, rig)
+    monkeypatch.setenv("USERS_TABLE", "users")
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "user-media")
+    data = TEST_LOGO_PNG
+    rig.Table("users").put_item(Item={
+        "userId": "owner",
+        "media": {"logo": {"selectedId": "selected", "items": [
+            {"id": "selected", "key": "users/owner/logos/club.png"},
+        ]}},
+    })
+    body = BytesIO(data)
+    s3 = MagicMock()
+    s3.get_object.return_value = {
+        "Body": body, "ContentType": "image/png", "ContentLength": len(data),
+    }
+    monkeypatch.setattr(worker.boto3, "client", lambda service: s3)
+
+    assert worker._selected_logo(rig, "owner") == data
+    s3.get_object.assert_called_once_with(
+        Bucket="user-media", Key="users/owner/logos/club.png",
+    )
+    rig.Table("users").put_item(Item={
+        "userId": "owner",
+        "media": {"logo": {"selectedId": "other", "items": [
+            {"id": "selected", "key": "users/owner/logos/club.png"},
+        ]}},
+    })
+    with pytest.raises(worker.RewardEmailAssetError):
+        worker._selected_logo(rig, "owner")
+
+
+def test_email_branding_uses_selected_logo_and_resolved_wallet_for_owner(rig, monkeypatch):
+    worker = delivery_module(monkeypatch, rig)
+    monkeypatch.setenv("USERS_TABLE", "users")
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "user-media")
+    rig.Table("users").put_item(Item={
+        "userId": "owner",
+        "media": {"logo": {"selectedId": "selected", "items": [
+            {"id": "selected", "key": "users/owner/logos/club.png"},
+        ]}},
+    })
+    s3 = MagicMock()
+    s3.get_object.return_value = {
+        "Body": BytesIO(TEST_LOGO_PNG), "ContentType": "image/png",
+        "ContentLength": len(TEST_LOGO_PNG),
+    }
+    monkeypatch.setattr(worker.boto3, "client", lambda service: s3)
+
+    branding = worker._email_branding(
+        rig, {"gameId": "ABC123", "ownerUserId": "owner"},
+        {"locationId": "loc", "ownerId": "owner"},
+        MagicMock(location_id="loc", owner_id="owner", location_name="Club"),
+        {"id": "customer"},
+    )
+
+    assert branding == (
+        "Club",
+        "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc",
+        TEST_LOGO_PNG,
+    )

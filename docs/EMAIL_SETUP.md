@@ -129,10 +129,25 @@ reused on these roles to preserve all prior game/session behavior.
 
 The STACK delivery worker separately receives `ses:SendRawEmail` on the same
 identity, restricted to `EmailSenderAddress`. Its MIME message contains
-bilingual text/HTML and a locally generated inline PNG QR; no QR/image service
-receives participant phone numbers. The worker's pinned `qrcode`/`pypng`
-requirements are installed by SAM build and by the test requirements.
+Spanish branded text/HTML, the selected owner logo, a wallet link and a locally
+generated inline PNG QR; no QR/image service receives participant phone
+numbers. The worker's pinned `qrcode`/`pypng` requirements are installed by SAM
+build and by the test requirements.
 Assignment Lambdas still cannot send email.
+
+For an explicitly approved recovery/test, `reward_email.build_message` also
+accepts keyword-only `club_name`, `wallet_url` and `logo_png`. Providing a club
+name selects the Spanish club-specific card layout, with a highlighted reward,
+wallet button and large QR. `logo_png` embeds a PNG of at most 5 MB as an inline
+MIME image rather than an expiring or externally hosted logo. This layout does
+not load the optional remote prize image. The optional wallet link must be an HTTPS
+`*.kivly.store/add-to-wallet` URL with exactly one `customer_id` and `location_id`.
+The QR still contains the phone returned by Kivly, not the registration form.
+Existing callers without these arguments retain the bilingual template. These
+arguments alone do not change the worker's delivery policy or enable any sends.
+Verify the assignment in Kivly before notifying: the customer-redemptions endpoint
+describes redemptions and may not list a newly earned, unredeemed reward.
+Do not repeat an earn merely because it is absent from that endpoint.
 
 `StackRewardEmailEnabled` defaults to `"false"` in the template. The dev
 `samconfig.toml` explicitly enables it for authorized testing; production does
@@ -146,12 +161,26 @@ Keep production disabled until the controlled flow is accepted.
 Select Email in a STACK game's prize settings after enabling the environment.
 New attempts use that channel; existing attempts/awards retain their previous
 channel. Name, verified email and phone are required for new STACK registrations
-in either mode. Publish backend and matching frontend together so older forms
-without phone do not remain in circulation.
+in either mode. The delivery worker checks the participant's confirmed active
+Kivly customer by the persisted location/customer ID, not by email, before
+earning a reward or preparing its notice. It sends only to the participant's
+verified STAND email; the QR phone comes from that same active Kivly customer.
+It requires the owner's currently selected PNG logo in
+`users/{ownerUserId}/logos/` and an approved Kivly storefront for the wallet
+link. Missing/invalid branding data fails the notification rather than silently
+substituting an unbranded template. The worker needs `USER_MEDIA_BUCKET` in its
+environment; its role needs read access to the owner's user record, the selected
+logo object and the existing SES sending identity. Publish backend and matching
+frontend together so older forms without phone do not remain in circulation.
 
-The worker sends only for confirmed Kivly assignments. Email acceptance is
-tracked independently: `accepted` means SES returned a MessageId, not delivery
-to the recipient. The existing verification-email rate counters do not apply
+The worker sends only for confirmed Kivly assignments. Until the prize is
+confirmed, the API reports email as `blocked`, not `pending`; after earn
+confirmation it becomes `pending` for notification. Email acceptance is tracked
+independently: `accepted` means SES returned a MessageId, which is persisted
+alongside the acceptance timestamp, not delivery to the recipient. The operator
+panel should distinguish blocked-before-confirmation, pending, accepted, failed
+and reconciliation-required states; it must not present a blocked notice as an
+email waiting to send. The existing verification-email rate counters do not apply
 to reward notices; award stock, persisted allocation and bounded retries limit
 reward sends. Account-wide SES quotas still apply and must cover both flows.
 The operator prize panel lists safe notification status/errors and permits retry

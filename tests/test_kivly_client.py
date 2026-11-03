@@ -89,6 +89,72 @@ def test_create_reward_posts_scoped_contract_and_maps_response(client, monkeypat
     )
 
 
+def test_get_reward_reads_detailed_scoped_reward(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    request = MagicMock(return_value={
+        "id": "reward/1", "title": "Coffee", "description": "A coffee",
+        "reward_type": "free_item", "value": 1, "point_type": "POINT",
+        "points_required": 25, "status": "active", "image": None,
+        "terms_and_conditions": "One per visit", "valid_from": None, "valid_until": None,
+        "max_redemptions": 100, "max_redemptions_per_user": 1,
+    })
+    monkeypatch.setattr(client, "_scoped_request", request)
+
+    reward = client.get_reward("location", "owner", "reward/1")
+
+    assert reward == {
+        "id": "reward/1", "title": "Coffee", "description": "A coffee",
+        "rewardType": "free_item", "value": 1, "pointsRequired": 25,
+        "image": None, "termsAndConditions": "One per visit",
+        "validFrom": None, "validUntil": None,
+        "maxRedemptions": 100, "maxRedemptionsPerUser": 1,
+    }
+    request.assert_called_once_with("location", "owner", "/api/v1/rewards/reward%2F1")
+
+
+def test_update_reward_uses_put_and_clears_optional_fields(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    request = MagicMock(return_value={
+        "id": "reward-1", "title": "Tea", "description": "A cup of tea",
+        "reward_type": "free_item", "value": 1, "point_type": "POINT",
+        "points_required": 25, "status": "active",
+    })
+    monkeypatch.setattr(client, "_scoped_request", request)
+
+    reward = client.update_reward("location", "owner", "reward-1", {
+        "title": " Tea ", "description": " A cup of tea ", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 25, "image": None, "termsAndConditions": None,
+        "validFrom": None, "validUntil": None, "maxRedemptions": None,
+        "maxRedemptionsPerUser": None,
+    })
+
+    assert reward == {"id": "reward-1", "name": "Tea"}
+    request.assert_called_once_with(
+        "location", "owner", "/api/v1/rewards/reward-1",
+        body={
+            "title": "Tea", "description": "A cup of tea", "rewardType": "free_item",
+            "value": 1, "pointsRequired": 25, "image": None,
+            "termsAndConditions": None, "validFrom": None, "validUntil": None,
+            "maxRedemptions": None, "maxRedemptionsPerUser": None,
+        },
+        method="PUT",
+    )
+
+
+def test_update_reward_does_not_repeat_uncertain_mutations(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    request = MagicMock(side_effect=KivlyError("KivlyUnavailable"))
+    monkeypatch.setattr(client, "_scoped_request", request)
+    draft = {
+        "title": "Coffee", "description": "A coffee", "rewardType": "free_item",
+        "value": 1, "pointsRequired": 0,
+    }
+
+    with pytest.raises(KivlyError, match="KivlyRewardUpdateUncertain"):
+        client.update_reward("location", "owner", "reward-1", draft)
+    request.assert_called_once()
+
+
 @pytest.mark.parametrize("reward", [
     {},
     {"title": "Coffee", "description": "A coffee", "rewardType": "other", "value": 1, "pointsRequired": 0},
@@ -151,6 +217,27 @@ def test_scoped_reward_post_uses_http_201_and_json_body(client, monkeypatch):
     assert request.full_url == "https://api.getkivly.com/api/v1/rewards/"
     assert json.loads(request.data) == payload
     assert sender.call_args.kwargs["expected_status"] == 201
+
+
+def test_scoped_reward_update_uses_put_only_on_reward_detail_path(client, monkeypatch):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    sender = MagicMock(return_value={"accepted": True})
+    monkeypatch.setattr(client, "_send_request", sender)
+
+    client._scoped_request(
+        "location", "owner", "/api/v1/rewards/reward-1",
+        body={"title": "Tea"}, method="PUT",
+    )
+
+    request = sender.call_args.args[0]
+    assert request.method == "PUT"
+    assert request.full_url == "https://api.getkivly.com/api/v1/rewards/reward-1"
+    assert json.loads(request.data) == {"title": "Tea"}
+    with pytest.raises(KivlyError, match="KivlyRequestNotAllowed"):
+        client._scoped_request(
+            "location", "owner", "/api/v1/rewards/", body={"title": "Tea"}, method="PUT",
+        )
+    sender.assert_called_once()
 
 
 def test_authentication_cache_is_private_and_reused(client, monkeypatch):
@@ -295,7 +382,6 @@ def test_filtered_search_preserves_upstream_failure_without_retry(client, monkey
 
 
 @pytest.mark.parametrize("page", [
-    customer_page([], total=1),
     customer_page([], has_next=True),
     customer_page([{"id": "one", "email": "player@club.test"}], total=0),
     customer_page([{"id": "one", "email": 123}]),
@@ -308,6 +394,37 @@ def test_incomplete_or_ambiguous_listing_never_proves_absence(client, monkeypatc
     monkeypatch.setattr(client, "_customers", lambda *args, **kwargs: page)
     with pytest.raises(KivlyError):
         client.find_customer("location", "owner", "player@club.test")
+
+
+@pytest.mark.parametrize("rows", [[], [{"id": "match", "email": "player@club.test"}]])
+def test_filtered_lookup_accepts_global_total_without_treating_it_as_filtered_count(client, monkeypatch, rows):
+    monkeypatch.setattr(client, "_customers", lambda *args, **kwargs: customer_page(rows, total=30000))
+    result = client.find_customer("location", "owner", "player@club.test")
+    assert result == (rows[0] if rows else None)
+
+
+def test_unfiltered_page_is_bounded_at_250_not_the_response_cap_exceeding_1000(client, monkeypatch):
+    request = MagicMock(return_value={**customer_page([], total=30000), "limit": 250})
+    monkeypatch.setattr(client, "_customers", request)
+    assert client.list_customers_page("location", "owner", 1)["total"] == 30000
+    request.assert_called_once_with("location", "owner", page=1, search=None, limit=250)
+
+
+def test_get_customer_uses_scoped_id_and_rejects_mismatched_response(client, monkeypatch):
+    request = MagicMock(return_value={"id": "customer", "is_active": True, "email": None})
+    monkeypatch.setattr(client, "_scoped_request", request)
+    assert client.get_customer("location", "owner", "customer")["id"] == "customer"
+    request.assert_called_once_with("location", "owner", "/api/v1/customers/customer")
+    request.return_value["id"] = "other"
+    with pytest.raises(KivlyError, match="KivlyCustomerInvalid"):
+        client.get_customer("location", "owner", "customer")
+
+
+def test_get_customer_checks_token_scope_before_reading_any_customer(client, monkeypatch):
+    monkeypatch.setattr(client, "_authenticate", lambda: _Token("token", "elsewhere", "owner", 99999))
+    with pytest.raises(KivlyError, match="KivlyScopeMismatch"):
+        client.get_customer("location", "owner", "customer")
+    client._opener.open.assert_not_called()
 
 
 def test_duplicate_matching_customers_fail_closed(client, monkeypatch):
@@ -354,6 +471,22 @@ def test_create_requires_matching_active_customer_response(client, monkeypatch, 
     })
     with pytest.raises(KivlyError, match="KivlyCustomerInvalid"):
         client.create_customer("location", "owner", "Full Name", "player@club.test", "stand-attempt")
+
+
+def test_create_allows_different_external_id_only_for_explicit_resolver_path(client, monkeypatch):
+    monkeypatch.setattr(client, "_customers", lambda *args, **kwargs: {
+        "id": "existing", "email": "different@club.test", "external_id": "original-attempt",
+        "is_active": True,
+    })
+    with pytest.raises(KivlyError, match="KivlyCustomerInvalid"):
+        client.create_customer("location", "owner", "Full Name", "player@club.test", "stand-attempt")
+    result = client.create_customer(
+        "location", "owner", "Full Name", "player@club.test", "stand-attempt",
+        allow_external_id_reuse=True,
+    )
+    assert result["id"] == "existing"
+    assert result["email"] == "different@club.test"
+    assert result["external_id"] == "original-attempt"
 
 
 def test_http_transport_is_bounded_and_does_not_retry(client):

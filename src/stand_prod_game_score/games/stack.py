@@ -4,7 +4,7 @@ import os
 import boto3
 
 from botocore.exceptions import ClientError
-from stand_common import stack_prizes
+from stand_common import stack_prizes, kivly_registration
 from stand_common.stack import CONFIG_VERSION, game_config, replay, player_rank
 from stand_common.utils import _iso_now, _parse_iso, get_game_type_blob
 
@@ -145,6 +145,13 @@ def store_score(game_id: str, gp_table, payload: dict, game_meta: dict) -> dict:
     player = gp_table.get_item(Key=key, ConsistentRead=True).get("Item")
     if not player:
         return {"ok": False, "error": "PlayerNotFound"}
+    try:
+        dynamo = boto3.resource("dynamodb")
+        resolved_meta = kivly_registration.apply_account_settings(dynamo, game_meta)
+        kivly_registration.require_player(dynamo, resolved_meta, player)
+    except kivly_registration.ERRORS as error:
+        _, response = kivly_registration.error_response(error)
+        return response
     if action == "finish":
         return _finish(game_id, player_id, player, gp_table, payload, game_meta)
     existing = _existing_result(game_id, player_id, player, attempt_id, gp_table)

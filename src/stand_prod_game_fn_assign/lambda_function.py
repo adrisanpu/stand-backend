@@ -14,7 +14,7 @@ from stand_common.email_verification import (
     require_verified_registration, complete_registration, identity_id,
     find_existing_player_by_email, find_verified_player,
 )
-from stand_common import kivly_registration
+from stand_common import kivly_registration, kivly_participation
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -292,6 +292,13 @@ def _put_verified_player(table, record, player, max_players, now):
             "ExpressionAttributeValues": {":now": int(time.time()), ":max": 5},
         }},
     ]
+    membership = player.get("kivlyMembership")
+    if membership:
+        transactions.append({"Put": {
+            "TableName": os.environ["KIVLY_REGISTRATION_TABLE"],
+            "Item": kivly_participation.claim_item(game_id, player["playerId"], membership),
+            "ConditionExpression": "attribute_not_exists(id)",
+        }})
     try:
         table.meta.client.transact_write_items(TransactItems=transactions)
     except Exception as exc:
@@ -305,6 +312,8 @@ def _put_verified_player(table, record, player, max_players, now):
                 raise VerificationError("VerificationExpired", 410) from exc
             if 2 in failed:
                 return "exists"
+            if 5 in failed:
+                return "identity_exists"
             if 0 in failed:
                 current = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
                 if not current:
@@ -345,17 +354,28 @@ def _handle_web_assign(event: dict) -> dict:
     existing = _find_verified_player(verified_table, game_id, email) if email else None
     max_players_raw = meta.get("maxPlayers") or 9999
     max_players = int(max_players_raw)
+    membership = kivly_registration.ensure_membership(dynamo_r, meta, values)
+    if membership:
+        linked = kivly_participation.existing_player(dynamo_r, game_id, membership)
+        if existing and linked and int(existing["playerId"]) != int(linked["playerId"]):
+            raise kivly_registration.RegistrationError("KivlyIdentityConflict", 409)
+        if linked:
+            existing = linked
+        if existing:
+            old_membership = existing.get("kivlyMembership") or {}
+            old_id = old_membership.get("customerId")
+            if (old_id and old_id != "pending-reconciliation"
+                    and old_id != membership["customerId"]):
+                raise kivly_registration.RegistrationError("KivlyIdentityConflict", 409)
+            kivly_participation.require_joinable(existing)
     if not existing and int(meta.get("playersCount", 0)) >= max_players:
         return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
-    membership = kivly_registration.ensure_membership(dynamo_r, meta, values)
     if existing:
         _apply_resume_fields(existing, values, verified_record.get("resume"))
         if membership:
-            gp_table.update_item(
-                Key={"gameId": game_id, "playerId": int(existing["playerId"])},
-                UpdateExpression="SET kivlyMembership = :m",
-                ConditionExpression="attribute_exists(playerId)",
-                ExpressionAttributeValues={":m": membership},
+            kivly_participation.bind_existing_player(dynamo_r, existing, membership)
+            kivly_participation.require_unique_player(
+                dynamo_r, {**existing, "kivlyMembership": membership},
             )
         return _existing_web_response(verified_table, verified_record, game_id, game_type, existing)
 
@@ -416,17 +436,23 @@ def _handle_web_assign(event: dict) -> dict:
                     continue
                 if outcome == "full":
                     return {"ok": False, "reason": "player_limit_reached", "maxPlayers": max_players}
-                if outcome == "exists":
+                if outcome in ("exists", "identity_exists"):
                     # Another confirmation won the same identity; recover it without reserving another slot.
-                    winner = _find_verified_player(verified_table, game_id, email)
+                    winner = (kivly_participation.existing_player(dynamo_r, game_id, membership)
+                              if outcome == "identity_exists" else
+                              _find_verified_player(verified_table, game_id, email))
                     if not winner:
                         raise VerificationError("VerificationUnavailable", 503)
                     if membership:
-                        gp_table.update_item(
-                            Key={"gameId": game_id, "playerId": int(winner["playerId"])},
-                            UpdateExpression="SET kivlyMembership = :m",
-                            ConditionExpression="attribute_exists(playerId)",
-                            ExpressionAttributeValues={":m": membership},
+                        previous_membership = winner.get("kivlyMembership") or {}
+                        if (previous_membership.get("customerId")
+                                not in (None, "pending-reconciliation", membership["customerId"])):
+                            raise kivly_registration.RegistrationError("KivlyIdentityConflict", 409)
+                        kivly_participation.require_joinable(winner)
+                    if membership:
+                        kivly_participation.bind_existing_player(dynamo_r, winner, membership)
+                        kivly_participation.require_unique_player(
+                            dynamo_r, {**winner, "kivlyMembership": membership},
                         )
                     return _existing_web_response(verified_table, verified_record, game_id, game_type, winner)
                 complete_registration(verified_table, verified_record, new_pid)
