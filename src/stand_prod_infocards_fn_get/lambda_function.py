@@ -3,6 +3,7 @@ import boto3
 from decimal import Decimal
 from botocore.exceptions import ClientError
 from stand_common.utils import log, _resp, _get_claims, _read_json_body, _iso_now, get_game_type_blob, set_game_type_blob
+from stand_common import game_lifecycle
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -137,6 +138,8 @@ def _handle_put(event, owner_user_id):
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
     # Optional participation settings (merge into blob)
+    if game_lifecycle.state(item) != "active" or item.get("archivedAt"):
+        return _resp(409, {"error": "GameInactive"})
     requires_validation = body.get("requiresValidation")
     quiz_completed_message = body.get("quizCompletedMessage")
 
@@ -149,6 +152,13 @@ def _handle_put(event, owner_user_id):
         new_blob["requiresValidation"] = bool(requires_validation)
     if quiz_completed_message is not None:
         new_blob["quizCompletedMessage"] = (quiz_completed_message or "").strip()
+    if "cardLayouts" in body:
+        layouts = body["cardLayouts"]
+        if (not isinstance(layouts, dict) or any(
+                not isinstance(key, str) or value not in ("top", "left", "right", "bottom")
+                for key, value in layouts.items())):
+            return _resp(400, {"error": "InvalidCardLayouts"})
+        new_blob["cardLayouts"] = layouts
 
     # Strip ephemeral client-side fields; keep only persisted fields
     clean_cards = []
@@ -169,6 +179,8 @@ def _handle_put(event, owner_user_id):
 
     new_blob["cards"] = clean_cards
 
+    active_condition = "isActive = :active" if "isActive" in item else "attribute_not_exists(isActive)"
+    condition_values = {":owner": owner_user_id, **({":active": True} if "isActive" in item else {})}
     try:
         set_game_type_blob(
             games_table,
@@ -176,9 +188,12 @@ def _handle_put(event, owner_user_id):
             "INFOCARDS",
             new_blob,
             updated_at=_iso_now(),
-            condition_expression="attribute_exists(gameId)",
+            condition_expression="attribute_exists(gameId) AND ownerUserId = :owner AND " + active_condition,
+            condition_values=condition_values,
         )
     except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return _resp(409, {"error": "GameInactive"})
         log("UpdateItem failed", {"error": str(e)})
         return _resp(500, {"error": "UpdateItemFailed", "detail": str(e)})
 

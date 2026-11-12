@@ -42,6 +42,8 @@ def _result(record, redemption=None):
 
 
 def completion_reward(dynamo, meta, player):
+    from stand_common import game_forms
+    game_forms.require(meta, player, "prize")
     if meta.get("gameType") != "STACK":
         raise registration.RegistrationError("UnsupportedGameType", 400)
     blob = get_game_type_blob(player, "STACK")
@@ -53,7 +55,7 @@ def completion_reward(dynamo, meta, player):
     if registration.is_pending_membership(player):
         return {"status": "none"}
     conn = registration._required_connection(dynamo, meta)
-    customer_id =  player["kivlyMembership"]["customerId"]
+    customer_id =  player["kivly"]["membership"]["customerId"]
     table = registration._table(dynamo)
     key = "reward:{}:{}".format(player["gameId"], player["playerId"])
     record = table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")
@@ -62,6 +64,37 @@ def completion_reward(dynamo, meta, player):
         return {"status": "none"}
     if record and (record["locationId"] != conn["locationId"] or record["customerId"] != customer_id):
         raise registration.RegistrationError("KivlyConnectionChanged", 409)
+    from stand_common import stack_prizes, prize_inventory
+    if record and prize_inventory.enabled() and not record.get("redemptionId"):
+        assigned = next((row for row in stack_prizes.records(dynamo, meta["gameId"])
+                         if row.get("playerId") == player["playerId"]
+                         and (row.get("prize") or {}).get("id") == "legacy_kivly"), None)
+        if assigned:
+            return _result({**record, "state": "confirmed" if assigned["state"] == "confirmed" else "pending"})
+    if not record and prize_inventory.enabled():
+        program = stack_prizes.upgrade_program(stack_prizes.legacy_program(meta))
+        rule = next((r for r in program["rules"] if r["condition"] == "completed"), None)
+        if not rule:
+            return {"status": "none"}
+        try:
+            stack_prizes.allocate_rule(dynamo, meta, player, program, rule, "legacy_completion")
+        except stack_prizes.PrizeError as exc:
+            raise registration.RegistrationError(exc.code, exc.status) from None
+        record = table.get_item(Key={"id": key}, ConsistentRead=True).get("Item")
+        if record:
+            return _result(record)
+        assigned = next((row for row in stack_prizes.records(dynamo, meta["gameId"])
+                         if row.get("playerId") == player["playerId"]
+                         and (row.get("prize") or {}).get("id") == "legacy_kivly"), None)
+        if assigned:
+            return _result({"name": assigned["prize"]["name"],
+                            "state": "confirmed" if assigned["state"] == "confirmed" else "pending"})
+        allocation = stack_prizes.table(dynamo).get_item(
+            Key={"gameId": meta["gameId"], "id": stack_prizes.allocation_id(
+                "legacy_completion", player["playerId"], rule["id"])}, ConsistentRead=True,
+        ).get("Item") or {}
+        return {"status": "none", "reason": (allocation.get("inventoryReasons") or {}).get(
+            "legacy_kivly", "InventoryUnavailable")}
     client = registration._client(conn)
     if record:
         if record["state"] != "confirmed":

@@ -25,9 +25,9 @@ def reward_rig(monkeypatch):
     game = {**membership_game(), "gameId": "ABC123", "gameType": "STACK",
             "kivlyReward": {"id": "reward-1", "name": "Coffee", "locationId": "location"}}
     player = {"gameId": "ABC123", "playerId": 7,
-              "kivlyMembership": {"customerId": "customer-1", "locationId": "location",
+              "kivly": {"membership": {"customerId": "customer-1", "locationId": "location",
                                   "status": "confirmed", "phone": "+34 612345678",
-                                  "consentVersion": game["kivly"]["consentVersion"]},
+                                  "consentVersion": game["kivly"]["consentVersion"]}},
               "type": {"STACK": {"score": 0, "attempt": {"status": "finished"}}}}
     conn = {"locationId": "location", "ownerId": "owner", "version": "v1",
             "clubSettings": {key: game["kivly"][key] for key in ("clubName", "privacyUrl", "termsUrl")}}
@@ -62,7 +62,7 @@ def reward_rig(monkeypatch):
 def reward_dynamo(player):
     dynamo = FakeDynamo()
     dynamo.seed("players", player)
-    membership = player.get("kivlyMembership") or {}
+    membership = (player.get("kivly") or {}).get("membership") or {}
     if membership.get("customerId") and membership.get("locationId"):
         dynamo.seed("registrations", kivly_participation.claim_item(
             player["gameId"], player["playerId"], membership,
@@ -102,7 +102,7 @@ def test_unfinished_player_cannot_receive_reward(reward_rig, blob):
 
 def test_reward_requires_membership(reward_rig):
     game, player, client, _, _ = reward_rig
-    player["kivlyMembership"] = {}
+    player["kivly"]["membership"] = {}
     with pytest.raises(registration.RegistrationError, match="KivlyMembershipRequired"):
         kivly_rewards.completion_reward(reward_dynamo(player), game, player)
     client.earn_reward.assert_not_called()

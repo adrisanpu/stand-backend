@@ -67,13 +67,13 @@ def existing_player(dynamo, game_id, membership):
 
 
 def _matches(player, membership):
-    saved = player.get("kivlyMembership") or {}
+    saved = (player.get("kivly") or {}).get("membership") or {}
     return (saved.get("locationId") == membership["locationId"]
             and saved.get("customerId") == membership["customerId"])
 
 
 def require_unique_player(dynamo, player):
-    membership = player.get("kivlyMembership") or {}
+    membership = (player.get("kivly") or {}).get("membership") or {}
     linked = existing_player(dynamo, player["gameId"], membership)
     if not linked or int(linked["playerId"]) != int(player["playerId"]):
         _error("KivlyDuplicateParticipation")
@@ -86,19 +86,23 @@ def bind_existing_player(dynamo, player, membership):
     ).get("Item")
     if claim and int(claim["playerId"]) != int(player["playerId"]):
         _error("KivlyDuplicateParticipation")
+    previous = player.get("kivly", {})
+    if not isinstance(previous, dict):
+        _error("KivlyMembershipRequired")
     update = {
         "TableName": os.environ["GAMEPLAYER_TABLE"],
         "Key": {"gameId": player["gameId"], "playerId": int(player["playerId"])},
-        "UpdateExpression": "SET kivlyMembership = :m",
+        "UpdateExpression": "SET #kivly = :kivly",
         "ConditionExpression": (
-            "attribute_exists(playerId) AND kivlyMembership = :previous"
-            if "kivlyMembership" in player else
-            "attribute_exists(playerId) AND attribute_not_exists(kivlyMembership)"
+            "attribute_exists(playerId) AND #kivly = :previous"
+            if "kivly" in player else
+            "attribute_exists(playerId) AND attribute_not_exists(#kivly)"
         ),
-        "ExpressionAttributeValues": {":m": membership},
+        "ExpressionAttributeNames": {"#kivly": "kivly"},
+        "ExpressionAttributeValues": {":kivly": {**previous, "membership": membership}},
     }
-    if "kivlyMembership" in player:
-        update["ExpressionAttributeValues"][":previous"] = player["kivlyMembership"]
+    if "kivly" in player:
+        update["ExpressionAttributeValues"][":previous"] = previous
     actions = [{"Update": update}]
     if not claim:
         actions.append({"Put": {
@@ -117,7 +121,7 @@ def bind_existing_player(dynamo, player, membership):
         saved = table.get_item(
             Key={"id": claim_id(player["gameId"], membership)}, ConsistentRead=True,
         ).get("Item")
-        if (not current or current.get("kivlyMembership") != membership
+        if (not current or (current.get("kivly") or {}).get("membership") != membership
                 or not saved or int(saved["playerId"]) != int(player["playerId"])):
             _error("KivlyDuplicateParticipation")
 

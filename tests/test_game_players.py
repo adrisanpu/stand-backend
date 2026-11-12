@@ -188,6 +188,7 @@ def test_delete_player_also_removes_its_verified_email_mapping():
         patch.object(game, "gp_table", player_table),
         patch.object(game, "dynamodb", dynamodb),
         patch.object(game, "EMAIL_VERIFICATION_TABLE", "verification"),
+        patch.object(game.client_index, "delete_actions", return_value=[]),
         patch.object(game, "identity_id", return_value="identity-key"),
     ):
         result = game.lambda_handler(

@@ -20,6 +20,7 @@ from stand_common.utils import (  # noqa: E402
     normalize_email,
     mask_email,
     default_participant_fields,
+    OPTIONAL_PARTICIPANT_FIELDS,
 )
 
 ASSIGN_DIR = ROOT / "src" / "stand_prod_game_fn_assign"
@@ -44,9 +45,45 @@ SECRET = "test-secret"
 public_mod.PLAYER_TOKEN_SECRET = SECRET
 
 
+@pytest.mark.parametrize("game_type", ["L3TRAS", "SEMAFORO", "CUPIDO", "INFOCARDS"])
+def test_mobile_games_cannot_reach_legacy_validator_or_expose_private_records(game_type, monkeypatch):
+    game_id = "ABC123"
+    monkeypatch.setattr(public_mod, "VALIDATE_LAMBDA", "validator")
+    monkeypatch.setattr(public_mod, "_get_game", lambda _: {
+        "gameId": game_id, "gameType": game_type, "isActive": True,
+    })
+    invoke = MagicMock(return_value={"players": [{"email": "private", "type": {"quizAnswers": {"q2": "secret"}}}]})
+    monkeypatch.setattr(public_mod, "_invoke_validate", invoke)
+    result = public_mod._handle_validate({"body": json.dumps({
+        "gameId": game_id, "playerToken": issue_player_token(game_id, 1, SECRET),
+        "codes": ["1234", "5678"],
+    })})
+    assert result["statusCode"] == 400
+    assert json.loads(result["body"])["error"] == "UseParticipantPlayAction"
+    invoke.assert_not_called()
+
+
+def test_infocards_participant_read_requires_a_valid_player_token(monkeypatch):
+    read = MagicMock()
+    monkeypatch.setattr(public_mod.mobile_gameplay, "assignment", read)
+    result = public_mod._handle_get_player({"httpMethod": "POST", "body": json.dumps({
+        "gameId": "ABC123", "playerToken": "invalid",
+    })})
+    assert result["statusCode"] == 403
+    read.assert_not_called()
+
+
 @pytest.fixture
 def photo_game(monkeypatch):
     monkeypatch.setattr(public_mod, "_get_game", lambda _: {"gameType": "STACK"})
+
+
+@pytest.mark.parametrize("marker", ["deletedAt", "deletionStartedAt"])
+def test_deleted_or_deleting_events_are_not_publicly_resolved(marker):
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"gameId": "ABC123", marker: "2026-01-01T00:00:00Z", "isActive": False}}
+    with patch.object(public_mod, "games_table", table):
+        assert public_mod._get_game("ABC123") is None
 
 
 @pytest.mark.parametrize("code", ["K9R4QM", "012345"])
@@ -143,7 +180,8 @@ def test_public_game_hides_legacy_instagram_registration_field():
     assert response["statusCode"] == 200
     assert json.loads(response["body"])["participantFields"] == {
         "email": {"required": True},
-        "phone": {"required": False, "enabled": True},
+        "phone": {"required": True, "enabled": True},
+        **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
 
 
@@ -303,7 +341,7 @@ def test_web_participant_can_request_a_scoped_photo_upload(monkeypatch, photo_ga
         "url": "signed:post",
         "fields": {"key": "players/ABC123/7/profile-photo.png", "policy": "signed"},
     }
-    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}), \
+    with patch.object(public_mod, "_get_player", return_value={"playerId": 7}), \
          patch.object(public_mod.boto3, "client", return_value=s3):
         response = public_mod._handle_player_photo({"body": json.dumps({
             "action": "upload-url",
@@ -337,7 +375,7 @@ def test_web_participant_can_request_a_scoped_photo_upload(monkeypatch, photo_ga
 def test_photo_upload_rejects_unsupported_or_oversized_images(monkeypatch, image_type, size, error, photo_game):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     token = issue_player_token("ABC123", 7, SECRET)
-    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}):
+    with patch.object(public_mod, "_get_player", return_value={"playerId": 7}):
         response = public_mod._handle_player_photo({"body": json.dumps({
             "action": "upload-url", "playerToken": token,
             "contentType": image_type, "sizeBytes": size,
@@ -346,15 +384,15 @@ def test_photo_upload_rejects_unsupported_or_oversized_images(monkeypatch, image
     assert json.loads(response["body"])["error"] == error
 
 
-def test_only_web_participants_can_upload_profile_photos():
-    token = issue_player_token("ABC123", 7, SECRET)
-    with patch.object(public_mod, "_get_player", return_value={"instagramPSID": "psid"}):
+def test_photo_upload_requires_a_valid_player_token():
+    with patch.object(public_mod, "_get_player") as get_player:
         response = public_mod._handle_player_photo({"body": json.dumps({
-            "action": "upload-url", "playerToken": token,
+            "action": "upload-url", "playerToken": "invalid",
             "contentType": "image/png", "sizeBytes": 10,
         })})
     assert response["statusCode"] == 403
-    assert json.loads(response["body"])["error"] == "WebPhotoUploadOnly"
+    assert json.loads(response["body"])["error"] == "InvalidPlayerToken"
+    get_player.assert_not_called()
 
 
 def test_photo_completion_validates_image_and_persists_s3_key(monkeypatch, photo_game):
@@ -366,7 +404,7 @@ def test_photo_completion_validates_image_and_persists_s3_key(monkeypatch, photo
     s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"\x89PNG\r\n\x1a\nxxxx"))}
     s3.generate_presigned_url.return_value = "signed:get"
     update_item = MagicMock()
-    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}), \
+    with patch.object(public_mod, "_get_player", return_value={"playerId": 7}), \
          patch.object(public_mod.boto3, "client", return_value=s3), \
          patch.object(public_mod.gp_table, "update_item", update_item):
         response = public_mod._handle_player_photo({"body": json.dumps({
@@ -392,7 +430,7 @@ def test_photo_completion_rejects_non_image_bytes(monkeypatch, photo_game):
     s3.head_object.return_value = {"ContentType": "image/png", "ContentLength": 12}
     s3.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b"not-an-image"))}
     update_item = MagicMock()
-    with patch.object(public_mod, "_get_player", return_value={"joinSource": "web"}), \
+    with patch.object(public_mod, "_get_player", return_value={"playerId": 7}), \
          patch.object(public_mod.boto3, "client", return_value=s3), \
          patch.object(public_mod.gp_table, "update_item", update_item):
         response = public_mod._handle_player_photo({"body": json.dumps({
@@ -407,7 +445,6 @@ def test_player_response_returns_signed_photo_for_play(monkeypatch):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     player = {
         "playerId": 7,
-        "joinSource": "web",
         "participantPhotoKey": "players/ABC123/7/profile-photo.png",
         "type": {"T1MER": {}},
     }
@@ -557,6 +594,7 @@ def test_web_assign_creates_player(mock_meta, mock_assigners, *_mocks):
     mock_meta.return_value = {
         "gameId": "ABC123",
         "gameType": "EMPAREJA2",
+        "ownerUserId": "owner",
         "isActive": True,
         "maxPlayers": 25,
         "participantFields": default_participant_fields("EMPAREJA2"),
@@ -571,6 +609,7 @@ def test_web_assign_creates_player(mock_meta, mock_assigners, *_mocks):
         "game_id": "ABC123",
         "email": "player@example.com",
         "username": "Player",
+        "phone": "+34612345678",
     })
     assert out["ok"] is True
     assert out["created_new"] is True
@@ -590,6 +629,7 @@ def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
     mock_meta.return_value = {
         "gameId": "TMR001",
         "gameType": "T1MER",
+        "ownerUserId": "owner",
         "isActive": True,
         "maxPlayers": 50,
         "participantFields": default_participant_fields("T1MER"),
@@ -601,6 +641,7 @@ def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
         "game_id": "TMR001",
         "email": "timer@example.com",
         "username": "Timer player",
+        "phone": "+34612345678",
     })
     assert out["ok"] is True
     assert out["gameType"] == "T1MER"
@@ -616,6 +657,7 @@ def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment, verified
     mock_meta.return_value = {
         "gameId": "ABC123",
         "gameType": "EMPAREJA2",
+        "ownerUserId": "owner",
         "isActive": True,
         "participantFields": default_participant_fields("EMPAREJA2"),
     }
@@ -631,6 +673,7 @@ def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment, verified
             "game_id": "ABC123",
             "email": "player@example.com",
             "username": "Player",
+            "phone": "+34612345678",
         })
     assert out["ok"] is True
     assert out["already_joined"] is True
@@ -690,7 +733,9 @@ def test_public_score_happy():
     mock_inv.assert_called_once_with("ABCDEF", 2, "10.100", 100)
 
 
-def test_redeem_validation_happy():
+def test_redeem_validation_happy(monkeypatch):
+    monkeypatch.setenv("GAMES_TABLE", "games")
+    monkeypatch.setenv("GAMEPLAYER_TABLE", "players")
     mock_games = MagicMock()
     mock_gp = MagicMock()
     mock_games.get_item.return_value = {
@@ -713,7 +758,9 @@ def test_redeem_validation_happy():
     assert body["ok"] is True
     assert body["kind"] == "validation"
     assert body["prize"] is None
-    assert mock_gp.update_item.call_count == 3
+    assert mock_gp.update_item.call_count == 2
+    transaction = public_mod.dynamo_r.meta.client.transact_write_items.call_args.kwargs["TransactItems"]
+    assert transaction[1]["Update"]["ExpressionAttributeValues"][":d"] is True
 
 
 def test_redeem_already_delivered():

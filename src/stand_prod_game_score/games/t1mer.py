@@ -62,7 +62,7 @@ def _ensure_type_maps(game_id: str, player_id: int, game_type_upper: str, gp_tab
     )
 
 
-def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log_fn):
+def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log_fn, persist=None):
     """
     Payload esperado:
     {
@@ -123,7 +123,7 @@ def store_score(game_id: str, game_type_upper: str, gp_table, payload: dict, log
     now = _iso_now()
 
     try:
-        gp_table.update_item(
+        (persist or gp_table.update_item)(
             Key={"gameId": game_id, "playerId": int(player_id)},
             UpdateExpression="SET #type.#g.timer = :t, #type.#g.score = :s, #type.#g.scoreUpdatedAt = :ts",
             ConditionExpression="attribute_not_exists(#type.#g.score)",

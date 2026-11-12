@@ -9,6 +9,8 @@ def _as_int(x):
         return None
 
 def _game_has_quiz(game_meta: dict) -> bool:
+    if "formConfig" in (game_meta or {}):
+        return game_meta["formConfig"].get("quizMoment") == "after_registration"
     order = (game_meta or {}).get("quizOrder") or []
     return isinstance(order, list) and len(order) > 0
 

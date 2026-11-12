@@ -56,7 +56,7 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: Enable STACK reward email after SES setup and authorized Kivly QR acceptance
+    Description: Enable verified-email notifications for STAND awards across games and Kivly prize awards
 
   EmailIdentityName:
     Type: String
@@ -81,13 +81,35 @@ Globals:
         STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
         PLAYER_TOKEN_SECRET: !Ref PlayerTokenSecret
         STACK_PRIZES_TABLE: !Ref StandStackPrizesTable
+        PRIZE_INVENTORY_TABLE: !Ref StandPrizeInventoryTable
         KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
         KIVLY_REGISTRATION_QUEUE: !Ref StandKivlyRegistrationQueue
+        STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
         KIVLY_EXTERNAL_WRITES_ENABLED: !Ref KivlyExternalWritesEnabled
         STACK_REWARD_EMAIL_ENABLED: !Ref StackRewardEmailEnabled
 
 
 Resources:
+
+  StandPrizeInventoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "stand-${Environment}-prize-inventory"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: ownerId
+          AttributeType: S
+        - AttributeName: key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ownerId
+          KeyType: HASH
+        - AttributeName: key
+          KeyType: RANGE
 
   StandKivlyRegistrationDeadLetterQueue:
     Type: AWS::SQS::Queue
@@ -175,6 +197,37 @@ Resources:
           Projection:
             ProjectionType: ALL
 
+  StandClientIndexTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "stand-${Environment}-client-index"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: clientId
+          AttributeType: S
+        - AttributeName: recordKey
+          AttributeType: S
+        - AttributeName: ownerUserId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: clientId
+          KeyType: HASH
+        - AttributeName: recordKey
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: owner-clients
+          KeySchema:
+            - AttributeName: ownerUserId
+              KeyType: HASH
+            - AttributeName: clientId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
   StandStackPrizeDeadLetterQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -207,9 +260,12 @@ Resources:
           STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
           EMAIL_SENDER_ADDRESS: !Ref EmailSenderAddress
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
+          PUBLIC_API_BASE_URL: !Sub "https://${GameApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref StandStackPrizesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StandPrizeInventoryTable
         - DynamoDBCrudPolicy:
             TableName: !Ref StandProdGameTable
         - DynamoDBReadPolicy:
@@ -219,6 +275,17 @@ Resources:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt StandStackPrizeQueue.QueueName
         - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:ConditionCheckItem
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt StandProdGameplayerTable.Arn
+                - !GetAtt StandKivlyRegistrationTable.Arn
+                - !GetAtt StandPrizeInventoryTable.Arn
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
@@ -262,6 +329,32 @@ Resources:
       ManagedPolicyArns:
         - !Ref StandProdGameRolePolicy
       Policies:
+        - PolicyName: ArchivedGameMediaCleanup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt UserMediaBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "players/*"
+                      - "games/*"
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource:
+                  - !Sub "${UserMediaBucket.Arn}/players/*"
+                  - !Sub "${UserMediaBucket.Arn}/games/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt InfocardsUploadsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: "infocards/*"
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub "${InfocardsUploadsBucket.Arn}/infocards/*"
         - PolicyName: KivlyOwnerCredentials
           PolicyDocument:
             Version: "2012-10-17"
@@ -325,6 +418,9 @@ Resources:
               - !GetAtt StandEmailVerificationTable.Arn
               - !GetAtt StandKivlyRegistrationTable.Arn
               - !GetAtt StandStackPrizesTable.Arn
+              - !GetAtt StandPrizeInventoryTable.Arn
+              - !GetAtt StandClientIndexTable.Arn
+              - !Sub "${StandClientIndexTable.Arn}/index/owner-clients"
               - !Sub "${StandStackPrizesTable.Arn}/index/pending-work"
           - Sid: StackPrizeEnqueue
             Effect: Allow
@@ -356,12 +452,19 @@ Resources:
             Action:
               - s3:GetObject
             Resource: !Sub "${UserMediaBucket.Arn}/users/*/logos/*"
+          - Sid: S3HomeBackgrounds
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${UserMediaBucket.Arn}/users/*/home-backgrounds/*"
           - Sid: S3GamePrizeImages
             Effect: Allow
             Action:
               - s3:GetObject
               - s3:PutObject
-            Resource: !Sub "${UserMediaBucket.Arn}/games/*"
+            Resource:
+              - !Sub "${UserMediaBucket.Arn}/games/*"
+              - !Sub "${UserMediaBucket.Arn}/prizes/*"
           - Sid: S3ParticipantPhotosRead
             Effect: Allow
             Action:
@@ -430,6 +533,20 @@ Resources:
                 Action:
                   - s3:PutObject
                 Resource: !Sub "${UserMediaBucket.Arn}/players/*"
+        - PolicyName: ParticipantInfocardsRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${InfocardsUploadsBucket.Arn}/infocards/*"
+        - PolicyName: WalletPassCredentials
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/wallet-*"
 
   StandAssignRole:
     Type: AWS::IAM::Role
@@ -529,10 +646,12 @@ Resources:
     Properties:
       LayerName: stand-common
       Description: Shared utilities (log, _resp, _iso_now, etc.) for all Stand Lambda functions.
-      ContentUri: layers/stand_common/
+      ContentUri: layers/stand_common/python/
       CompatibleRuntimes:
         - python3.13
       RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.13
 
 # =========================
 # DYNAMODB TABLES
@@ -795,6 +914,8 @@ Resources:
         Variables:
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
+          INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
+          CLIENT_INDEX_TABLE: !Ref StandClientIndexTable
       Events:
         GameCrudGet:
           Type: HttpApi
@@ -832,11 +953,53 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/players
             Method: DELETE
+        ClientsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/clients
+            Method: GET
+        ClientHistoryGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/clients/{clientId}
+            Method: GET
         GamePrizeUploadUrl:
           Type: HttpApi
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/game/prizes
+            Method: POST
+        SharedPrizeCatalogGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/prizes/catalog
+            Method: GET
+        PrizeInventoryGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/prizes/inventory
+            Method: GET
+        PrizeInventoryPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/prizes/inventory
+            Method: POST
+        SharedPrizeCatalogPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/prizes/catalog
+            Method: PUT
+        SharedPrizeCatalogUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/prizes/catalog
             Method: POST
 
         KivlyAccountGet:
@@ -933,6 +1096,7 @@ Resources:
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
           KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
+          CLIENT_INDEX_TABLE: !Ref StandClientIndexTable
       Events:
         AssignPost:
           Type: HttpApi
@@ -979,6 +1143,7 @@ Resources:
           VALIDATE_LAMBDA: !Ref StandProdGameValidate
           SCORE_LAMBDA: !Ref StandProdGameScore
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
+          INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
           CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
           CHAR_URL_TTL: "120"
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
@@ -988,6 +1153,7 @@ Resources:
           EMAIL_IP_MAX_PER_HOUR: "3000"
           EMAIL_GLOBAL_MAX_PER_HOUR: "20000"
           KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
+          WALLET_CREDENTIALS_SECRET_NAME: !Sub "stand/${Environment}/wallet"
       Events:
         PublicGameGet:
           Type: HttpApi
@@ -1034,6 +1200,22 @@ Resources:
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/public/player
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicWalletPassGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/wallet/pass
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        PublicRewardEmailRetryPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/public/reward-email/retry
             Method: POST
             Auth:
               Authorizer: NONE
@@ -1220,6 +1402,9 @@ Resources:
       Role: !GetAtt StandProdBillingRole.Arn
       Layers:
         - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET: !Ref UserMediaBucket
       Events:
         UserPost:
           Type: HttpApi
@@ -1233,6 +1418,12 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/user/me
             Method: GET
+        MePut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/user/me
+            Method: PUT
 
   StandProdUserFnMedia:
     Type: AWS::Serverless::Function

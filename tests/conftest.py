@@ -92,12 +92,13 @@ if not LAYER_PATH.exists() and "stand_common" not in sys.modules:
 @pytest.fixture(autouse=True)
 def configure_kivly_error_types(monkeypatch):
     """New handlers need real exception types instead of the SDK MagicMock."""
-    from stand_common import kivly_registration, kivly_settings
+    from stand_common import client_index, kivly_registration, kivly_settings
     from tests.email_fake import FakeDynamoError
 
     monkeypatch.setattr(kivly_registration, "ClientError", FakeDynamoError)
     monkeypatch.setattr(kivly_registration, "BotoCoreError", FakeDynamoError)
     monkeypatch.setattr(kivly_settings, "ClientError", FakeDynamoError)
+    monkeypatch.setattr(client_index, "ClientError", FakeDynamoError)
     # Unrelated offline tests start without an account integration.
     monkeypatch.setattr(kivly_registration, "connection", lambda *_: None)
     monkeypatch.setattr(kivly_registration, "ERRORS", (
@@ -108,6 +109,7 @@ def configure_kivly_error_types(monkeypatch):
 def verified_web_assignment(monkeypatch):
     """Assignment unit tests start after verification; real gates have separate integration coverage."""
     from tests.test_public_web import assign_mod
+    from stand_common import client_index
 
     table, record = MagicMock(), {"verifiedAt": 1700000000}
     monkeypatch.setattr(assign_mod, "_verified_email", lambda *_: (table, record))
@@ -119,5 +121,6 @@ def verified_web_assignment(monkeypatch):
         assign_mod._put_player(player)
         return "created"
     monkeypatch.setattr(assign_mod, "_put_verified_player", put)
-    monkeypatch.setattr(assign_mod, "_complete_verified_player", MagicMock())
+    monkeypatch.setattr(assign_mod, "_complete_verified_player", lambda _table, _record, player: player)
     monkeypatch.setattr(assign_mod, "complete_registration", MagicMock())
+    monkeypatch.setattr(client_index, "index_player", MagicMock(return_value=False))

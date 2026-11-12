@@ -24,7 +24,7 @@ def store(monkeypatch):
 
 
 def player(pid=1, **fields):
-    return {"gameId": "ABC123", "playerId": pid, "kivlyMembership": deepcopy(MEMBERSHIP),
+    return {"gameId": "ABC123", "playerId": pid, "kivly": {"membership": deepcopy(MEMBERSHIP)},
             "type": {"STACK": {}}, **fields}
 
 
@@ -75,6 +75,29 @@ def test_wrong_player_cannot_use_another_players_claim(store):
     participation.require_unique_player(store, player())
     with pytest.raises(RegistrationError, match="KivlyDuplicateParticipation"):
         participation.require_unique_player(store, player(2))
+
+
+@pytest.mark.parametrize("previous", [
+    None, {"recovery": {"run": "run-1", "duplicateOf": 2}},
+    {"membership": MEMBERSHIP, "recovery": {"disposition": "duplicate"}},
+])
+def test_binding_membership_initializes_map_and_preserves_recovery(store, previous):
+    original = {"gameId": "ABC123", "playerId": 1}
+    if previous is not None:
+        original["kivly"] = deepcopy(previous)
+    store.seed("players", original)
+    participation.bind_existing_player(store, original, MEMBERSHIP)
+    assert store.rows("players")[0]["kivly"] == {**(previous or {}), "membership": MEMBERSHIP}
+
+
+def test_binding_does_not_overwrite_concurrently_changed_recovery(store):
+    original = player(kivly={"membership": MEMBERSHIP, "recovery": {"run": "old"}})
+    changed = deepcopy(original)
+    changed["kivly"]["recovery"]["run"] = "new"
+    store.seed("players", changed)
+    with pytest.raises(RegistrationError, match="KivlyDuplicateParticipation"):
+        participation.bind_existing_player(store, original, MEMBERSHIP)
+    assert store.rows("players")[0] == changed
 
 
 def test_two_emails_race_for_one_customer_in_assignment_transaction(rig, monkeypatch):
@@ -172,9 +195,9 @@ def test_legacy_adoption_and_new_player_compete_for_same_claim_atomically(rig, m
     monkeypatch.setenv("KIVLY_REGISTRATION_TABLE", "memberships")
     monkeypatch.setenv("GAMEPLAYER_TABLE", "players")
     monkeypatch.setattr(participation, "ClientError", FakeDynamoError)
-    original = player(kivlyMembership={
+    original = player(kivly={"membership": {
         "locationId": "location", "customerId": "pending-reconciliation",
-    })
+    }})
     rig["dynamo"].seed("players", original)
     verification = rig["dynamo"].Table("verification")
     rig["dynamo"].seed("verification", {
@@ -200,6 +223,6 @@ def test_legacy_adoption_and_new_player_compete_for_same_claim_atomically(rig, m
         outcomes = adoption.result(), creation.result()
     assert outcomes in (("adopted", "identity_exists"), ("blocked", "created"))
     confirmed = [p for p in rig["dynamo"].rows("players")
-                 if p["kivlyMembership"].get("customerId") == MEMBERSHIP["customerId"]]
+                 if p["kivly"]["membership"].get("customerId") == MEMBERSHIP["customerId"]]
     assert len(confirmed) == 1
     assert rig["dynamo"].rows("memberships")[0]["playerId"] == confirmed[0]["playerId"]

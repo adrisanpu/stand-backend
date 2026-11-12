@@ -56,8 +56,11 @@ their public registration, session or gameplay flows, even when old game data
 contains a Kivly flag.
 
 The general form policy is independent of Kivly: full name (`username`) and
-mandatory verified email. STACK also requires phone for both wallet and email;
-other games retain optional phone when `phone.enabled` is true.
+mandatory verified email and phone in every game (both STACK channels included).
+Legacy disabled/optional contact settings resolve to mandatory contacts; writes
+cannot disable them. Registration starts with email, then missing identity/details
+and consent, before verification. Optional address, company, job title and birth
+date are game-configured profile fields, not Kivly customer attributes.
 The existing public join support remains EMPAREJA2, T1MER, STACK and RULET4;
 this feature does not introduce new game-specific join implementations.
 
@@ -71,6 +74,17 @@ updates to devices. This extension's presence here is not evidence that it has
 been deployed or that installed-wallet propagation is verified.
 
 ## Organizer API (Cognito authenticated)
+
+`POST /v1/prizes/inventory` with `{"action":"delete","prizeId":"<inventory-id>"}`
+deletes an unused, uninitialized Kivly reward from its connected account's
+catalog using `DELETE /api/v1/rewards/{reward_id}` (204, empty body).
+The inventory ID is resolved server-side; the client cannot supply an external
+location or reward ID. Any event association, initialized balance, consumption
+or movement history blocks deletion. STAND-only definitions continue using
+the shared catalog endpoint. Uncertain external deletions return
+`KivlyRewardDeletionUncertain` and are not retried automatically. Empty,
+uninitialized orphan balance rows do not resurrect deleted catalog entries.
+This deletion flow has only been checked offline with mocked transport.
 
 The organizer connection route is `/v1/kivly`, handled by the game-management Lambda.
 Use the organizer's existing authenticated API client. A game ID is not needed.
@@ -207,8 +221,9 @@ STACK integration adds:
 Missing connection, missing club details, demo-disabled settings and all
 non-STACK games omit `loyalty`; do not show club consent in those cases.
 Public field metadata always resolves email to `{"required":true}` and phone to
-`{"required":true,"enabled":true}` for STACK, including legacy configuration.
-Other games retain `{"required":false,"enabled":true|false}`.
+`{"required":true,"enabled":true}` for every game, including legacy configuration.
+The optional `address`, `company`, `jobTitle` and `birthDate` entries each expose
+only `{"enabled":true|false}`. Profile values are never public metadata.
 There is no public customer ID, location ID or credential in `loyalty`.
 
 ### Request email challenge
@@ -228,12 +243,18 @@ There is no public customer ID, location ID or credential in `loyalty`.
 ```
 
 `username` is trimmed, nonempty and at most 100 Unicode characters; control
-characters are rejected. Email is mandatory, validated and normalized. STACK
+characters are rejected. Email is mandatory, validated and normalized. Every game's
 phone is mandatory, trimmed, at most 64 characters, with at least three ASCII
 digits and only an optional leading `+`, digits, spaces, parentheses or hyphens.
-STACK settings cannot disable phone or make it optional. Other games keep
-optional phone, ignored when disabled. Existing valid sessions are not revoked
+Settings cannot disable phone or make it optional. Existing valid sessions are not revoked
 solely because they predate required phone.
+Enabled optional fields are trimmed and bound into the email challenge before
+being persisted on the participant: address up to 300 characters, company and
+job title up to 160, birth date a valid non-future `YYYY-MM-DD`. Disabled fields
+are ignored. Missing optional fields alone do not force returning participants
+to repeat details; existing profile values and gameplay progress are preserved.
+These fields are available only in authenticated administrative responses/exports,
+not rankings, assignment responses or Kivly customer writes.
 `consent: true` is the general STAND consent. For enabled STACK club registration,
 the participant must additionally agree to the displayed club legal details;
 only then send their exact `loyaltyConsentVersion`. Missing/stale club consent
@@ -379,8 +400,10 @@ available.
 
 The other owner endpoint is
 `/v1/game/stack/prizes`: GET takes `gameId` in the query; PUT accepts
-`{gameId, program}`; POST accepts `{gameId, excludePlayerIds: []}` to request or
-progress definitive closure. All reject other owners and non-STACK games.
+`{gameId, program}`; POST accepts `{gameId, excludePlayerIds: []}` as a
+compatibility entry into the common asynchronous deactivation flow. Nonempty
+exclusions are rejected: started attempts must finish. All reject other
+owners and non-STACK games.
 
 GET and successful PUT return normalized `program` with `version: 3`,
 `storefrontUrl`, `deliveryChannel`, `catalog` and `rules`. The retained program URL is a
@@ -431,6 +454,46 @@ are atomic and idempotent. Attempts snapshot the program at start; finishing
 atomically saves the result and a durable grant job, which then allocates units.
 Changing a rule requires a new rule ID; existing awards keep their original
 prize snapshot.
+Saving rule edits that remove a prize's last reference releases its unassigned
+event reservation atomically with the rules. Its catalog entry and stock retain
+only consumed units, including consumption preserved by inventory movements
+after award rows have been deleted. Other rules still referencing the prize keep
+its reservation. This applies equally to STAND and Kivly, without modifying
+Kivly's external stock, assignments, existing awards or movement history.
+Each rules save also reconciles catalog entries left without any condition by
+older edits. Catalog-only edits do not release reservations.
+
+Event reservations are now the only live inventory source, for STAND and Kivly.
+`GET /v1/prizes/inventory` returns `mode: "reservations"`; each prize includes an
+authoritative reservation summary and event usage derived from durable movements.
+An event without a numeric reservation cannot borrow another event's stock or a
+legacy manual balance. `activate`, `initialize`, `replenish` and `adjust` actions
+return HTTP 410 `InventoryActionRetired`. Historical import, movement browsing,
+deletion protections and already-issued QR redemption remain supported.
+Public reads resolve persisted awards only; explicit historical import retains
+compatibility with pre-outbox player flags without recreating claims on reads.
+
+`scripts/migrate_prize_reservations.py` is dev-account/region/table guarded and
+read-only by default. Supply `--target-game`, `--target-prize` and `--target-total`
+to inspect a plan; `--apply` imports unmarked historical awards, conditionally
+updates the selected total (including awards already assigned), archives manual
+balance values and atomically archives/removes old control/request records.
+Before applying, create DynamoDB backups and resolve every preflight blocker.
+Assignments, redemption states, prize snapshots and movement history are retained;
+orphan STAND awards get archive-only identities, not recreated catalog entries.
+The operation performs no Kivly requests and is idempotent on a second run.
+
+For an explicitly approved destructive dev cleanup,
+`scripts/align_dev_prize_reservations.py` keeps only prizes referenced by the
+current conditions of existing events. It preserves those configured totals and
+their awards, removes unused STAND definitions and event catalog entries, deletes
+orphan/unreferenced awards and movements, prunes historical job/ledger references
+and recomputes retained balance counters. This intentionally erases local history
+of removed prizes, including uncertain Kivly deliveries, without revoking any
+external Kivly rewards. It defaults to dry-run; obtain explicit approval of that
+data loss and fresh backups of the four affected dev tables before `--apply`.
+Writes check event and row snapshots; interrupted runs must be inspected with a
+new dry-run before retrying. No deployment or external Kivly mutation is involved.
 
 Unit allocation accepts integral DynamoDB `Decimal` quantities as well as Python
 integers, and rejects fractional, non-finite or out-of-range quantities before
@@ -439,20 +502,23 @@ they keep their saved program and idempotent award identities.
 
 Closing blocks new starts but accepts valid finishes for active attempts, even
 if the game is paused. A scheduled worker finalizes automatically once no
-attempts remain. Explicitly excluding pending attempts gives them status
-`excluded`, without score or prizes; late finishes are rejected. Final ranking
-is immutable, and player deletion is blocked while closing/closed.
+attempts remain. Owner APIs no longer exclude pending attempts. Previously
+excluded attempts remain excluded. Player deletion is blocked while closing
+or inactive, and awarded players retain their history after reactivation.
 The existing unified close POST also works before any program has been saved,
 initializing a normalized legacy program in the same transaction that begins
-closing. `isActive` is not set false at the start of closing: admitted pending
-attempts can finish. It becomes false atomically with `stackPrizeState: "closed"`
-and the final-award outbox job after all pending attempts finish or are explicitly
-excluded. Final delivery is asynchronous and remains recoverable after closure.
-Generic `PUT /v1/game {isActive:false}` returns `409 StackCloseRequired` for STACK;
-use the close POST instead. Reactivation during/after closure returns
-`409 StackClosing`. Other game types retain their existing active-flag behavior.
+closing. `isActive` becomes false immediately; valid finishes for admitted
+attempts are explicitly allowed. `stackPrizeState: "closed"` freezes that
+cycle's ranking, while `lifecycleState` remains `closing` until award jobs
+finish. Assignment/delivery remains asynchronous and recoverable afterwards.
+Generic `PUT /v1/game {gameId, isActive:false}` now uses this same closure
+for every game. Reactivation during calculation returns `409 GameClosing`;
+afterwards it preserves consumed attempts, scores, stock and prior awards.
+Later closures may reward new winners, never re-award the same prize to
+the same participant. Raffles are still manual. Deletion archives inactive
+events and keeps queued deliveries, metadata and prize claims.
 Owner game reads and public result/collection reads remain available after
-definitive STACK closure; new registrations/starts do not.
+STACK closure and archival; new registrations/starts do not.
 
 The retained prize table stores unit awards, allocation records and a durable
 outbox. After the finish transaction commits, the score handler immediately
@@ -593,4 +659,5 @@ requires its own approved test before being relied on: install the official
 card, leave the game, trigger final-ranking/raffle awards, confirm one Kivly
 assignment per unit and check both installed wallet types. Also exercise two
 STAND QRs for the same prize, repeat scans, closing with an active attempt,
-exclusion and a rejected late finish.
+reactivation without restored attempts, a second closure and archival with
+pending delivery/collection.

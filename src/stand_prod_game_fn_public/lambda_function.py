@@ -2,6 +2,7 @@ import os
 import json
 import re
 import uuid
+import base64
 from decimal import Decimal
 
 import boto3
@@ -14,6 +15,7 @@ from stand_common.stack import (
 from botocore.exceptions import BotoCoreError, ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import (
+    GAME_MUTABLE_CONDITION,
     log,
     _resp,
     _read_json_body,
@@ -31,7 +33,9 @@ from stand_common.utils import (
     is_valid_email,
     is_valid_phone,
     normalize_email,
+    OPTIONAL_PARTICIPANT_FIELDS,
 )
+from stand_common import game_access
 from stand_common.game_access import resolve_game_access
 from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
@@ -40,7 +44,8 @@ from stand_common.email_verification import (
 from stand_common.prizes import serialize_prize_catalog
 from stand_common.rulet4 import game_config as rulet4_game_config
 from stand_common.rulet4_gameplay import public_assignment as rulet4_assignment, spin as rulet4_spin
-from stand_common import kivly_registration, kivly_rewards, stack_prizes
+from stand_common import kivly_registration, kivly_rewards, stack_prizes, wallet_passes
+from stand_common import game_forms, mobile_gameplay
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -103,7 +108,10 @@ def _player_profile_pic_url(player: dict) -> str | None:
 
 def _get_game(game_id: str) -> dict | None:
     resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
-    return kivly_registration.apply_account_settings(dynamo_r, resp.get("Item"))
+    item = resp.get("Item")
+    if item and (item.get("deletedAt") or item.get("deletionStartedAt")):
+        return None
+    return kivly_registration.apply_account_settings(dynamo_r, item)
 
 
 def _public_prize_catalog(meta: dict):
@@ -216,12 +224,12 @@ def _handle_get_game(event):
         return _resp(404, {"ok": False, "error": "GameNotFound"})
     closed_stack = (item.get("gameType") == "STACK" and "stackPrizeProgram" in item
                     and item.get("stackPrizeState") in ("closing", "closed"))
-    if not item.get("isActive", True) and not closed_stack:
+    if not item.get("isActive", True) and not closed_stack and not item.get("lifecycleState"):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (item.get("gameType") or "").upper()
     configured_fields = web_participant_fields(game_type, item.get("participantFields"))
-    pf = {name: configured_fields[name] for name in ("email", "phone")}
+    pf = {name: value for name, value in configured_fields.items() if name != "instagram"}
     recent = item.get("recentPairs") or []
     if not isinstance(recent, list):
         recent = []
@@ -233,6 +241,7 @@ def _handle_get_game(event):
         "gameName": item.get("gameName"),
         "gameType": item.get("gameType"),
         "isActive": bool(item.get("isActive", True)),
+        **({"lifecycleState": item["lifecycleState"]} if item.get("lifecycleState") else {}),
         "playMode": access["playMode"],
         "joinChannel": access["joinChannel"],
         "participantFields": pf,
@@ -240,6 +249,7 @@ def _handle_get_game(event):
         "validatedCount": _as_int(item.get("validatedCount")),
         "recentPairs": recent[-10:],
         "joinUrl": _public_join_url(game_id, access["joinChannel"]),
+        **game_forms.public_config(item),
     }
     try:
         loyalty = kivly_registration.game_settings(item)
@@ -288,7 +298,8 @@ def _handle_get_game(event):
 
 def _invoke_assign_web(game_id: str, email: str | None, phone: str | None = None,
                        verification: str | None = None, username: str | None = None,
-                       loyalty_consent_version: str | None = None) -> dict:
+                       loyalty_consent_version: str | None = None,
+                       profile_fields: dict | None = None) -> dict:
     payload = {
         "source": "web",
         "game_id": game_id,
@@ -301,6 +312,8 @@ def _invoke_assign_web(game_id: str, email: str | None, phone: str | None = None
         payload["username"] = username
     if loyalty_consent_version:
         payload["loyaltyConsentVersion"] = loyalty_consent_version
+    if profile_fields:
+        payload.update(profile_fields)
     resp = lambda_client.invoke(
         FunctionName=ASSIGN_LAMBDA,
         InvocationType="RequestResponse",
@@ -355,7 +368,7 @@ def _registration_game(game_id):
         raise VerificationError("GameNotFound", 404)
     if not meta.get("isActive", True):
         raise VerificationError("GameInactive", 403)
-    if (meta.get("gameType") or "").upper() not in {"EMPAREJA2", "T1MER", "STACK", "RULET4"}:
+    if (meta.get("gameType") or "").upper() not in game_access.GAME_ACCESS_CAPABILITIES:
         raise VerificationError("unsupported_game_type", 400)
     return meta
 
@@ -413,6 +426,7 @@ def _handle_email_resume(event, body, game_id, meta):
         "phone": needed["phone"],
         "consent": needed["consent"],
         "loyaltyConsentVersion": needed["loyaltyConsent"],
+        **{name: needed.get(name, False) for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
     allowed = {"gameId", "email", "mode", "language"}
     allowed.update(name for name, required in supplied_fields.items() if required)
@@ -426,8 +440,8 @@ def _handle_email_resume(event, body, game_id, meta):
             return _resp(400, {"ok": False, "error": "KivlyConsentRequired"})
 
     candidate = {"email": email, **stored_values}
-    for field in ("username", "phone"):
-        if needed[field] and field in body:
+    for field in ("username", "phone", *OPTIONAL_PARTICIPANT_FIELDS):
+        if needed.get(field) and field in body:
             candidate[field] = body[field]
     if "phone" in candidate and candidate["phone"] and not is_valid_phone(candidate["phone"]):
         raise RegistrationError("invalid_phone")
@@ -455,7 +469,8 @@ def _handle_email_resume(event, body, game_id, meta):
     if player:
         resume = {
             "playerId": int(player["playerId"]),
-            "fields": [field for field in ("username", "phone") if needed[field] and values.get(field)],
+            "fields": [field for field in ("username", "phone", *OPTIONAL_PARTICIPANT_FIELDS)
+                       if needed.get(field) and values.get(field)],
         }
     request_context = event.get("requestContext") or {}
     source_ip = (request_context.get("http") or {}).get("sourceIp") or (
@@ -489,6 +504,7 @@ def _handle_join(event):
         result = _invoke_assign_web(
             game_id, values["email"], values.get("phone"),
             verification=receipt, username=values["username"],
+            profile_fields={name: values[name] for name in OPTIONAL_PARTICIPANT_FIELDS if name in values},
             **({"loyalty_consent_version": values["loyaltyConsentVersion"]}
                if "loyaltyConsentVersion" in values else {}),
         )
@@ -509,6 +525,8 @@ def _handle_join(event):
         player = _get_player(claims["gameId"], claims["playerId"])
         if player:
             kivly_registration.require_player(dynamo_r, meta, player)
+            if meta.get("gameType") in mobile_gameplay.TYPES:
+                assignment = mobile_gameplay.assignment(meta, player)
             assignment["profilePicUrl"] = _player_profile_pic_url(player)
             assignment.setdefault("participantName", _player_display_label(player))
 
@@ -566,6 +584,7 @@ def _append_recent_pair(game_id: str, players: list[dict], validated_at: str):
           Key={"gameId": game_id},
           UpdateExpression="SET recentPairs = list_append(if_not_exists(recentPairs, :empty), :entry), updatedAt = :now",
           ExpressionAttributeValues={":empty": [], ":entry": [entry], ":now": validated_at},
+          ConditionExpression=GAME_MUTABLE_CONDITION,
       )
   except ClientError as e:
       log("public_recent_pair_failed", {"error": str(e), "gameId": game_id})
@@ -598,10 +617,13 @@ def _handle_validate(event):
     # Participant-side validation is a mobile-only action; operator validation is unaffected.
     if not _is_mobile_play(meta):
         return _resp(403, {"valid": False, "error": "MobilePlayDisabled"})
+    if meta.get("gameType") in mobile_gameplay.TYPES:
+        return _resp(400, {"valid": False, "error": "UseParticipantPlayAction"})
 
     player = _get_player(game_id, claims["playerId"])
     if not player:
         return _resp(403, {"valid": False, "error": "PlayerNotFound"})
+    game_forms.require(meta, player, "after_registration")
 
     own_code = str(player.get("validationCode", "")).strip()
     if own_code not in codes:
@@ -670,6 +692,31 @@ def _empareja2_prizes(player: dict, game_id: str, player_id: int) -> list[dict]:
 def _set_prize_delivered(game_id: str, player_id: int, game_type: str, attr: str) -> None:
     """Ensure type.<gameType>.<attr> = true (three-step Dynamo path like game PUT)."""
     key = {"gameId": game_id, "playerId": int(player_id)}
+    meta = _get_game(game_id)
+    if meta and not meta.get("lifecycleState"):
+        from stand_common import prize_inventory
+        if prize_inventory.enabled():
+            player = _get_player(game_id, player_id)
+            condition = "validation" if attr == "validationPrizeDelivered" else "raffle"
+            try:
+                award = prize_inventory.legacy_claim(dynamo_r, meta, player, condition)
+            except prize_inventory.InventoryError as exc:
+                raise stack_prizes.PrizeError(exc.code, exc.status) from None
+            if not award:
+                raise stack_prizes.PrizeError("InventoryNotAssigned")
+            stack_prizes.redeem(dynamo_r, game_id, player_id, award["id"])
+            return
+    if meta and meta.get("lifecycleState"):
+        condition = "validation" if attr == "validationPrizeDelivered" else "raffle"
+        award = next((row for row in stack_prizes.records(dynamo_r, game_id)
+                      if row.get("playerId") == player_id and row.get("condition") == condition
+                      and row.get("id", "").startswith("award_")), None)
+        if award:
+            stack_prizes.redeem(dynamo_r, game_id, player_id, award["id"])
+            return
+        raise stack_prizes.PrizeError(
+            "NotEligible" if meta["lifecycleState"] == "inactive" else "PrizesCalculating",
+        )
     gp_table.update_item(
         Key=key,
         UpdateExpression="SET #type = if_not_exists(#type, :tinit)",
@@ -682,12 +729,16 @@ def _set_prize_delivered(game_id: str, player_id: int, game_type: str, attr: str
         ExpressionAttributeNames={"#type": "type", "#g": game_type},
         ExpressionAttributeValues={":ginit": {}},
     )
-    gp_table.update_item(
-        Key=key,
-        UpdateExpression="SET #type.#g.#a = :d",
-        ExpressionAttributeNames={"#type": "type", "#g": game_type, "#a": attr},
-        ExpressionAttributeValues={":d": True},
-    )
+    stack_prizes.transact(dynamo_r, [
+        stack_prizes.game_update(meta, ""),
+        {"Update": {
+            "TableName": os.environ["GAMEPLAYER_TABLE"], "Key": key,
+            "UpdateExpression": "SET #type.#g.#a = :d",
+            "ConditionExpression": "attribute_not_exists(#type.#g.#a) OR #type.#g.#a = :no",
+            "ExpressionAttributeNames": {"#type": "type", "#g": game_type, "#a": attr},
+            "ExpressionAttributeValues": {":d": True, ":no": False},
+        }},
+    ])
 
 
 def _stack_ranking_prize_eligible(meta: dict, rank) -> bool:
@@ -812,6 +863,8 @@ def _handle_score(event):
     kivly_registration.require_player(dynamo_r, meta, player)
 
     if game_type == "STACK":
+        if body.get("action") != "finish":
+            game_forms.require(meta, player, "after_registration")
         allowed = {"gameId", "playerToken", "action", "attemptId"}
         if body.get("action") == "finish":
             allowed.add("placements")
@@ -829,6 +882,7 @@ def _handle_score(event):
         return _resp(stack_response_status(result), _json_sanitize(result))
     if timer is None or score is None:
         return _resp(400, {"ok": False, "error": "MissingFields"})
+    game_forms.require(meta, player, "after_registration")
     result = _invoke_score_store(game_id, claims["playerId"], timer, score)
     status = 200 if result.get("ok") else 400
     return _resp(status, _json_sanitize(result))
@@ -858,6 +912,7 @@ def _handle_rulet4_spin(event):
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
     try:
+        game_forms.require(meta, player, "after_registration")
         kivly_registration.require_player(dynamo_r, meta, player)
         result = rulet4_spin(meta, player, gp_table)
     except ValueError:
@@ -889,7 +944,7 @@ def _handle_kivly_reward(event):
     player = _get_player(game_id, claims["playerId"])
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
-    result = ({"status": "none"} if "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {})
+    result = ({"status": "none"} if meta.get("lifecycleState") or "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {})
               else kivly_rewards.completion_reward(dynamo_r, meta, player))
     return _resp(200, _json_sanitize({
         "ok": True, "gameId": game_id, "playerId": claims["playerId"], "reward": result,
@@ -918,8 +973,6 @@ def _handle_player_photo(event):
     player = _get_player(game_id, player_id)
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
-    if player.get("joinSource") != "web":
-        return _resp(403, {"ok": False, "error": "WebPhotoUploadOnly"})
     kivly_registration.require_player(dynamo_r, _get_game(game_id) or {}, player)
     action = body.get("action")
     existing_photo_key = player.get("participantPhotoKey")
@@ -1058,7 +1111,7 @@ def _impostor_assignment_from_player(meta: dict, player: dict, game_id: str) -> 
 
 def _player_response(meta: dict, player: dict, game_id: str, player_id: int, token: str):
     """Shared PlayerResponse: {ok, gameId, gameType, playerToken, assignment, prizes}."""
-    managed_result = ("prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {})
+    managed_result = (("stackPrizeProgram" in meta or "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {}))
                       and get_game_type_blob(player, "STACK").get("attempt", {}).get("status") == "finished")
     if not managed_result:
         kivly_registration.require_player(dynamo_r, meta, player)
@@ -1080,8 +1133,23 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
     elif game_type == "RULET4":
         assignment = rulet4_assignment(player, _player_display_label(player), _player_profile_pic_url(player))
         prizes = []
+    elif game_type in mobile_gameplay.TYPES:
+        try:
+            game_forms.require(meta, player, "after_registration")
+            mobile_gameplay.reconcile_awards(dynamo_r, meta, player)
+            assignment = mobile_gameplay.assignment(meta, player)
+        except game_forms.FormError:
+            assignment = {
+                "gameType": game_type, "playerId": player_id,
+                "displayName": _player_display_label(player),
+                "validationCode": player.get("validationCode"), "validated": bool(player.get("validated")),
+                "play": {"revision": 0, "phase": "idle"},
+            }
+        except mobile_gameplay.PlayError as exc:
+            return _resp(exc.status, {"ok": False, "error": exc.code})
+        prizes = []
     else:
-        assignment = None
+        assignment = _t1mer_assignment_from_player(player)
         prizes = []
 
     payload = {
@@ -1091,7 +1159,13 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
         "playerToken": token,
         "assignment": assignment,
         "prizes": prizes,
+        "quiz": game_forms.participant_state(meta, player),
     }
+    if game_type == "SEMAFORO" and (player.get("mobilePlay") or {}).get("phase") == "quiz":
+        payload["quiz"]["finished"] = False
+    from stand_common import prize_inventory
+    if prize_inventory.enabled() and meta.get("prizeCatalog"):
+        payload["prizeUnavailable"] = prize_inventory.native_unavailable(dynamo_r, meta, player)
     if "prizeCatalog" in meta:
         payload["prizeCatalog"] = _public_prize_catalog(meta)
     if game_type == "STACK" and "stackPrizeProgram" in meta:
@@ -1099,8 +1173,29 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
             dynamo_r, meta, player,
             lambda aid: issue_prize_token(game_id, player_id, "a", PLAYER_TOKEN_SECRET, award_id=aid),
         )
-        if "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {}):
+        if meta.get("lifecycleState") or "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {}):
             payload["prizes"] = []
+    elif meta.get("lifecycleState") or prize_inventory.enabled() or (game_type in mobile_gameplay.TYPES and meta.get("prizeCatalog")):
+        awards = [row for row in stack_prizes.records(dynamo_r, game_id)
+                  if row.get("playerId") == player_id and row.get("id", "").startswith("award_")
+                  and row["prize"].get("source") == "stand"]
+        payload["nativePrizes"] = [{
+            "id": row["id"], "name": row["prize"]["name"], "condition": row["condition"],
+            "source": "stand", "state": row["state"],
+            "emailState": stack_prizes.email_delivery_state(row),
+            "emailError": row.get("emailError"),
+            "imageUrl": stack_prizes.image_url(row["prize"], meta),
+            "token": issue_prize_token(game_id, player_id, "a", PLAYER_TOKEN_SECRET, award_id=row["id"])
+            if row["state"] == "available" else None,
+        } for row in awards]
+        payload["prizes"] = []
+    if game_forms.pending(meta, player, "prize"):
+        payload["quiz"]["prizePending"] = bool(
+            payload.get("nativePrizes") or payload.get("stackPrizes", {}).get("awards") or payload.get("prizes"))
+        for award in payload.get("nativePrizes", []) + payload.get("stackPrizes", {}).get("awards", []) + payload.get("prizes", []):
+            award["token"] = None
+        if payload.get("stackPrizes"):
+            payload["stackPrizes"]["walletUrl"] = None
     return _resp(200, _json_sanitize(payload))
 
 
@@ -1129,7 +1224,162 @@ def _handle_get_player(event):
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
 
     meta = _get_game(claims["gameId"]) or {}
+    if not meta:
+        return _resp(404, {"ok": False, "error": "GameNotFound"})
+    if params.get("action") == "quiz":
+        kivly_registration.require_player(dynamo_r, meta, player)
+        if game_forms.moment(meta) == "after_game" and (player.get("mobilePlay") or {}).get("phase") == "quiz":
+            return _resp(409, {"ok": False, "error": "GameNotFinished"})
+        game_forms.submit(dynamo_r, meta, player, params.get("answers"), params.get("revision"))
+        player = _get_player(claims["gameId"], claims["playerId"])
+    elif params.get("action") == "play":
+        if not _is_mobile_play(meta):
+            return _resp(403, {"ok": False, "error": "MobilePlayDisabled"})
+        try:
+            mobile_gameplay.act(dynamo_r, meta, player, params)
+        except mobile_gameplay.PlayError as exc:
+            return _resp(exc.status, {"ok": False, "error": exc.code})
+        player = _get_player(claims["gameId"], claims["playerId"])
     return _player_response(meta, player, claims["gameId"], claims["playerId"], token)
+
+
+def _handle_wallet_pass(event):
+    params = event.get("queryStringParameters") or {}
+    token = params.get("token", "")
+    platform = params.get("platform", "")
+    claims = verify_prize_token(token, PLAYER_TOKEN_SECRET, allow_expired=True)
+    if not claims:
+        return _resp(400, {"ok": False, "error": "InvalidPrizeToken"})
+    if platform not in ("apple", "google"):
+        return _resp(400, {"ok": False, "error": "InvalidWalletPlatform"})
+
+    meta = _get_game(claims["gameId"])
+    player = _get_player(claims["gameId"], claims["playerId"])
+    if not meta or not player:
+        return _resp(404, {"ok": False, "error": "PrizeNotFound"})
+    game_forms.require(meta, player, "prize")
+
+    pass_claims = claims
+    if claims["kind"] == "a":
+        award = stack_prizes.table(dynamo_r).get_item(
+            Key={"gameId": claims["gameId"], "id": claims["awardId"]}, ConsistentRead=True,
+        ).get("Item")
+        if (not award or award.get("playerId") != claims["playerId"]
+                or award.get("state") != "available"
+                or (award.get("prize") or {}).get("source") != "stand"):
+            return _resp(404, {"ok": False, "error": "PrizeNotFound"})
+        prize = award["prize"]
+        details = {
+            "id": award["id"], "gameId": claims["gameId"], "playerId": claims["playerId"],
+            "name": prize["name"], "gameName": meta.get("gameName") or "STAND",
+        }
+    else:
+        prize_key = {"v": "validation", "r": "raffle", "k": "ranking"}[claims["kind"]]
+        condition = prize_key
+        game_type_blob = get_game_type_blob(player, (meta.get("gameType") or "").upper())
+        if meta.get("lifecycleState"):
+            award = next((row for row in stack_prizes.records(dynamo_r, claims["gameId"])
+                          if row.get("playerId") == claims["playerId"]
+                          and row.get("condition") == condition
+                          and (row.get("prize") or {}).get("source") == "stand"), None)
+            if not award or award.get("state") != "available":
+                return _resp(404, {"ok": False, "error": "PrizeNotFound"})
+            pass_claims = {
+                "gameId": claims["gameId"], "playerId": claims["playerId"],
+                "kind": "a", "awardId": award["id"],
+            }
+            prize = award["prize"]
+        else:
+            prize = (_public_prize_catalog(meta) or {}).get(prize_key)
+            delivered = {
+                "validation": game_type_blob.get("validationPrizeDelivered"),
+                "raffle": game_type_blob.get("prizeDelivered"),
+                "ranking": game_type_blob.get("rankingPrizeDelivered"),
+            }[prize_key]
+            eligible = {
+                "validation": player.get("validated") is True,
+                "raffle": bool(game_type_blob.get("raffleWin")),
+                "ranking": True,
+            }[prize_key]
+            if (not prize or not isinstance(prize.get("name"), str) or delivered or not eligible):
+                return _resp(404, {"ok": False, "error": "PrizeNotFound"})
+        details = {
+            "id": claims["kind"], "gameId": claims["gameId"], "playerId": claims["playerId"],
+            "name": prize["name"], "gameName": meta.get("gameName") or "STAND",
+        }
+
+    secret_name = os.environ.get("WALLET_CREDENTIALS_SECRET_NAME", "")
+    if not secret_name:
+        return _resp(503, {"ok": False, "error": "WalletPassUnavailable"})
+    try:
+        secret = boto3.client("secretsmanager").get_secret_value(SecretId=secret_name)
+        credentials = json.loads(secret.get("SecretString") or "")
+        provider_credentials = credentials.get(platform)
+        if not isinstance(provider_credentials, dict):
+            raise wallet_passes.WalletPassError("WalletPassUnavailable")
+        pass_token = issue_prize_token(
+            pass_claims["gameId"], pass_claims["playerId"], pass_claims["kind"],
+            PLAYER_TOKEN_SECRET, ttl_seconds=315360000,
+            award_id=pass_claims.get("awardId"),
+        )
+        if platform == "apple":
+            content = wallet_passes.build_apple_pass(details, pass_token, provider_credentials)
+            return {
+                "statusCode": 200,
+                "headers": {
+                    "Content-Type": "application/vnd.apple.pkpass",
+                    "Content-Disposition": 'attachment; filename="stand-award.pkpass"',
+                    "Cache-Control": "no-store",
+                    "Access-Control-Allow-Origin": "*",
+                },
+                "isBase64Encoded": True,
+                "body": base64.b64encode(content).decode("ascii"),
+            }
+        save_url = wallet_passes.build_google_save_url(details, pass_token, provider_credentials)
+        return {
+            "statusCode": 302,
+            "headers": {"Location": save_url, "Cache-Control": "no-store"},
+            "body": "",
+        }
+    except wallet_passes.WalletPassError:
+        return _resp(503, {"ok": False, "error": "WalletPassUnavailable"})
+    except (ClientError, ValueError, TypeError) as exc:
+        log("wallet_pass_generation_failed", {"errorType": type(exc).__name__})
+        return _resp(503, {"ok": False, "error": "WalletPassUnavailable"})
+
+
+def _handle_reward_email_retry(event):
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"ok": False, "error": "InvalidJson"})
+    game_id = body.get("gameId")
+    award_id = body.get("awardId")
+    claims = verify_player_token(body.get("playerToken", ""), PLAYER_TOKEN_SECRET)
+    if not claims:
+        return _resp(403, {"ok": False, "error": "InvalidPlayerToken"})
+    if claims["gameId"] != game_id:
+        return _resp(403, {"ok": False, "error": "TokenGameMismatch"})
+    if not isinstance(award_id, str) or not re.fullmatch(r"award_[0-9a-f]{64}", award_id):
+        return _resp(400, {"ok": False, "error": "InvalidAwardId"})
+
+    key = {"gameId": game_id, "id": award_id}
+    try:
+        stack_prizes.table(dynamo_r).update_item(
+            Key=key,
+            UpdateExpression="SET emailState = :pending, #w = :pending, dueAt = :now REMOVE emailError",
+            ConditionExpression="playerId = :player AND emailState = :failed AND #s IN (:available, :confirmed)",
+            ExpressionAttributeNames={"#w": "work", "#s": "state"},
+            ExpressionAttributeValues={
+                ":pending": "pending", ":now": 0, ":player": claims["playerId"],
+                ":failed": "failed", ":available": "available", ":confirmed": "confirmed",
+            },
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return _resp(409, {"ok": False, "error": "EmailNotRetryable"})
+        raise
+    stack_prizes.enqueue({"gameId": game_id, "id": award_id, "playerId": claims["playerId"]})
+    return _resp(200, {"ok": True, "emailState": "pending"})
 
 
 def _handle_redeem(event):
@@ -1151,34 +1401,82 @@ def _handle_redeem(event):
     meta = _get_game(game_id)
     if not meta:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
-    if not meta.get("isActive", True) and not (kind == "a" and meta.get("stackPrizeState") in ("closing", "closed")):
+    from stand_common import prize_inventory
+    inventory_active = prize_inventory.enabled()
+    if (not meta.get("isActive", True) and not meta.get("lifecycleState") and not inventory_active
+            and not (kind == "a" and meta.get("stackPrizeState") in ("closing", "closed"))):
         return _resp(403, {"ok": False, "error": "GameInactive"})
 
     game_type = (meta.get("gameType") or "").upper()
-    if game_type not in {"EMPAREJA2", "STACK"}:
+    if game_type not in {"EMPAREJA2", "STACK"} and kind != "a":
         return _resp(400, {"ok": False, "error": "UnsupportedGameType"})
 
     player = _get_player(game_id, player_id)
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
 
+    game_forms.require(meta, player, "prize")
     if kind != "a":
         kivly_registration.require_player(dynamo_r, meta, player)
     blob = get_game_type_blob(player, game_type)
 
-    if game_type == "STACK" and kind == "a":
+    if kind == "a":
         try:
             prize = stack_prizes.redeem(dynamo_r, game_id, player_id, claims["awardId"])
         except stack_prizes.PrizeError as exc:
+            return _resp(exc.status, {"ok": False, "error": exc.code})
+        except game_forms.FormError as exc:
             return _resp(exc.status, {"ok": False, "error": exc.code})
         return _resp(200, _json_sanitize({
             "ok": True, "gameId": game_id, "playerId": player_id, "kind": "award",
             "delivered": True, "label": _player_display_label(player), "prize": prize,
         }))
 
+    if game_type == "EMPAREJA2" and meta.get("lifecycleState"):
+        condition = {"v": "validation", "r": "raffle"}.get(kind)
+        award = next((row for row in stack_prizes.records(dynamo_r, game_id)
+                      if row.get("playerId") == player_id and row.get("condition") == condition
+                      and row.get("id", "").startswith("award_")), None)
+        if award:
+            try:
+                prize = stack_prizes.redeem(dynamo_r, game_id, player_id, award["id"])
+            except stack_prizes.PrizeError as exc:
+                return _resp(exc.status, {"ok": False, "error": exc.code})
+            return _resp(200, _json_sanitize({
+                "ok": True, "gameId": game_id, "playerId": player_id, "kind": condition,
+                "delivered": True, "label": _player_display_label(player), "prize": prize,
+            }))
+
     if game_type == "STACK":
         if kind != "k":
             return _resp(400, {"ok": False, "error": "NotEligible"})
+        from stand_common import prize_inventory
+        if prize_inventory.enabled() and not meta.get("lifecycleState"):
+            try:
+                award = prize_inventory.legacy_claim(dynamo_r, meta, player, "ranking")
+                if not award:
+                    return _resp(409, {"ok": False, "error": "InventoryNotAssigned"})
+                prize = stack_prizes.redeem(dynamo_r, game_id, player_id, award["id"])
+            except (stack_prizes.PrizeError, prize_inventory.InventoryError) as exc:
+                return _resp(exc.status, {"ok": False, "error": exc.code})
+            return _resp(200, _json_sanitize({
+                "ok": True, "gameId": game_id, "playerId": player_id, "kind": "ranking",
+                "delivered": True, "label": _player_display_label(player), "prize": prize,
+            }))
+        if meta.get("lifecycleState"):
+            award = next((row for row in stack_prizes.records(dynamo_r, game_id)
+                          if row.get("playerId") == player_id
+                          and (row.get("prize") or {}).get("id") == "legacy_ranking"), None)
+            if not award:
+                return _resp(409, {"ok": False, "error": "PrizesCalculating"})
+            try:
+                prize = stack_prizes.redeem(dynamo_r, game_id, player_id, award["id"])
+            except stack_prizes.PrizeError as exc:
+                return _resp(exc.status, {"ok": False, "error": exc.code})
+            return _resp(200, _json_sanitize({
+                "ok": True, "gameId": game_id, "playerId": player_id, "kind": "ranking",
+                "delivered": True, "label": _player_display_label(player), "prize": prize,
+            }))
         if blob.get("rankingPrizeDelivered"):
             return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "ranking"})
         ranking = stack_ranking(game_id, gp_table, None)["results"]
@@ -1187,19 +1485,22 @@ def _handle_redeem(event):
             return _resp(400, {"ok": False, "error": "NotEligible"})
         prize = (_public_prize_catalog(meta) or {}).get("ranking")
         try:
-            gp_table.update_item(
-                Key={"gameId": game_id, "playerId": int(player_id)},
-                UpdateExpression="SET #type.#g.#delivered = :yes",
-                ConditionExpression=(
+            stack_prizes.transact(dynamo_r, [stack_prizes.game_update(meta, ""), {"Update": {
+                "TableName": os.environ["GAMEPLAYER_TABLE"],
+                "Key": {"gameId": game_id, "playerId": int(player_id)},
+                "UpdateExpression": "SET #type.#g.#delivered = :yes",
+                "ConditionExpression": (
                     "attribute_exists(playerId) AND #type.#g.#attempt.#status = :finished "
                     "AND (attribute_not_exists(#type.#g.#delivered) OR #type.#g.#delivered = :no)"
                 ),
-                ExpressionAttributeNames={
+                "ExpressionAttributeNames": {
                     "#type": "type", "#g": "STACK", "#delivered": "rankingPrizeDelivered",
                     "#attempt": "attempt", "#status": "status",
                 },
-                ExpressionAttributeValues={":yes": True, ":no": False, ":finished": "finished"},
-            )
+                "ExpressionAttributeValues": {":yes": True, ":no": False, ":finished": "finished"},
+            }}])
+        except stack_prizes.PrizeError as exc:
+            return _resp(exc.status, {"ok": False, "error": exc.code})
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 return _resp(409, {"ok": False, "error": "AlreadyDelivered", "kind": "ranking"})
@@ -1231,6 +1532,8 @@ def _handle_redeem(event):
     prize = (_public_prize_catalog(meta) or {}).get(kind_out)
     try:
         _set_prize_delivered(game_id, player_id, "EMPAREJA2", attr)
+    except stack_prizes.PrizeError as exc:
+        return _resp(exc.status, {"ok": False, "error": exc.code})
     except ClientError as e:
         log("public_redeem_failed", {"error": str(e), "gameId": game_id, "playerId": player_id})
         return _resp(500, {"ok": False, "error": "UpdateFailed"})
@@ -1263,6 +1566,10 @@ def lambda_handler(event, context):
             return _handle_validate(event)
         if path.endswith("/player") and method in ("GET", "POST"):
             return _handle_get_player(event)
+        if path.endswith("/wallet/pass") and method == "GET":
+            return _handle_wallet_pass(event)
+        if path.endswith("/reward-email/retry") and method == "POST":
+            return _handle_reward_email_retry(event)
         if path.endswith("/player/photo") and method == "POST":
             return _handle_player_photo(event)
         if path.endswith("/redeem") and method == "POST":
@@ -1275,6 +1582,8 @@ def lambda_handler(event, context):
             return _handle_kivly_reward(event)
 
         return _resp(404, {"ok": False, "error": "NotFound"})
+    except game_forms.FormError as exc:
+        return _resp(exc.status, {"ok": False, "error": exc.code})
     except stack_prizes.PrizeError as exc:
         return _resp(exc.status, {"ok": False, "error": exc.code})
     except (kivly_registration.RegistrationError, kivly_registration.KivlyError) as exc:

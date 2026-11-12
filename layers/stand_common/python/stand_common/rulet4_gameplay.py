@@ -17,6 +17,8 @@ def public_assignment(player, display_name, profile_pic_url=None):
 
 
 def spin(meta, player, table):
+    from stand_common import game_forms
+    game_forms.require(meta, player, "after_registration")
     previous = get_game_type_blob(player, "RULET4").get("result")
     if previous is not None:
         return previous

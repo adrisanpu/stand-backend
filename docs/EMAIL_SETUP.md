@@ -125,14 +125,17 @@ authorization is configured. Only the dedicated public Lambda role receives
 table permissions but cannot send mail. The existing game managed policy is
 reused on these roles to preserve all prior game/session behavior.
 
-### STACK reward emails
+### Prize notification emails across games
 
-The STACK delivery worker separately receives `ses:SendRawEmail` on the same
-identity, restricted to `EmailSenderAddress`. Its MIME message contains
-Spanish branded text/HTML, the selected owner logo, a wallet link and a locally
-generated inline PNG QR; no QR/image service receives participant phone
-numbers. The worker's pinned `qrcode`/`pypng` requirements are installed by SAM
-build and by the test requirements.
+The shared delivery worker sends the same bilingual STAND prize-notification
+format for native rewards across all web-enabled game types, including a locally
+generated inline PNG QR and Apple/Google Wallet links where applicable. Kivly
+awards use that same format with their Kivly Wallet link. Participant email
+addresses must be verified before sending. The worker receives
+`ses:SendRawEmail` on the shared identity, restricted to `EmailSenderAddress`;
+no QR/image service receives participant phone numbers. Its pinned
+`qrcode`/`pypng` requirements are installed by SAM build and by the test
+requirements.
 Assignment Lambdas still cannot send email.
 
 For an explicitly approved recovery/test, `reward_email.build_message` also
@@ -149,10 +152,12 @@ Verify the assignment in Kivly before notifying: the customer-redemptions endpoi
 describes redemptions and may not list a newly earned, unredeemed reward.
 Do not repeat an earn merely because it is absent from that endpoint.
 
-`StackRewardEmailEnabled` defaults to `"false"` in the template. The dev
-`samconfig.toml` explicitly enables it for authorized testing; production does
-not. For an approved dev rollout, first verify SES identity, quotas,
-sandbox recipients, bounce/complaint handling and worker From-address permission.
+`StackRewardEmailEnabled` defaults to `"false"` in the template and gates
+verified-email notifications for native rewards across games as well as Kivly
+prize notices. The dev `samconfig.toml` explicitly enables it for authorized
+testing; production does not. For an approved dev rollout, first verify SES
+identity, quotas, sandbox recipients, bounce/complaint handling and worker
+From-address permission.
 Enable it only for a controlled test, then use an authorized test mailbox/customer
 to confirm the emailed phone QR works with the actual Kivly scanner. A setting
 or mocked test is not evidence that the Kivly reader accepts the QR.

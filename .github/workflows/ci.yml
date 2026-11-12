@@ -49,6 +49,7 @@ jobs:
       - name: Build and deploy dev stack
         run: |
           sam build
+          python scripts/check_common_layer.py .aws-sam/build/StandCommonLayer
           # samconfig profile is for local CLI; Actions uses OIDC env credentials
           sed -i '/^profile = /d' samconfig.toml
           sam deploy --config-env dev

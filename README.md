@@ -2,6 +2,33 @@
 
 Backend for the Stand project: AWS Serverless Application Model (SAM) app with Python 3.13 Lambda functions.
 
+## Editable Home and mobile gameplay
+
+The stand renders only a Home canvas; gameplay runs through participant-token
+endpoints on phones. L3TRAS gathers codes on one phone; SEMAFORO and CUPIDO validate
+from one participant's phone; SEMAFORO's cross quiz alternates turns there.
+INFOCARDS serves participant-authorized swipeable cards. CUPIDO remains development-only.
+`POST /public/player` with `action: "play"` uses revision/request IDs for retries;
+the server owns timing, validation, results, rewards, and private-answer evaluation.
+
+Operator canvas configuration uses `GET /v1/game?gameId=...&home=true` and
+`PUT /v1/game` with `{gameId, homeCanvas, expectedHomeRevision}`. Both the minimal
+and regular game reads expose `homeCanvas`, `homeRevision`, signed
+`homeBackgroundUrls`, and read-only state. Canvas revisions are independent of
+form/questionnaire revisions. New events persist empty landscape/portrait
+compositions; legacy events without the field receive deterministic editable defaults.
+Positions/sizes use integer grid units, with bounds, minimum sizes, unique widget
+types (except text), and no overlaps enforced on the server.
+
+The existing user-media API has a separate `home-background.items` library.
+Upload and register with `kind: "home-background"`; this never selects a logo.
+Images are limited to 5 MB; MP4/WebM videos to 100 MB. Registration checks the
+owner prefix and S3 object type/size; canvas selection checks ownership and plan.
+Backgrounds and custom colors require advanced customization, while layout/text
+remain available to all plans. Persist media keys, not signed URLs.
+Individual items can also store `backgroundColor` as `"transparent"` or a
+six-digit hex color on every plan; omission preserves the existing widget style.
+
 ## Stack
 
 - **Runtime:** Python 3.13
@@ -19,6 +46,7 @@ Backend for the Stand project: AWS Serverless Application Model (SAM) app with P
 ```bash
 # Build
 sam build
+python scripts/check_common_layer.py .aws-sam/build/StandCommonLayer
 
 # Local invoke (example)
 sam local invoke StandProdUserFnUserSam --event events/user.json
@@ -39,12 +67,164 @@ Deploy config is in `samconfig.toml`:
 
 Region: `us-east-1`. Full dev setup: **[docs/DEV_ENVIRONMENT.md](docs/DEV_ENVIRONMENT.md)**.
 
+## Participant schema and dev migration
+
+Game participants use `verificationMethod` (currently `email-code`) and
+`verifiedAt` (an ISO timestamp). These describe identity verification, not game
+completion: `validated`, `validatedAt` and the four-digit `validationCode` retain
+their game-specific meaning. The six-digit email OTP is separate, expires after
+10 minutes, and is stored as a hash in the email verification table.
+
+All new participants join through the web; `joinSource` is no longer stored or
+required for authenticated photo uploads. Kivly participant data is grouped in
+one DynamoDB Map:
+
+```json
+{
+  "kivly": {
+    "membership": {
+      "customerId": "...",
+      "locationId": "...",
+      "consentVersion": "...",
+      "consentedAt": "...",
+      "phone": "...",
+      "status": "confirmed"
+    },
+    "recovery": {
+      "run": "...",
+      "disposition": "...",
+      "duplicateOf": 1
+    }
+  }
+}
+```
+
+Only existing optional fields are retained; recovery is omitted when absent.
+The contact phone and membership phone are intentionally separate. Membership
+updates preserve recovery metadata and use optimistic concurrency. Reward email
+requires an `email-code` verification method, timestamp and valid email address.
+
+`scripts/migrate_gameplayer_schema.py` migrates only
+`stand-dev-gameplayer-table` in account `781283585341`, region `us-east-1`.
+It defaults to a paginated, read-only preflight:
+
+```bash
+python scripts/migrate_gameplayer_schema.py --profile stand-deploy-cli
+python scripts/migrate_gameplayer_schema.py --profile stand-deploy-cli --apply
+```
+
+There is **no legacy runtime fallback**. Before `--apply`, create and verify an
+on-demand DynamoDB backup and pause participant operations and asynchronous
+Kivly/prize workers. Deploy the new dev backend and migrate while they remain
+paused. Each item update atomically renames verification fields, merges Kivly
+metadata, removes obsolete attributes and checks their previously read values.
+Conflicting formats or values stop the migration; a partially applied run can be
+rerun after resolving the cause. The final consistent scan compares all records
+with their expected migrated values without logging participant data.
+
+Resume operations only after deployment and migration verification succeed.
+Keep the backup until the cutover is accepted. Rollback requires coordinating
+old code with old-schema data, not merely redeploying old code. Production is
+excluded: a future production deployment needs its own coordinated migration.
+
 ## Structure
 
 - `template.yaml` – SAM template (APIs, Lambdas, roles)
 - `src/` – Lambda source code (one folder per function)
 - `samconfig.toml` – SAM deploy configuration
 - `layers/stand_common/` – Shared Python utilities (log, _resp, get_game_type_blob, set_game_type_blob, etc.)
+
+### Shared layer packaging
+
+`StandCommonLayer` uses SAM's Python builder with
+`ContentUri: layers/stand_common/python/`. Keep its dependencies in
+`layers/stand_common/python/requirements.txt`, next to `stand_common/`.
+SAM adds the outer `python/` directory: the built layer must contain
+`python/stand_common/`, never `python/python/stand_common/`.
+Build before packaging/deploying and run `scripts/check_common_layer.py`
+against the built layer directory. CI runs this check before deployment.
+Native dependencies must target Lambda Linux x86_64/Python 3.13, not Windows.
+
+## Required initial configuration review
+
+New games persist `game.setupReview` with `version: 1`, an opaque `revision`,
+`confirmedSections` and `completed: false`. Owner list/get/configuration and
+creation responses return it; legacy games without the marker are exempt.
+The six section IDs follow UI order: `appearance` (Home), `configuration` (Game),
+`form`, `questionnaire`, `conditions` (Prizes), `prizes` (Raffle).
+
+Owner-authenticated `PUT /v1/game` accepts
+`{gameId, setupReview: {section, confirmed, expectedRevision}}`.
+Every mutation returns the new revision in `{ok, gameId, setupReview}`.
+After all six confirmations, explicitly finish with
+`{gameId, setupReview: {finish: true, expectedRevision}}`.
+Stale revisions return 409 `SetupReviewChanged`; premature finish returns
+409 `SetupReviewIncomplete`; legacy updates return 409 `SetupReviewNotRequired`.
+Unconfirming a panel clears completion. Existing ownership and lifecycle checks
+apply. This persists operator review only: it does not introduce a publication
+state or block public participant access.
+
+## Event forms and participant surveys
+
+Owner-authenticated `GET /v1/game?gameId=...&form=true` reads the presentation,
+questions, registration fields, edit lock and revision. `PUT /v1/game` accepts
+`{gameId, form: {formConfig, participantFields, questions, expectedRevision}}`.
+The server checks ownership, active lifecycle, plan, limits and optimistic
+concurrency. `formConfig` is event-wide presentation plus a single `quizMoment`:
+the event retains its shared logo, banner, colors and theme, which are
+used by the event home, gameplay, registration and questionnaire. The normal
+owner `GET /v1/game?gameId=...` also returns `formConfig`, `formLogoUrl` and
+`formBannerUrl` alongside `game`, so the event home uses the same saved settings.
+Media URLs are signed on reads; persisted settings continue to contain only keys.
+`disabled`, `after_registration`, `after_game`, `prize` or `raffle`.
+It stores owned image keys, never signed URLs. After-game placement is rejected
+for INFOCARDS and IMPOSTOR until a suitable final participant event is supported.
+
+Questions retain `quizOrder`/`quizQuestions`. A participant submits all answers
+using `POST /v1/public/player` with
+`{gameId, playerToken, action: "quiz", answers, revision}`. The transaction locks
+the questionnaire on the game and writes `quizAnswers`, `quizCompleted` and
+`quizCompletedAt` in `type.<GAME>` without replacing gameplay progress.
+Question/moment changes are rejected after any answers exist; presentation
+changes do not reset answers. Identical retries are idempotent.
+The normal player response includes the questionnaire and completion state.
+Draft-only AI generation uses `POST /v1/game/quiz/generate` with `draftOnly: true`;
+legacy writers cannot replace questionnaires managed through the new editor.
+
+Prize surveys preserve earned awards and inventory reservations but withhold
+usable claim tokens, wallet passes, STAND collection, Kivly assignment and reward
+email until completion. The existing durable outbox retains pending work; its
+dispatcher resumes delivery after completion without requiring the browser to
+stay open. Already uncertain external writes retain their reconciliation rules,
+and already delivered prizes are not revoked. Raffle surveys filter both native
+and STACK draws regardless of the operator's validated-only filter.
+
+Owner-authenticated `GET /v1/game/quiz?gameId=...&analytics=1` returns the selected
+event's questions and participant responses for the Respuestas panel. It follows
+all participant query pages within the selected game partition, not a table
+scan. The UI filters/paginates that complete dataset and exports the selected
+results with CSV formula escaping. There are no visit/abandonment events,
+cross-questionnaire insights, new tables or new external API operations.
+Deploy the changed functions and shared layer together; no deployment or live
+Kivly mutation is performed by local verification.
+
+## Account profile
+
+Authenticated `GET /v1/user/me` includes optional `name`, `profilePhotoKey`
+and a one-hour signed `profilePicUrl`. `PUT /v1/user/me` accepts exactly
+`{name, profilePhotoKey}`: a trimmed name of 1-100 characters and either an
+owned uploaded photo key or `null` to remove the photo. The update preserves
+email, plans, integrations and game branding; it does not edit Cognito attributes.
+
+Request a photo upload through `POST /v1/user/media?action=upload-url` with
+`files: [{kind: "profile-photo", fileName, contentType, sizeBytes}]`, then PUT
+the binary to its signed URL and submit the returned `key` with the profile.
+JPEG, PNG and WebP files must be nonempty and at most 5 MB. The profile update
+checks object ownership, stored content type and size before saving. Photos
+use `users/<sub>/profile-photos/`, separate from logos and legacy game avatars.
+Removing a photo clears its account reference; it does not delete the S3 object.
+Only the key is persisted, not the signed URL. Deploy the user/media functions
+and SAM route/environment changes together.
 
 ## Data model: game-table `type` column
 
@@ -53,6 +233,345 @@ The game table (`stand-prod-game-table` in prod, `stand-dev-game-table` in dev) 
 - **Structure:** `type.<GAME_TYPE>` where `GAME_TYPE` is the same value as `gameType` in uppercase (e.g. `INFOCARDS`, `EMPAREJA2`).
 - **Example:** For an INFOCARDS game, cards are stored under `type.INFOCARDS.cards`; the blob can include other keys (e.g. `sourceUploadKey`, `generatedQuizGameId`) as needed.
 - **Usage:** Use the helpers from `stand_common.utils`: `get_game_type_blob(game_item, "INFOCARDS")` to read and `set_game_type_blob(games_table, game_id, "INFOCARDS", {"cards": [...]}, updated_at=...)` to write. New game types that need type-specific blobs should follow the same pattern and reuse the `type` column instead of defining new top-level attributes.
+
+## Owner game listing
+
+Authenticated `GET /v1/game` queries the current owner's index and reads all
+DynamoDB pages before sorting and returning `{ok, ownerUserId, gameType, count,
+games}`. Each listed game includes its existing `createdAt` when present and
+`playerCount` from the persisted `playersCount` counter (zero when absent, as
+in the existing game stats). No per-event roster queries are needed.
+The list also includes `isActive` (legacy default true), `lifecycleState`
+(`active`, `closing`, `inactive`), and `stackPrizeState` for STACK. Archived
+events are excluded.
+The optional `gameType` filter applies to the complete result. A failed
+later page returns an error rather than a successful partial list. The response
+contract, ownership checks and plan rules are unchanged; no new resources or
+data migration are required.
+
+The administration's **Mis partidas** view uses this existing endpoint.
+Publish the updated game-management Lambda before relying on a complete
+multi-page list in the frontend.
+
+## Per-event administration settings (delivery 1B)
+
+Owner-only `GET /v1/game?gameId=...&configuration=true` returns the usual owned
+game metadata plus `configuration` (the existing type-specific blob) and an
+opaque `rewardConditionsRevision`. It permits reading legacy inactive events,
+not archives/deleted events or another owner's event. Effective STACK/RULET4
+settings remain under `game.type`. No selection from browser storage is needed.
+Existing mechanic PUTs reject inactive events; affected mechanic writes also
+condition on activity/ownership at commit, so a concurrent close cannot silently
+accept a configuration update.
+
+`PUT /v1/game` with exactly `{gameId, rewardConditions: {rankingTopX,
+expectedRevision}}` updates only an existing T1MER ranking reward's top positions
+(integer 1–100). It cannot create a reward or edit its name, image or limit.
+The revision hashes the stored catalog, not signed image URLs. Conflicts return
+409; success includes the new `rewardConditionsRevision`.
+
+STACK's existing `/v1/game/stack/prizes` GET includes `programRevision`.
+Its PUT accepts `{gameId, action: "rules", expectedRevision, rules}`: validate
+existing rules while retaining the current catalog, inventory consumption,
+delivery channel and existing awards. The operation uses the usual optimistic
+transaction and must target an active, open event. Missing prizes, invalid rules,
+identity reuse and disabled plan features keep their existing validation.
+Success returns the saved program and next revision. Revision mismatches return
+`RewardConditionsChanged`; transactional races return `StackPrizeConflict`.
+The new catalog client uses `{gameId, action: "catalog", program}`; the server
+takes rules from its current snapshot instead of trusting stale client rules.
+Native catalog saves with `preserveRewardConditions: true` similarly retain the
+latest existing T1MER top, with a catalog comparison at write time.
+The legacy whole-program API remains compatible; there is no new rule engine.
+
+INFOCARDS persists optional `cardLayouts` (`top/left/right/bottom`, keyed by card
+ID) alongside cards in `type.INFOCARDS`, instead of leaving these edits only in
+one browser. Regeneration preserves other blob settings. Editing, media upload
+requests and AI generation reject inactive events, with active write guards on
+card/quiz commits. Reads remain available for the administration's read-only
+view. Registration, catalogs and integrations are not part of mechanic saves.
+No tables, dependencies, services or automatic deployment are added. Deploy the
+game handler/shared layer and affected INFOCARDS/quiz functions together with
+the compatible frontend.
+
+## Prize delivery and Wallet (delivery 1C)
+
+Prize catalogs and manual raffles are managed within each event's settings
+overlay, not from the operational home. Native validation and manual-raffle
+awards are persisted when their result is confirmed; ranking awards that
+depend on the final leaderboard are persisted during event closure. Available
+STAND awards enter the durable delivery outbox. Email failure never invalidates
+the award or its individual QR claim.
+
+The delivery worker emails the verified participant address automatically for
+native STAND awards across all web-enabled game types. Emails include Apple
+Wallet and Google Wallet links when their credentials are configured.
+`StackRewardEmailEnabled` controls prize notification emails and defaults to
+disabled. Participants can retry a failed email; the award and QR remain
+available regardless of email or Wallet-provider failures. Kivly awards keep
+their Kivly Wallet link and use the same notification format.
+
+### Shared prize catalog
+
+The authenticated owner API exposes `GET`, `PUT` and `POST /v1/prizes/catalog`.
+The catalog is stored on the owner's user record, so definitions are shared
+across that owner's games; it is not a cross-owner/global catalog. `GET`
+returns `{ok, catalog, revision}` with fresh signed image URLs. `PUT` accepts
+`{catalog, expectedRevision}` and uses optimistic revision checks; entries are
+`{id, name, imageKey}`. Existing event prize names/images are migrated on first
+access and merged only when both name and image key match exactly. Shared
+definition edits propagate to linked event assignments while preserving each
+event's limits, ranking positions and STACK stock. Deleting a referenced
+definition returns `SharedPrizeInUse`.
+
+`POST` accepts `{action:"upload-url", contentType:"image/png", sizeBytes:N}`
+and returns an owner-scoped S3 PUT URL. Images are bounded to 5 MiB and checked
+as PNG before association. Catalog saves validate new or changed image keys;
+unchanged images on existing entries are not downloaded again when deleting
+or renaming prizes. Owner-scoped key checks still apply to every image.
+A failed propagation after a successful catalog
+write returns `SharedPrizeCatalogSyncFailed`; retrying the catalog read
+reapplies the idempotent synchronization. STACK STAND items retain their
+shared-prize identity when legacy prize programs are upgraded. Deploy the game
+handler, shared layer, routes and media-bucket permissions together; no
+deployment is performed by these local changes.
+
+### General prize inventory and activation
+
+`PRIZE_INVENTORY_TABLE` points to `stand-${Environment}-prize-inventory`.
+There is **one table per environment**, shared by all operators, partitioned by
+authenticated `ownerId`; it is not one table per operator. PITR and retention
+are enabled. `CONTROL`, `BAL#`, `MOVE#`, `REQUEST#` and `IMPORT#` sort-key
+prefixes hold cutover state, balances, movements, idempotency receipts and
+resumable import progress. Inventory/history survive event deletion.
+
+The inventory applies to both STAND shared prize IDs and Kivly identities
+derived from location/reward IDs. Available units are consumed atomically
+**when assigned**, alongside the award and event cap. STAND redemption updates
+the assignment and redeemed count once, without another stock debit. A Kivly
+earn acknowledgement or a Wallet/email delivery is not evidence of collection:
+Kivly `canjeados` is `null` ("Sin confirmar"). Failed/uncertain external writes
+and failed emails never return units automatically.
+
+Event caps are additional limits, not reservations. STACK `stockTotal` accepts
+`null` (no event cap), `0` (disabled) or an integer up to 1000; native `limit`
+keeps its existing nullable contract. Existing explicit caps are retained.
+When the same general prize has several local assignments, game associations
+are counted once and shown active if any assignment is enabled; the displayed
+cap is the sum of those local caps (or unlimited if any is unlimited).
+Uninitialized/exhausted general stock or an exhausted cap omits that prize,
+preserves valid alternatives and does not stop gameplay. STACK allocation
+records expose `inventoryReasons`; eligible native player responses expose
+`prizeUnavailable: [{condition, reason}]`. Historical native award identities
+are reused when shared definitions acquire an ID or change name/image.
+
+Owner endpoints:
+
+- `GET /v1/prizes/inventory`: `{ok, mode, catalog, unresolved, imports}`.
+  Each catalog item contains `inventory` (available, initialized, assigned,
+  redeemed, historicalAssigned, historicalRedeemed, revision), `canjeados`
+  and game associations `{gameId, name, active, limit}`. Active associations
+  exclude archived/closing events, disabled conditions and zero caps.
+- `GET /v1/prizes/inventory?prizeId=ID&cursor=...`: paginated
+  `{ok, items, cursor}` movements, including assignment-unit states and event
+  snapshots. Cursors are bound to owner and prize.
+- `POST /v1/prizes/inventory` with
+  `{action: "initialize"|"replenish"|"adjust", prizeId, quantity, reason,
+  requestId, expectedRevision}` records an audited change. Initialize uses an
+  absolute available quantity; replenish adds positive units; adjust applies a
+  signed delta and cannot make stock negative. Reuse the same request ID and
+  body after an uncertain response; a changed payload with that ID conflicts.
+  Revision conflicts require reloading, not silently replacing the balance.
+- `POST` with `{action:"import", gameId, cursor?}` imports up to 20 award or
+  legacy participant rows per page, returning `{ok, cursor, unresolved}`.
+  Continue with the **opaque returned cursor** until `null`; skipped cursors
+  are rejected. Retrying the last processed cursor after a lost response returns
+  its stored page result without advancing or recounting. Repeating from the
+  beginning is safe. The prize panel automatically walks every pending game's
+  pages on opening, including archives and games without a current catalog;
+  completed imports are skipped and errors remain visible. Confirmed old player
+  flags and legacy Kivly reservations are projected without issuing external
+  requests or debiting manually initialized stock. Old QR tokens resolve to
+  the same awards; missing historical collection dates are not invented.
+- `POST` with `{action:"activate"}` explicitly switches the operator to general
+  consumption. It requires initialized associated prizes and completed,
+  reconciled imports for owned games. A transactional mode check prevents an
+  in-flight legacy concession from committing across cutover.
+
+  The maximum supported grouped assignment (8 prizes x 10 units) stays within
+  DynamoDB's 100-operation limit, including the legacy player snapshot guard.
+  When inventory infrastructure is enabled, new legacy Kivly completions use
+  the authoritative award/outbox rather than an additional duplicate reservation;
+  existing reservations remain readable and are imported without replaying earn.
+
+Rollout is coordinated and **not automatic**: deploy the table, IAM, routes,
+shared layer and all award/claim/delivery writers together, let old invocations
+drain, then publish the compatible frontend. Until explicit activation, linked
+new awards are historical projections and existing consumption stays in legacy
+mode. Open Administration > Premios, initialize **free units for new awards**
+(exclude units already promised to outstanding awards; never sum old per-game
+stocks), import every game including archives, resolve
+unmatched historical definitions using exact identity evidence, then activate.
+Unmatched rows block activation; do not merge on a similar name. Historical
+assigned/redeemed counts remain separate from post-cutover counts. A later
+new, uninitialized prize cannot be assigned until initialized.
+
+Deleting shared definitions with initialized stock or history is rejected.
+Permanent event deletion first projects any remaining award history and keeps
+shared catalog images. Operator reads use the owner game index and scoped
+inventory queries; movement history is paginated, with no global inventory
+scan. These changes do not authorize deployment or frontend publication.
+
+Wallet credentials are optional and must be stored outside the repository in
+AWS Secrets Manager as `stand/${Environment}/wallet`. The secret is a JSON
+object with `apple` and/or `google` properties:
+
+```json
+{
+  "apple": {
+    "certificateP12Base64": "<base64-encoded pass certificate>",
+    "certificatePassword": "<optional certificate password>",
+    "wwdrCertificatePem": "<Apple WWDR certificate PEM>",
+    "passTypeIdentifier": "pass.example.stand",
+    "teamIdentifier": "<Apple team identifier>",
+    "organizationName": "STAND"
+  },
+  "google": {
+    "issuerId": "<Google Wallet issuer ID>",
+    "classId": "<pre-created generic pass class ID>",
+    "serviceAccountEmail": "<service-account>@<project>.iam.gserviceaccount.com",
+    "privateKeyPem": "<service-account private key PEM>"
+  }
+}
+```
+
+Only configure credential blocks for providers that are ready. Create and
+validate provider-side pass identifiers/classes before enabling that provider.
+The public pass endpoint reads this secret using `StandPublicRole`. Credentials
+must never be put in source control or frontend configuration. Configure and
+verify the SES sender identity separately.
+
+Deploy the backend stack, including the shared layer, public API, validation
+and raffle functions, and delivery worker, before publishing the matching
+frontend. This delivery does not deploy automatically.
+
+## Clients and prize history (delivery 1D)
+
+The authenticated owner API exposes `GET /v1/clients?limit=25&cursor=...`
+and `GET /v1/clients/{clientId}`. The first returns a paginated client list;
+the second returns that client's participant records across all the owner's
+games and persisted prize, email and Kivly-assignment states. Access is scoped
+to the authenticated `ownerUserId`. Client IDs are HMAC-derived from the
+normalized, verified email and owner; names never create or merge identities.
+Pages default to 25 unique clients and never exceed 25, even when an older
+frontend requests 50. Continuation cursors load the next page; participant and
+prize history is fetched only when a client is opened, not for the entire list.
+The Gmail-style directory uses `GET /v1/clients?page=1&search=...` and returns
+`page`, `pageSize: 25` and the exact filtered `total`. Name/email/phone searches
+are owner-scoped and case/accent-insensitive, with normalized phone matching.
+It queries all profile pages of that owner's `owner-clients` index to compute
+the exact count and search results, but returns only the requested 25 summaries.
+It never scans participant tables or loads award history for this search.
+This makes read cost linear in the owner's client directory; large directories
+would need a dedicated search index/counter rather than filtering participants.
+The cursor endpoint remains available for older clients.
+
+`StandClientIndexTable` stores the derived profile and per-game participant
+references. New verified web registrations maintain the index; participant
+removal and permanent event deletion remove their references. Archived games
+remain in history. Historical population is an explicit, resumable migration,
+not part of deployment or API reads. From the backend root, first preview:
+
+```powershell
+python scripts/migrate_client_index.py --owner-id <owner-id> --checkpoint <path>
+```
+
+After reviewing the counts, run the same command with `--apply` to write the
+derived index. The script requires the deployed table names and
+`PLAYER_TOKEN_SECRET` in its environment, uses only verification markers or an
+exact existing per-game email mapping, and skips unresolved duplicate or
+unverified records. Re-running the same checkpoint is idempotent.
+
+The API reports a STAND award separately from email status and STAND collection.
+For Kivly it reports only the external-assignment state already stored in STAND;
+it does not query Kivly or claim that an externally assigned reward was
+physically redeemed. `accepted` email state means the provider accepted the
+send request, not inbox delivery. The endpoints expose no claim tokens.
+
+## Closing, reactivation and archival
+
+Owner-only `PUT /v1/game` with exactly `{gameId, isActive}` is the common
+lifecycle action for every game. `false` atomically stops admission and
+starts a durable closure job in the existing prize outbox. The response
+includes the persisted `game.isActive` and `game.lifecycleState`; a successful
+request can still be `closing`. STACK accepts finishes for attempts already
+started. Other mechanics settle confirmed validations, configured T1MER
+rankings and already drawn raffles, not all registered players. No automatic
+raffles or new game/reward rules are introduced.
+
+The worker leaves the event `closing` until award calculations finish.
+Native rewards are allocated, not marked collected. Kivly assignment, email
+acceptance and actual collection remain separate, recoverable states.
+Existing local prizes are snapshotted into the existing award table; supported
+public participant flows expose `nativePrizes` with individually redeemable QRs.
+This does not add web gameplay to unsupported game types.
+
+`true` is allowed only after calculations finish. It preserves players,
+scores, consumed attempts, previous awards and consumed stock. A later closure
+can reward new winners without repeating a reward for the same player.
+Explicit multi-unit allocations still issue one QR per unit. Unique closure
+cycles and optimistic game revisions prevent stale jobs and concurrent
+requests from reopening or settling a different cycle. Legacy Kivly completion
+reservations are retained: confirmed or uncertain upstream writes are never
+replayed by conversion to the outbox.
+
+Owner-only `DELETE /v1/game` now **archives**, returning
+`{gameId, message: "Game archived successfully"}`. It requires `inactive` and
+no outstanding award-calculation jobs; active/closing events return 409.
+Legacy inactive events first enter the closure queue and return 409: reload
+and retry archival after settlement. `archivedAt` hides an event from the normal owner
+listing and prevents reactivation/configuration changes, but retains metadata,
+participants, awards, queued deliveries and valid prize-collection access.
+Archival is not a personal-data purge and does not free its identifier or name.
+
+`GET /v1/game?archived=true` lists only the authenticated owner's archived
+events, including every query page. The default (or `archived=false`) lists
+current events. `PUT /v1/game` with exactly `{gameId, archived:false}` restores
+an archived event **inactive**, preserving players, attempts, results, stock
+and awards. Activation remains a separate action.
+
+Permanent deletion uses owner-only `DELETE /v1/game` with exactly
+`{gameId, permanent:true, confirmation:<exact gameName>}`. It requires archival,
+inactivity, no pending prize jobs, no uncollected local awards, confirmed
+external assignments, accepted email deliveries where applicable, and no
+uncertain event-specific registration/completion writes. This does not claim
+to know whether an externally assigned Kivly reward has been physically redeemed.
+External Kivly customers/rewards, shared customer idempotency records, account
+settings/logos and global rate limits are never deleted.
+
+After checks, `deletionStartedAt` permanently prevents restoration while the
+handler deletes event-specific verification/registration records, email identity
+mappings, players, awards/jobs and media under this event's exact photo/prize/staging
+prefixes and `infocards/{gameId}/` in the INFOCARDS upload bucket. Shared content
+is untouched. Metadata/configuration writers reject archived/deleted events
+at write time, including delayed quiz/INFOCARDS generation and both steps of
+the type-blob helper, so stale requests cannot restore deleted event content.
+Auxiliary tables have no event index; this infrequent owner action
+uses paginated filtered scans, with no new index or service. Cleanup is bounded
+to 18 seconds/500 steps per request. A partial failure or `GameDeletionInProgress`
+is not success: reload and explicitly repeat the same confirmed deletion.
+Metadata is retained until completion; the final response is
+`{gameId, message:"Game permanently deleted successfully"}`. Only a technical
+`{gameId,deletedAt,isActive:false}` tombstone remains, without owner/event/player
+data, reserving the join code so old signed links cannot target a future event.
+Previously issued upload URLs can still write until their normal expiry;
+staged-prize lifecycle retention remains in force. This is event removal, not
+a regulated-erasure guarantee, and does not remove backups or AWS logs.
+
+Deploy the shared layer, game/public/score/validate/raffle functions, worker
+and its SAM permission update together before publishing the matching frontend.
+The worker uses the existing queue and one-minute recovery schedule; closing
+is asynchronous. No new table, dependency or external service is required.
 
 ## Adding a new backend game (lean checklist)
 
@@ -66,7 +585,7 @@ a table migration; configured participant and plan limits are unchanged.
 
 Instagram is not a participant registration field or game access channel.
 Participant registration uses a required full name (`username`), mandatory verified
-email, and optional phone when enabled. Existing Instagram values remain in stored records but are
+email and mandatory phone in every game. Existing Instagram values remain in stored records but are
 not requested or used by the public registration contract.
 
 `POST /v1/public/player` accepts `{ "gameId": "...", "playerToken": "..." }`
@@ -115,16 +634,23 @@ T1MER, STACK and RULET4 resolves it to this policy:
 ```json
 {
   "email": { "required": true },
-  "phone": { "required": false, "enabled": false }
+  "phone": { "required": true, "enabled": true },
+  "address": { "enabled": false },
+  "company": { "enabled": false },
+  "jobTitle": { "enabled": false },
+  "birthDate": { "enabled": false }
 }
 ```
 
 Email is always required and verified, including legacy games stored with
-`email.required: false`. Phone is never mandatory: `phone.enabled: true` requests
-an optional value; `false` ignores incoming phone values and does not store them.
-Legacy `phone.required: true` enables optional phone unless an explicit `enabled`
-overrides it. Omitted phone settings disable it. The public endpoint exposes only
-email and phone; the game configuration Lambda tolerates the historical
+`email.required: false`. Phone is always enabled and mandatory, including legacy
+disabled/optional configurations. Writes cannot disable email or phone. The four
+optional profile fields are collected only when enabled and supplied, validated
+and bound to the verification challenge; they do not modify Kivly customers.
+Registration starts with email, then missing identity/details and consent, then
+verification. Complete returning participants are not asked to fill optional fields.
+Public metadata exposes field configuration, never profile values; authenticated
+administrative responses/CSV include those values. The game configuration Lambda tolerates the historical
 `instagram` field, but the public endpoint hides and ignores it. PUT replaces the
 field configuration, filling omitted keys from defaults. Malformed configuration
 returns 400 before writes.
@@ -238,8 +764,8 @@ Authenticated `PUT /v1/game` accepts a `prizeCatalog` replacement:
 {
   "gameId": "ABC123",
   "prizeCatalog": {
-    "validation": { "name": "Gift", "limit": 10, "imageKey": "games/..." },
-    "ranking": { "name": "Top prize", "limit": null, "topX": 3, "imageKey": null },
+    "validation": { "name": "Gift", "limit": 10, "sharedPrizeId": "catalog-id" },
+    "ranking": { "name": "Top prize", "limit": null, "topX": 3, "sharedPrizeId": "catalog-id" },
     "raffle": { "name": "Raffle prize", "limit": 5, "imageKey": null }
   }
 }
@@ -251,6 +777,10 @@ STACK; raffle prizes retain the existing paid-plan availability. `name` is a
 non-empty string (up to 200 characters), `limit` is a non-negative integer or
 `null`, and ranking `topX` is an integer from 1 to 100. `imageKey` may be
 omitted to preserve that slot's existing image, or set to `null` to remove it.
+`sharedPrizeId` selects a definition from the authenticated owner's shared
+catalog; the backend resolves its canonical name/image while retaining the
+event-specific limit and ranking position. The legacy event-scoped image
+upload flow remains supported for non-shared entries.
 Client-supplied URLs and
 unknown catalog fields are rejected. Saving `{}` explicitly stores an empty
 catalog; records without a catalog remain unchanged for legacy compatibility.

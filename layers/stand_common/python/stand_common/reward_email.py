@@ -166,3 +166,74 @@ def build_message(
         filename="kivly-qr.png", disposition="inline",
     )
     return message.as_bytes()
+
+
+def build_reward_message(sender, recipient, name, prize, *, qr_value=None, wallet_links=()):
+    if not is_valid_email(recipient):
+        raise ValueError("InvalidRewardEmailContact")
+    title = prize.get("name")
+    if (not isinstance(title, str) or not title.strip() or len(title) > 200
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in title)):
+        raise ValueError("InvalidRewardEmailPrize")
+    if not isinstance(name, str) or len(name) > 200:
+        name = ""
+    links = []
+    for label, url in wallet_links:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        if (not parsed or parsed.scheme != "https" or not parsed.hostname
+                or parsed.username or parsed.password or len(url) > 4096
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in url)):
+            raise ValueError("InvalidRewardWalletLink")
+        links.append((str(label), url))
+    if qr_value is not None and (
+        not isinstance(qr_value, str) or not qr_value or len(qr_value) > 4096
+        or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in qr_value)
+    ):
+        raise ValueError("InvalidRewardQRCode")
+
+    message = EmailMessage(policy=SMTP)
+    message["From"] = sender
+    message["To"] = recipient
+    message["Subject"] = f"Tu premio STAND / Your STAND reward: {title}"
+    message.set_content(
+        f"Hola, {name}:\n\nTu premio STAND: {title}.\n\n"
+        "Muestra el QR o la tarjeta Wallet al personal del evento para recogerlo.\n"
+        "Show the QR code or Wallet pass to event staff to collect your reward.\n\n"
+        + "".join(f"{label}: {url}\n" for label, url in links)
+    )
+    link_html = "".join(
+        f'<p><a href="{escape(url, quote=True)}">{escape(label)}</a></p>' for label, url in links
+    )
+    qr_html = ""
+    qr_image = None
+    if qr_value:
+        import qrcode
+        from qrcode.image.pure import PyPNGImage
+
+        image = BytesIO()
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
+        qr.add_data(qr_value, optimize=0)
+        qr.make(fit=True)
+        qr.make_image(image_factory=PyPNGImage).save(image)
+        qr_image = image.getvalue()
+        qr_html = (
+            '<p style="font-size:16px;font-weight:bold;">Tu QR personal / Your reward QR</p>'
+            '<img src="cid:reward-qr" width="240" height="240" alt="QR del premio">'
+        )
+    message.add_alternative(
+        '<!doctype html><html lang="es"><body style="font-family:Arial,Helvetica,sans-serif;'
+        'color:#171717;max-width:600px;margin:24px auto;padding:24px;">'
+        f'<p>Hola, {escape(name)}.</p><h1>{escape(title)}</h1>'
+        '<p>Muestra tu tarjeta Wallet o este QR al personal del evento.</p>'
+        '<p>Show your Wallet pass or QR code to event staff.</p>'
+        f'{link_html}{qr_html}'
+        '<p style="font-size:12px;color:#666;">El email no refleja cambios posteriores en el estado del premio.'
+        ' / This email does not reflect later reward status changes.</p></body></html>',
+        subtype="html",
+    )
+    if qr_image is not None:
+        message.get_payload()[1].add_related(
+            qr_image, maintype="image", subtype="png", cid="<reward-qr>",
+            filename="stand-reward-qr.png", disposition="inline",
+        )
+    return message.as_bytes()

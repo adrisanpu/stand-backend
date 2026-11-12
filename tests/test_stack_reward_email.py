@@ -43,23 +43,19 @@ def test_stack_rejects_disabling_phone_on_settings_write_but_reads_old_settings(
     assert web_participant_fields("T1MER", fields)["phone"]["enabled"] is False
 
 
-def test_program_channel_validation_and_compatibility(monkeypatch):
+def test_program_channel_is_legacy_only_and_normalizes_to_wallet():
     assert prizes.upgrade_program({**PROGRAM, "deliveryChannel": "wallet"})["deliveryChannel"] == "wallet"
     old = {k: v for k, v in PROGRAM.items() if k != "deliveryChannel"}
     assert prizes.upgrade_program(old)["deliveryChannel"] == "wallet"
     for channel in ("both", None, [], True):
         with pytest.raises(prizes.PrizeError, match="InvalidStackDeliveryChannel"):
             prizes.validate_program({**PROGRAM, "deliveryChannel": channel}, {}, None, [], True)
-    with pytest.raises(prizes.PrizeError, match="RewardEmailUnavailable"):
-        prizes.validate_program({**PROGRAM, "deliveryChannel": "email"}, {}, None, [], True)
-    monkeypatch.setenv("STACK_REWARD_EMAIL_ENABLED", "true")
-    monkeypatch.setattr(prizes.registration, "account_game_settings", lambda *_: {"enabled": True})
     result = prizes.validate_program({**PROGRAM, "deliveryChannel": "email"}, {}, {"locationId": "loc"},
                                      [{"id": "r1", "name": "Coffee"}], True)
-    assert result["deliveryChannel"] == "email"
+    assert result["deliveryChannel"] == "wallet"
 
 
-def test_channel_is_pinned_at_start_not_at_award_or_game_close(rig):
+def test_legacy_email_channel_is_normalized_to_wallet(rig):
     game = {**meta(rig), "stackPrizeProgram": {**PROGRAM, "deliveryChannel": "email"}}
     rig.Table("games").put_item(Item=game)
     prizes.start(rig, game, player(rig), ATTEMPT)
@@ -69,7 +65,7 @@ def test_channel_is_pinned_at_start_not_at_award_or_game_close(rig):
     for condition in ("completed", "top_finish", "top_final", "raffle"):
         row = prizes.award_units(game, current, {"id": "rule", "condition": condition},
                                  PROGRAM["catalog"][1], 1)[0]
-        assert row["deliveryChannel"] == "email"
+        assert row["deliveryChannel"] == "wallet"
     assert prizes.wallet_link(rig, game, current) is None
 
 
@@ -78,10 +74,12 @@ def email_rig(rig, monkeypatch):
     worker = delivery_module(monkeypatch, rig)
     monkeypatch.setenv("STACK_REWARD_EMAIL_ENABLED", "true")
     monkeypatch.setenv("EMAIL_SENDER_ADDRESS", "no-reply@example.test")
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://api.example.test/prod")
+    monkeypatch.setenv("PLAYER_TOKEN_SECRET", "test-token-secret")
     monkeypatch.setattr(worker, "BotoCoreError", OSError)
     current = player(rig)
-    current.update(email="verified@example.test", emailVerifiedAt="2026-10-30T00:00:00Z",
-                   phone="+34 111111111")
+    current.update(email="verified@example.test", verifiedAt="2026-10-30T00:00:00Z",
+                   verificationMethod="email-code", phone="+34 111111111")
     current["type"]["STACK"]["attempt"] = {"prizeProgram": {**PROGRAM, "deliveryChannel": "email"}}
     rig.Table("players").put_item(Item=current)
     row = prizes.award_units(meta(rig), current, PROGRAM["rules"][0], PROGRAM["catalog"][1], 1)[0]
@@ -91,7 +89,7 @@ def email_rig(rig, monkeypatch):
     client.get_customer.return_value = {
         "id": "customer", "is_active": True, "phone": "+34 999999999",
     }
-    client.get_context.return_value = MagicMock(location_name="Club & Pizza")
+    client.get_context.return_value = MagicMock(location_name="Club & Pizza", location_id="loc", owner_id="owner")
     ses.send_raw_email.return_value = {"MessageId": "message-1"}
     monkeypatch.setattr(worker.registration, "connection", lambda *_: {"locationId": "loc", "ownerId": "owner"})
     monkeypatch.setattr(worker.registration, "_client", lambda *_: client)
@@ -99,6 +97,10 @@ def email_rig(rig, monkeypatch):
                 "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc",
                 TEST_LOGO_PNG)
     monkeypatch.setattr(worker, "_email_branding", lambda *_: branding)
+    monkeypatch.setattr(
+        worker, "_kivly_wallet_link",
+        lambda *_: "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc",
+    )
     monkeypatch.setattr(worker.boto3, "client", lambda *_, **__: ses)
     return worker, rig, row, client, ses
 
@@ -112,21 +114,50 @@ def process(worker, row):
     assert worker.lambda_handler(event, None) == {"batchItemFailures": []}
 
 
-def test_email_is_sent_after_earn_once_using_kivly_phone_not_form(email_rig, monkeypatch):
+def test_survey_holds_kivly_assignment_and_email_then_releases_once(email_rig):
     worker, rig, row, client, ses = email_rig
-    payloads = []
-    original = qrcode.QRCode.add_data
-    def capture(self, data, *args, **kwargs):
-        payloads.append(data)
-        return original(self, data, *args, **kwargs)
-    monkeypatch.setattr(qrcode.QRCode, "add_data", capture)
+    game = meta(rig)
+    game["formConfig"] = {"quizMoment": "prize"}
+    rig.Table("games").put_item(Item=game)
+    process(worker, row)
+    assert stored(rig, row)["state"] == "queued"
+    assert stored(rig, row)["work"] == "pending"
+    client.earn_reward.assert_not_called()
+    ses.send_raw_email.assert_not_called()
+    current = player(rig)
+    current["type"]["STACK"]["quizCompleted"] = True
+    rig.Table("players").put_item(Item=current)
+    process(worker, row)
+    process(worker, row)
+    process(worker, row)
+    client.earn_reward.assert_called_once()
+    ses.send_raw_email.assert_called_once()
+    assert stored(rig, row)["emailState"] == "accepted"
+
+
+def test_survey_holds_stand_email_without_losing_award(email_rig):
+    worker, rig, _, _, ses = email_rig
+    game = meta(rig)
+    game["formConfig"] = {"quizMoment": "prize"}
+    rig.Table("games").put_item(Item=game)
+    row = prizes.award_units(game, player(rig), PROGRAM["rules"][0], PROGRAM["catalog"][0], 1)[0]
+    rig.Table("prizes").put_item(Item=row)
+    process(worker, row)
+    assert stored(rig, row)["state"] == "available"
+    assert stored(rig, row)["emailState"] == "pending"
+    ses.send_raw_email.assert_not_called()
+    with pytest.raises(prizes.PrizeError, match="QuizRequired"):
+        prizes.redeem(rig, game["gameId"], 1, row["id"])
+
+
+def test_email_is_sent_after_earn_once_with_kivly_wallet_link(email_rig):
+    worker, rig, row, client, ses = email_rig
     process(worker, row)
     ses.send_raw_email.assert_not_called()
     assert stored(rig, row)["state"] == "confirmed"
     assert stored(rig, row)["work"] == "pending"
     process(worker, row)
     process(worker, row)
-    assert payloads == ["+34 999999999"]
     assert stored(rig, row)["emailState"] == "accepted"
     assert stored(rig, row)["emailMessageId"] == "message-1"
     assert stored(rig, row)["emailAcceptedAt"]
@@ -139,20 +170,73 @@ def test_email_is_sent_after_earn_once_using_kivly_phone_not_form(email_rig, mon
     assert sent["Destinations"] == ["verified@example.test"]
     message = BytesParser(policy=policy.default).parsebytes(sent["RawMessage"]["Data"])
     html = message.get_body(preferencelist=("html",)).get_content()
-    assert "Club &amp; Pizza" in html
+    assert "Kivly Wallet" in html
     assert "add-to-wallet?customer_id=customer&amp;location_id=loc" in html
-    assert "cid:club-logo" in html and "cid:reward-qr" in html
-    qr_payload = next(part for part in message.walk()
-                      if part.get_content_type() == "image/png"
-                      and str(part["Content-ID"]) == "<reward-qr>")
-    assert qr_payload.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
+    assert "cid:club-logo" not in html and "cid:reward-qr" not in html
     public = prizes.public_awards(rig, meta(rig), player(rig), lambda _: "token")
-    assert public["walletUrl"] is None and public["walletExpected"] is False
+    assert public["walletUrl"] == "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc"
+    assert public["walletExpected"] is True
     assert public["awards"][0]["emailState"] == "accepted"
     owner = json.loads(stack_prize_api.response(rig, meta(rig))["body"])
     assert owner["awards"][0]["emailAcceptedAt"] == stored(rig, row)["emailAcceptedAt"]
     assert "+34" not in json.dumps(public)
     assert "verified@example.test" not in json.dumps(public)
+
+
+def test_stand_award_email_includes_wallet_passes_and_redeem_qr(email_rig):
+    worker, rig, _, client, ses = email_rig
+    row = prizes.award_units(
+        meta(rig), player(rig), PROGRAM["rules"][0], PROGRAM["catalog"][0], 1,
+    )[0]
+    rig.Table("prizes").put_item(Item=row)
+
+    process(worker, row)
+
+    saved = stored(rig, row)
+    assert saved["state"] == "available"
+    assert saved["emailState"] == "accepted"
+    client.earn_reward.assert_not_called()
+    ses.send_raw_email.assert_called_once()
+    sent = ses.send_raw_email.call_args.kwargs
+    message = BytesParser(policy=policy.default).parsebytes(sent["RawMessage"]["Data"])
+    html = message.get_body(preferencelist=("html",)).get_content()
+    text = message.get_body(preferencelist=("plain",)).get_content()
+    assert "Apple Wallet" in html and "Google Wallet" in html
+    assert "/v1/public/wallet/pass?" in text
+    qr_image = next(part for part in message.walk()
+                    if part.get_content_type() == "image/png"
+                    and str(part["Content-ID"]) == "<reward-qr>")
+    assert qr_image.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize("game_type", [
+    "EMPAREJA2", "T1MER", "STACK", "RULET4", "L3TRAS",
+    "CUPIDO", "SEMAFORO", "INFOCARDS", "IMPOSTOR",
+])
+def test_native_stand_reward_email_uses_shared_format_for_every_game(email_rig, game_type):
+    worker, rig, _, _, ses = email_rig
+    game = meta(rig)
+    game["gameType"] = game_type
+    rig.Table("games").put_item(Item=game)
+    row = {
+        "gameId": game["gameId"], "id": "award_" + "0" * 64,
+        "playerId": 1, "ownerUserId": game["ownerUserId"],
+        "prize": {"source": "stand", "name": "Coffee"},
+        "state": "available", "emailState": "pending", "work": "pending", "dueAt": 0,
+    }
+    rig.Table("prizes").put_item(Item=row)
+
+    process(worker, row)
+
+    assert stored(rig, row)["emailState"] == "accepted"
+    ses.send_raw_email.assert_called_once()
+    message = BytesParser(policy=policy.default).parsebytes(
+        ses.send_raw_email.call_args.kwargs["RawMessage"]["Data"],
+    )
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert "Tu premio STAND / Your STAND reward: Coffee" in str(message["Subject"])
+    assert "Coffee" in html
+    assert "Your reward QR" in html
 
 
 def test_mail_has_inline_png_text_and_escaped_content():
@@ -266,21 +350,26 @@ def test_club_mail_rejects_invalid_club_name(club):
 
 
 @pytest.mark.parametrize("phone", [None, "", "invalid"])
-def test_missing_kivly_phone_never_falls_back_to_form_or_reassigns(email_rig, phone):
+def test_kivly_reward_email_does_not_require_phone(email_rig, phone):
     worker, rig, row, client, ses = email_rig
     client.get_customer.return_value["phone"] = phone
     process(worker, row)
     process(worker, row)
     assert stored(rig, row)["state"] == "confirmed"
-    assert stored(rig, row)["emailError"] == "KivlyPhoneRequired"
-    ses.send_raw_email.assert_not_called()
+    assert stored(rig, row)["emailState"] == "accepted"
+    assert "emailError" not in stored(rig, row)
+    ses.send_raw_email.assert_called_once()
     client.earn_reward.assert_called_once()
 
 
-def test_unverified_address_cannot_receive_reward_email(email_rig):
+@pytest.mark.parametrize("method", [None, "sms-code", "email-code"])
+def test_unverified_address_cannot_receive_reward_email(email_rig, method):
     worker, rig, row, client, ses = email_rig
     current = player(rig)
-    del current["emailVerifiedAt"]
+    if method == "email-code":
+        del current["verifiedAt"]
+    else:
+        current["verificationMethod"] = method
     rig.Table("players").put_item(Item=current)
     process(worker, row)
     process(worker, row)
@@ -350,16 +439,17 @@ def test_throttling_retries_are_bounded_without_reassigning(email_rig):
 
 def test_operator_can_retry_failed_email_after_fix_without_earning_again(email_rig, monkeypatch):
     worker, rig, row, client, ses = email_rig
-    client.get_customer.return_value["phone"] = None
     process(worker, row)
+    original_link = worker._kivly_wallet_link
+    monkeypatch.setattr(worker, "_kivly_wallet_link", lambda *_: (_ for _ in ()).throw(worker.RewardEmailAssetError()))
     process(worker, row)
+    monkeypatch.setattr(worker, "_kivly_wallet_link", original_link)
     monkeypatch.setattr(stack_prize_api, "_get_claims", lambda _: {"sub": "owner"})
     monkeypatch.setattr(stack_prize_api, "ClientError", FakeDynamoError)
     body = {"gameId": row["gameId"], "action": "retry_email", "awardId": row["id"]}
     event = {"body": json.dumps(body)}
     response = stack_prize_api.handle(event, "POST", rig, lambda _: True, None)
     assert response["statusCode"] == 200
-    client.get_customer.return_value["phone"] = "+34123456789"
     process(worker, row)
     assert stored(rig, row)["emailState"] == "accepted"
     assert stack_prize_api.handle(event, "POST", rig, lambda _: True, None)["statusCode"] == 409
@@ -367,14 +457,14 @@ def test_operator_can_retry_failed_email_after_fix_without_earning_again(email_r
     ses.send_raw_email.assert_called_once()
 
 
-def test_wallet_awards_never_send_email(email_rig):
+def test_kivly_awards_send_email_independently_of_wallet_channel(email_rig):
     worker, rig, row, client, ses = email_rig
     row["deliveryChannel"] = "wallet"
     rig.Table("prizes").put_item(Item=row)
     process(worker, row)
     process(worker, row)
-    assert "work" not in stored(rig, row)
-    ses.send_raw_email.assert_not_called()
+    assert stored(rig, row)["emailState"] == "accepted"
+    ses.send_raw_email.assert_called_once()
 
 
 def test_disabled_email_remains_pending_and_does_not_send(email_rig, monkeypatch):
@@ -391,9 +481,9 @@ def test_email_is_blocked_until_confirmed_and_pending_marker_cannot_earn(email_r
     worker, rig, row, client, ses = email_rig
     row["customerId"] = "pending-reconciliation"
     rig.Table("players").put_item(Item={
-        **player(rig), "kivlyMembership": {
+        **player(rig), "kivly": {"membership": {
             "locationId": "loc", "customerId": "pending-reconciliation",
-        },
+        }},
     })
     worker.deliver(row)
     saved = stored(rig, row)
@@ -422,7 +512,7 @@ def test_missing_branded_assets_fail_without_sending_or_fallback(email_rig, monk
     worker, rig, row, client, ses = email_rig
     def missing_branding(*_):
         raise worker.RewardEmailAssetError()
-    monkeypatch.setattr(worker, "_email_branding", missing_branding)
+    monkeypatch.setattr(worker, "_kivly_wallet_link", missing_branding)
     process(worker, row)
     process(worker, row)
     saved = stored(rig, row)
@@ -439,8 +529,8 @@ def test_award_email_state_is_blocked_before_confirmation(rig):
     row = prizes.award_units(meta(rig), player_row, {"id": "done", "condition": "completed"},
                              PROGRAM["catalog"][1], 1)[0]
     assert row["state"] == "queued"
-    assert row["emailState"] == "blocked"
-    assert prizes.email_delivery_state(row) == "blocked"
+    assert "emailState" not in row
+    assert prizes.email_delivery_state(row) is None
 
 
 def test_selected_owner_logo_is_required_and_owner_scoped(rig, monkeypatch):

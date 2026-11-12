@@ -15,6 +15,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import BotoCoreError, ClientError
 
 from stand_common import kivly_registration as registration
+from stand_common import prize_inventory
 from stand_common.kivly import reward_image_url
 from stand_common.prizes import prize_image_key
 from stand_common.stack import get_ranking
@@ -87,6 +88,22 @@ def records(dynamo, game_id):
 
 def transact(dynamo, operations):
     # The resource client applies its Dynamo serializer to native Python values.
+    if prize_inventory.enabled():
+        awards = [op["Put"]["Item"] for op in operations if "Put" in op
+                  and op["Put"]["TableName"] == os.environ["STACK_PRIZES_TABLE"]
+                  and op["Put"]["Item"].get("id", "").startswith("award_")]
+        if awards:
+            meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+                Key={"gameId": awards[0]["gameId"]}, ConsistentRead=True,
+            ).get("Item")
+            if not meta or not meta.get("ownerUserId"):
+                raise PrizeError("GameNotFound", 404)
+            try:
+                operations = [*operations, *prize_inventory.award_operations(dynamo, meta, awards)]
+            except prize_inventory.InventoryError as exc:
+                raise PrizeError(exc.code, exc.status) from None
+        if len(operations) > 100:
+            raise PrizeError("InventoryTransactionTooLarge", 400)
     try:
         dynamo.meta.client.transact_write_items(TransactItems=operations)
     except ClientError as exc:
@@ -142,7 +159,8 @@ def legacy_program(meta):
             continue
         catalog.append({"id": "legacy_" + slot, "source": "stand", "name": prize["name"],
                         "stockTotal": 1000,
-                        "imageKey": prize.get("imageKey"), "limit": prize.get("limit")})
+                        "imageKey": prize.get("imageKey"), "limit": prize.get("limit"),
+                        **({"sharedPrizeId": prize["sharedPrizeId"]} if prize.get("sharedPrizeId") else {})})
         rule = {"id": "legacy_" + slot, "condition": condition, "mode": "all",
                 "allocations": [{"prizeId": "legacy_" + slot, "quantity": 1}]}
         if slot == "ranking":
@@ -161,8 +179,10 @@ def legacy_program(meta):
 def upgrade_program(raw):
     if not isinstance(raw, dict):
         raise PrizeError("InvalidStackPrizeProgram", 400)
+    if raw.get("deliveryChannel", "wallet") not in ("wallet", "email"):
+        raise PrizeError("InvalidStackDeliveryChannel", 400)
     if raw.get("version") == 3:
-        return {**deepcopy(raw), "deliveryChannel": raw.get("deliveryChannel", "wallet")}
+        return {**deepcopy(raw), "deliveryChannel": "wallet"}
     if raw.get("version") not in (1, 2):
         raise PrizeError("InvalidStackPrizeProgram", 400)
     if not isinstance(raw.get("catalog"), list) or not isinstance(raw.get("rules"), list):
@@ -201,23 +221,16 @@ def upgrade_program(raw):
         })
     return {"version": 3, "catalog": catalog, "rules": rules,
             "storefrontUrl": raw.get("storefrontUrl", ""),
-            "deliveryChannel": raw.get("deliveryChannel", "wallet")}
+            "deliveryChannel": "wallet"}
 
 
-def validate_program(raw, meta, conn, rewards, raffles_enabled):
+def validate_program(raw, meta, conn, rewards, raffles_enabled, shared_catalog=None):
     if (not isinstance(raw, dict) or set(raw) - {"version", "catalog", "rules", "storefrontUrl", "deliveryChannel"}
             or not {"version", "catalog", "rules", "storefrontUrl"} <= set(raw)):
         raise PrizeError("InvalidStackPrizeProgram", 400)
     if type(raw["version"]) is not int:
         raise PrizeError("InvalidStackPrizeProgram", 400)
     raw = upgrade_program(raw)
-    if raw["deliveryChannel"] not in ("wallet", "email"):
-        raise PrizeError("InvalidStackDeliveryChannel", 400)
-    if raw["deliveryChannel"] == "email":
-        if os.environ.get("STACK_REWARD_EMAIL_ENABLED", "false").lower() != "true":
-            raise PrizeError("RewardEmailUnavailable", 503)
-        if not conn or not registration.account_game_settings(meta, conn)["enabled"]:
-            raise PrizeError("KivlyConnectionRequired")
     if (raw["version"] != 3
             or not isinstance(raw["storefrontUrl"], str)
             or not isinstance(raw["catalog"], list) or len(raw["catalog"]) > 32):
@@ -226,7 +239,7 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
         raise PrizeError("InvalidStackPrizeRules", 400)
     result = {"version": 3, "catalog": [], "rules": [],
               "storefrontUrl": storefront(raw["storefrontUrl"]) if raw["storefrontUrl"] else "",
-              "deliveryChannel": raw["deliveryChannel"]}
+              "deliveryChannel": "wallet"}
     previous = upgrade_program(meta.get("stackPrizeProgram") or legacy_program(meta))
     previous_catalog = {p["id"]: p for p in previous["catalog"]}
     previous_rules = {r["id"]: r for r in previous["rules"]}
@@ -241,20 +254,28 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
             raise PrizeError("InvalidStackPrizeName", 400)
         value = {"id": prize["id"], "source": prize.get("source"), "name": name.strip()}
         stock_total = prize.get("stockTotal")
-        if type(stock_total) is not int or not 1 <= stock_total <= 1000:
+        if stock_total is not None and (type(stock_total) is not int or not 0 <= stock_total <= 1000):
             raise PrizeError("InvalidStackPrizeStock", 400)
         value["stockTotal"] = stock_total
         if value["source"] == "stand":
-            if set(prize) - {"id", "source", "name", "imageKey", "imageUrl", "limit", "stockTotal"}:
+            if set(prize) - {"id", "source", "name", "imageKey", "imageUrl", "limit", "stockTotal", "sharedPrizeId"}:
                 raise PrizeError("InvalidStackPrize", 400)
-            key = prize.get("imageKey")
-            if key and not any(prize_image_key(meta["ownerUserId"], meta["gameId"], slot, key)
-                               for slot in ("ranking", "raffle", "validation")):
+            shared_id = prize.get("sharedPrizeId")
+            shared = next((entry for entry in shared_catalog or []
+                           if isinstance(entry, dict) and entry.get("id") == shared_id), None) if shared_id else None
+            if shared_id and not shared:
+                raise PrizeError("InvalidStackSharedPrize", 400)
+            key = shared.get("imageKey") if shared else prize.get("imageKey")
+            if key and not shared and not any(prize_image_key(meta["ownerUserId"], meta["gameId"], slot, key)
+                                              for slot in ("ranking", "raffle", "validation")):
                 raise PrizeError("InvalidStackPrizeImage", 400)
             limit = prize.get("limit")
             if limit is not None and (type(limit) is not int or limit < 0):
                 raise PrizeError("InvalidStackPrizeLimit", 400)
-            value.update(imageKey=key, limit=limit)
+            value.update(name=shared["name"] if shared else name.strip(),
+                         imageKey=key, limit=limit)
+            if shared:
+                value["sharedPrizeId"] = shared_id
         elif value["source"] == "kivly":
             if set(prize) - {"id", "source", "name", "rewardId", "locationId", "stockTotal", "imageUrl", "imageKey"}:
                 raise PrizeError("InvalidStackPrize", 400)
@@ -279,7 +300,7 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled):
             raise PrizeError("InvalidStackPrizeSource", 400)
         # An award's identity cannot be reused for a different product.
         old = previous_catalog.get(value["id"])
-        if old and any(old.get(k) != value.get(k) for k in ("source", "rewardId", "locationId")):
+        if old and any(old.get(k) != value.get(k) for k in ("source", "rewardId", "locationId", "sharedPrizeId")):
             raise PrizeError("StackPrizeIdentityChanged", 400)
         result["catalog"].append(value)
     rule_ids = set()
@@ -340,10 +361,12 @@ def image_url(prize, meta=None):
     if prize.get("source") == "kivly" and "imageKey" not in prize:
         return reward_image_url(prize.get("imageUrl"))
     key = prize.get("imageKey")
-    if prize.get("source") not in ("stand", "kivly") or (key and meta and not any(
+    game_key = key and meta and any(
         prize_image_key(meta["ownerUserId"], meta["gameId"], slot, key)
         for slot in ("ranking", "raffle", "validation")
-    )):
+    )
+    shared_key = key and meta and prize.get("sharedPrizeId") and key.startswith(f"prizes/{meta['ownerUserId']}/")
+    if prize.get("source") not in ("stand", "kivly") or (key and meta and not (game_key or shared_key)):
         return None
     return boto3.client("s3").generate_presigned_url(
         "get_object", Params={"Bucket": os.environ["USER_MEDIA_BUCKET"], "Key": key}, ExpiresIn=3600,
@@ -411,7 +434,7 @@ def initial_stock(program, existing_awards=()):
             awarded[prize["id"]] = awarded.get(prize["id"], 0) + 1
     return {
         p["id"]: {"total": p["stockTotal"],
-                  "remaining": max(0, p["stockTotal"] - awarded.get(p["id"], 0))}
+                  "remaining": prize_inventory.MAX_UNITS if p["stockTotal"] is None else max(0, p["stockTotal"] - awarded.get(p["id"], 0))}
         for p in upgrade_program(program)["catalog"]
     }
 
@@ -429,15 +452,15 @@ def updated_stock(meta, program, existing_awards=()):
     for prize in program["catalog"]:
         old = current.get(prize["id"])
         if old:
-            consumed = max(0, old["total"] - old["remaining"])
-            if prize["stockTotal"] < consumed:
+            consumed = awarded.get(prize["id"], 0) if old["total"] is None else max(0, old["total"] - old["remaining"])
+            if prize["stockTotal"] is not None and prize["stockTotal"] < consumed:
                 raise PrizeError("StackPrizeStockBelowAwarded", 409)
-            remaining = prize["stockTotal"] - consumed
+            remaining = prize_inventory.MAX_UNITS if prize["stockTotal"] is None else prize["stockTotal"] - consumed
         else:
             consumed = awarded.get(prize["id"], 0)
-            if prize["stockTotal"] < consumed:
+            if prize["stockTotal"] is not None and prize["stockTotal"] < consumed:
                 raise PrizeError("StackPrizeStockBelowAwarded", 409)
-            remaining = prize["stockTotal"] - consumed
+            remaining = prize_inventory.MAX_UNITS if prize["stockTotal"] is None else prize["stockTotal"] - consumed
         result[prize["id"]] = {"total": prize["stockTotal"], "remaining": remaining}
     return result
 
@@ -498,15 +521,25 @@ def award_units(meta, player, rule, prize, quantity, job_id=None):
                "condition": rule["condition"], "prize": prize, "createdAt": _iso_now(),
                "ownerUserId": meta["ownerUserId"],
                "state": "available" if prize["source"] == "stand" else "queued"}
+        legacy_blob = get_game_type_blob(player, "STACK")
+        if prize["id"] == "legacy_ranking" and legacy_blob.get("rankingPrizeDelivered"):
+            row["state"] = "delivered"
+        if prize["id"] == "legacy_raffle" and legacy_blob.get("prizeDelivered"):
+            row["state"] = "delivered"
         if prize["source"] == "kivly":
-            row["deliveryChannel"] = delivery_channel(player)
-            if row["deliveryChannel"] == "email":
-                row["emailState"] = "blocked"
-            membership = player.get("kivlyMembership") or {}
+            row["deliveryChannel"] = "wallet"
+            membership = (player.get("kivly") or {}).get("membership") or {}
             if membership.get("locationId") != prize["locationId"] or not membership.get("customerId"):
                 row["state"] = "connection_required"
+                row["emailState"] = "blocked"
             else:
-                row.update(customerId=membership["customerId"], work="pending", dueAt=0)
+                row["customerId"] = membership["customerId"]
+                row["work"] = "pending"
+                row["dueAt"] = 0
+        elif prize["source"] == "stand" and row["state"] == "available":
+            row["emailState"] = "pending"
+            row["work"] = "pending"
+            row["dueAt"] = 0
         rows.append(row)
     return rows
 
@@ -516,7 +549,37 @@ def allocation_id(job_id, player_id, rule_id):
     return "allocation_" + digest
 
 
-def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existing_records=None, score=None):
+def legacy_reward_reservations(dynamo, meta, player, units):
+    operations = []
+    if "prizeProgram" in get_game_type_blob(player, "STACK").get("attempt", {}):
+        return operations
+    for row in units:
+        if row["prize"]["id"] != "legacy_kivly":
+            continue
+        name = os.environ.get("KIVLY_REGISTRATION_TABLE")
+        if not name:
+            raise PrizeError("KivlyRegistrationUnavailable", 503)
+        key = {"id": f"reward:{meta['gameId']}:{player['playerId']}"}
+        previous = dynamo.Table(name).get_item(Key=key, ConsistentRead=True).get("Item")
+        if previous:
+            row["state"] = "confirmed" if (
+                previous.get("state") == "confirmed"
+                and previous.get("rewardId") == row["prize"]["rewardId"]
+                and previous.get("locationId") == row["prize"]["locationId"]
+                and previous.get("customerId") == row.get("customerId")
+            ) else "reconciliation_required"
+            row.pop("work", None)
+            row.pop("dueAt", None)
+        elif not prize_inventory.enabled():
+            reservation = {**key, "state": "pending", "name": row["prize"]["name"],
+                           "rewardId": row["prize"]["rewardId"], "locationId": row["prize"]["locationId"],
+                           "customerId": row.get("customerId"), "createdAt": _iso_now()}
+            operations.append({"Put": {"TableName": name, "Item": reservation,
+                                      "ConditionExpression": "attribute_not_exists(id)"}})
+    return operations
+
+
+def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existing_records=None, score=None, _attempt=0):
     program = upgrade_program(program)
     rule = next(r for r in program["rules"] if r["id"] == rule["id"])
     if rule["condition"] == "score" and not score_matches(rule, score):
@@ -533,18 +596,27 @@ def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existi
     ).get("Item")
     if not current_meta:
         raise PrizeError("GameNotFound", 404)
-    existing_records = existing_records if existing_records is not None else records(dynamo, meta["gameId"])
+    if any(current_meta.get(key) for key in ("archivedAt", "deletionStartedAt", "deletedAt")):
+        return
+    existing_records = records(dynamo, meta["gameId"])
     stock = current_meta.get("stackPrizeStock") or initial_stock(program, existing_records)
+    local_stock = stock
+    global_stock = prize_inventory.capacity(dynamo, meta["ownerUserId"], program["catalog"], current_meta)
+    if global_stock is not None:
+        stock = {pid: {**value, "remaining": min(value["remaining"], global_stock.get(pid, {}).get("remaining", 0))}
+                 for pid, value in stock.items()}
     catalog = {p["id"]: p for p in program["catalog"]}
     prize_ids = {a["prizeId"] for g in rule["groups"] for a in g["allocations"]}
     already_awarded = [
         row for row in existing_records
         if row.get("id", "").startswith("award_")
         and int(row.get("playerId", -1)) == int(player["playerId"])
-        and row.get("ruleId") == rule["id"]
         and (row.get("prize") or {}).get("id") in prize_ids
     ]
-    if already_awarded:
+    if already_awarded and (
+        any(row.get("ruleId") == rule["id"] for row in already_awarded)
+        or prize_ids.issubset({row["prize"]["id"] for row in already_awarded})
+    ):
         grouped = {}
         for row in already_awarded:
             prize_id = row["prize"]["id"]
@@ -556,43 +628,86 @@ def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existi
                       for pid, quantity in grouped.items()
                   ], "state": "allocated", "createdAt": _iso_now()}
         transact(dynamo, [
-            game_update(current_meta, ", stackPrizeStock = :stock", {":stock": stock}),
+            game_update(current_meta, ", stackPrizeStock = :stock", {":stock": local_stock}),
             put(ledger),
         ])
         return
     rank_eligible = any(eligible_allocations(g, catalog, rank) for g in rule["groups"])
-    selected = select_group(rule, catalog, stock, rank)
-    new_stock = dict(stock)
+    selection_stock = dict(stock)
+    for row in already_awarded:
+        pid = row["prize"]["id"]
+        selection_stock[pid] = {**stock.get(pid, {}), "remaining": sum(
+            allocation["quantity"] for group in rule["groups"] for allocation in group["allocations"]
+            if allocation["prizeId"] == pid
+        )}
+    selected = select_group(rule, catalog, selection_stock, rank)
+    considered = {a["prizeId"] for a in selected} if selected else prize_ids
+    inventory_reasons = {
+        pid: "EventLimitReached" if local_stock[pid]["remaining"] <= 0 else global_stock[pid]["reason"]
+        for pid in considered if local_stock[pid]["remaining"] <= 0
+        or global_stock is not None and global_stock[pid]["reason"]
+    } if rank_eligible else {}
+    new_stock = dict(local_stock)
     units = []
     requested = []
+    global_remaining = {}
+    if global_stock is not None:
+        global_remaining = {entry["prizeId"]: entry["remaining"] for entry in global_stock.values()}
     for allocation in selected:
         pid = allocation["prizeId"]
+        if any(row["prize"]["id"] == pid for row in already_awarded):
+            continue
         prize = catalog[pid]
         requested.append({"prizeId": pid, "quantity": allocation["quantity"]})
         available = stock.get(pid, {}).get("remaining", prize["stockTotal"])
+        global_pid = global_stock[pid]["prizeId"] if global_stock is not None else None
+        if global_stock is not None:
+            available = min(available, global_remaining.get(global_pid, 0))
         quantity = min(allocation["quantity"], max(0, available))
+        if quantity < allocation["quantity"]:
+            inventory_reasons[pid] = ("EventLimitReached"
+                if local_stock[pid]["remaining"] < allocation["quantity"]
+                else global_stock[pid]["reason"] or "EventLimitReached")
         if quantity == 0:
             continue
-        new_stock[pid] = {"total": stock.get(pid, {}).get("total", prize["stockTotal"]),
-                          "remaining": available - quantity}
+        if global_stock is not None:
+            global_remaining[global_pid] -= quantity
+        new_stock[pid] = {"total": local_stock.get(pid, {}).get("total", prize["stockTotal"]),
+                          "remaining": local_stock[pid]["remaining"] - quantity}
         units.extend(award_units(meta, player, rule, prize, quantity, job_id))
     grouped = {}
     for row in units:
         pid = row["prize"]["id"]
         grouped[pid] = grouped.get(pid, 0) + 1
+    reservations = legacy_reward_reservations(dynamo, meta, player, units)
     ledger = {"gameId": meta["gameId"], "id": key["id"], "kind": "allocation",
               "playerId": int(player["playerId"]), "ruleId": rule["id"],
               "requested": requested, "awarded": [
                   {"prizeId": pid, "quantity": quantity, "name": catalog[pid]["name"]}
                   for pid, quantity in grouped.items()
               ], "state": "allocated" if units else "out_of_stock" if rank_eligible else "not_eligible",
+              "inventoryReasons": inventory_reasons,
               "createdAt": _iso_now()}
     # One rule can create at most 8 * 10 unit rows, leaving room below DynamoDB's
     # 100-operation transaction limit for the stock reservation and ledger.
-    transact(dynamo, [
+    operations = [
         game_update(current_meta, ", stackPrizeStock = :stock", {":stock": new_stock}),
-        put(ledger), *[put(row) for row in units],
-    ])
+        put(ledger), *[put(row) for row in units], *reservations,
+    ]
+    if any(row["prize"]["id"] in {"legacy_ranking", "legacy_raffle"} for row in units):
+        operations.append({"Update": {
+            "TableName": os.environ["GAMEPLAYER_TABLE"],
+            "Key": {"gameId": meta["gameId"], "playerId": player["playerId"]},
+            "UpdateExpression": "SET #t = :snapshot", "ConditionExpression": "#t = :snapshot",
+            "ExpressionAttributeNames": {"#t": "type"},
+            "ExpressionAttributeValues": {":snapshot": player.get("type", {})},
+        }})
+    try:
+        transact(dynamo, operations)
+    except PrizeError as exc:
+        if _attempt < 2 and exc.code in ("StackPrizeConflict", "InventoryChanged", "EventLimitReached"):
+            return allocate_rule(dynamo, meta, player, program, rule, job_id, rank, score=score, _attempt=_attempt + 1)
+        raise
     for row in units:
         if row.get("work") == "pending":
             enqueue(row)
@@ -658,14 +773,8 @@ def close(dynamo, meta, excluded):
     if meta.get("stackPrizeState") == "closed":
         return
     if meta.get("stackPrizeState", "open") == "open":
-        task = {"gameId": meta["gameId"], "id": "close", "kind": "close", "work": "pending", "dueAt": 0}
-        expression, values = ", stackPrizeState = :state", {":state": "closing"}
-        if "stackPrizeProgram" not in meta:
-            program = upgrade_program(legacy_program(meta))
-            expression += ", stackPrizeProgram = :program, stackPrizeStock = :stock"
-            values.update({":program": program, ":stock": initial_stock(
-                program, records(dynamo, meta["gameId"]))})
-        transact(dynamo, [game_update(meta, expression, values), put(task)])
+        from stand_common import game_lifecycle
+        game_lifecycle.change_active(dynamo, meta, False)
         raise PrizeError("StackClosingStarted")
     all_players = players(dynamo, meta["gameId"])
     pending = [p for p in all_players if get_game_type_blob(p, "STACK").get("attempt", {}).get("status") == "started"]
@@ -687,15 +796,35 @@ def close(dynamo, meta, excluded):
     if pending_ids - set(excluded):
         return
     ranking = get_ranking(meta["gameId"], dynamo.Table(os.environ["GAMEPLAYER_TABLE"]), None)["results"]
-    task = job(meta, "top_final", [{"playerId": r["playerId"], "rank": r["rank"]}
-                                 for r in ranking[:100]])
+    cycle = meta.get("closeCycle")
+    chunks = [ranking[index:index + 100] for index in range(0, len(ranking), 100)] or [[]]
+    for index, chunk in enumerate(chunks):
+        task = job(meta, "top_final", [{"playerId": r["playerId"], "rank": r["rank"], "score": r["score"]}
+                                     for r in chunk])
+        task["id"] = "job_" + hashlib.sha256(json.dumps([
+            meta["gameId"], meta.get("closeCycle", "legacy"), "closure", index,
+        ]).encode()).hexdigest()
+        task["closure"] = True
+        if not table(dynamo).get_item(
+            Key={"gameId": meta["gameId"], "id": task["id"]}, ConsistentRead=True,
+        ).get("Item"):
+            transact(dynamo, [game_update(meta, ""), put(task)])
+            enqueue(task)
+        meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+            Key={"gameId": meta["gameId"]}, ConsistentRead=True)["Item"]
+        if meta.get("stackPrizeState") != "closing" or meta.get("closeCycle") != cycle:
+            return
     transact(dynamo, [game_update(meta, ", stackPrizeState = :closed, stackClosedAt = :now, isActive = :inactive",
-                                  {":closed": "closed", ":now": _iso_now(), ":inactive": False}), put(task)])
+                                  {":closed": "closed", ":now": _iso_now(), ":inactive": False, ":closing": "closing"},
+                                  extra=" AND stackPrizeState = :closing")])
 
 
 def delivery_channel(player):
-    attempt = get_game_type_blob(player, "STACK").get("attempt") or {}
-    return (attempt.get("prizeProgram") or {}).get("deliveryChannel", "wallet")
+    return "wallet"
+
+
+def email_delivery_state(award):
+    return award.get("emailState")
 
 
 def email_delivery_state(award):
@@ -706,9 +835,10 @@ def email_delivery_state(award):
 
 
 def wallet_link(dynamo, meta, player):
-    if delivery_channel(player) == "email":
+    from stand_common import game_forms
+    if game_forms.pending(meta, player, "prize"):
         return None
-    membership = player.get("kivlyMembership") or {}
+    membership = (player.get("kivly") or {}).get("membership") or {}
     conn = registration.connection(dynamo, meta["ownerUserId"])
     if not conn or membership.get("locationId") != conn["locationId"] or not membership.get("customerId"):
         return None
@@ -722,29 +852,91 @@ def wallet_link(dynamo, meta, player):
 
 def public_awards(dynamo, meta, player, issue_token):
     awards = []
-    for row in records(dynamo, meta["gameId"]):
+    rows = records(dynamo, meta["gameId"])
+    reasons = {}
+    for row in sorted(rows, key=lambda r: r.get("createdAt", "")):
+        if row.get("kind") == "allocation" and row.get("playerId") == player["playerId"]:
+            reasons.update(row.get("inventoryReasons") or {})
+    for row in rows:
         if not row["id"].startswith("award_") or row["playerId"] != player["playerId"]:
             continue
         prize = row["prize"]
         awards.append({"id": row["id"], "source": prize["source"], "name": prize["name"],
                        "imageUrl": image_url(prize, meta), "condition": row["condition"], "state": row["state"],
-                       "deliveryChannel": row.get("deliveryChannel", "wallet"),
+                       "deliveryChannel": "wallet",
                        "emailState": email_delivery_state(row), "emailError": row.get("emailError"),
                        "token": issue_token(row["id"]) if prize["source"] == "stand" and row["state"] == "available" else None})
-    channel = delivery_channel(player)
+    channel = "wallet"
+    closing = meta.get("lifecycleState") == "closing"
+    program = meta.get("stackPrizeProgram") or legacy_program(meta)
     return {"awards": awards, "walletUrl": wallet_link(dynamo, meta, player), "deliveryChannel": channel,
-            "walletExpected": channel == "wallet" and (bool(player.get("kivlyMembership")) or any(
-                p["source"] == "kivly" for p in meta["stackPrizeProgram"]["catalog"])),
-            "state": meta.get("stackPrizeState", "open"),
-            "finalPrizesPending": meta.get("stackPrizeState") != "closed" and any(
-                r["condition"] == "top_final" for r in meta["stackPrizeProgram"]["rules"])}
+            "inventoryReasons": reasons,
+            "walletExpected": bool((player.get("kivly") or {}).get("membership")) or any(
+                p["source"] == "kivly" for p in program["catalog"]),
+            "state": "closing" if closing else meta.get("stackPrizeState", "open"),
+            "finalPrizesPending": (closing or meta.get("stackPrizeState") != "closed") and any(
+                r["condition"] == "top_final" for r in program["rules"])}
 
 
 def redeem(dynamo, game_id, player_id, award_id):
+    from stand_common import game_forms
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": game_id}, ConsistentRead=True,
+    ).get("Item")
+    if meta and game_forms.moment(meta) == "prize":
+        player = dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
+            Key={"gameId": game_id, "playerId": player_id}, ConsistentRead=True,
+        ).get("Item") or {}
+        if game_forms.pending(meta, player, "prize"):
+            raise PrizeError("QuizRequired")
     key = {"gameId": game_id, "id": award_id}
     row = table(dynamo).get_item(Key=key, ConsistentRead=True).get("Item")
     if not row or row.get("playerId") != player_id or row["prize"]["source"] != "stand":
         raise PrizeError("NotEligible", 400)
+    if prize_inventory.enabled():
+        if row.get("state") != "available":
+            raise PrizeError("AlreadyDelivered")
+        meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+            Key={"gameId": game_id}, ConsistentRead=True,
+        ).get("Item")
+        if not meta or meta.get("ownerUserId") != row.get("ownerUserId"):
+            raise PrizeError("GameNotFound", 404)
+        try:
+            if not row.get("inventoryMovementKey"):
+                prize_inventory.import_award(dynamo, meta, row)
+            now = _iso_now()
+            operations = prize_inventory.redemption_operations(dynamo, row, now)
+            operations.append({"Update": {
+                "TableName": os.environ["STACK_PRIZES_TABLE"], "Key": key,
+                "UpdateExpression": "SET #s = :delivered, deliveredAt = :now",
+                "ConditionExpression": "#s = :available",
+                "ExpressionAttributeNames": {"#s": "state"},
+                "ExpressionAttributeValues": {":delivered": "delivered", ":available": "available", ":now": now},
+            }})
+            slot = "ranking" if row["prize"].get("id") == "legacy_ranking" else row.get("condition")
+            attr = {"validation": "validationPrizeDelivered", "raffle": "prizeDelivered",
+                    "ranking": "rankingPrizeDelivered"}.get(slot)
+            if attr:
+                player_key = {"gameId": game_id, "playerId": player_id}
+                player = dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
+                    Key=player_key, ConsistentRead=True,
+                ).get("Item")
+                if player:
+                    old_types = player.get("type") or {}
+                    game_type = meta["gameType"]
+                    updated_types = {**old_types, game_type: {**old_types.get(game_type, {}), attr: True}}
+                    operations.append({"Update": {
+                        "TableName": os.environ["GAMEPLAYER_TABLE"], "Key": player_key,
+                        "UpdateExpression": "SET #types = :types",
+                        "ConditionExpression": "#types = :previous" if "type" in player else "attribute_not_exists(#types)",
+                        "ExpressionAttributeNames": {"#types": "type"},
+                        "ExpressionAttributeValues": {":types": updated_types,
+                            **({":previous": old_types} if "type" in player else {})},
+                    }})
+            prize_inventory.write(dynamo, operations)
+        except prize_inventory.InventoryError as exc:
+            raise PrizeError(exc.code, exc.status) from None
+        return {"name": row["prize"]["name"], "limit": None, "imageUrl": image_url(row["prize"], meta)}
     try:
         table(dynamo).update_item(
             Key=key, UpdateExpression="SET #s = :delivered, deliveredAt = :now",

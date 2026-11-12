@@ -73,6 +73,10 @@ def lambda_handler(event, context):
 
         if (item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+        if not item.get("isActive", True):
+            return _resp(409, {"error": "GameInactive"})
+        if item.get("archivedAt"):
+            return _resp(409, {"error": "GameArchived"})
 
         if not INFOCARDS_BUCKET:
             return _resp(500, {"error": "Infocards bucket not configured."})

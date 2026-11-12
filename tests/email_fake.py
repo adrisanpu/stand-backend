@@ -15,6 +15,12 @@ class FakeDynamo:
     def __init__(self):
         self.tables = {}
         self.lock = RLock()
+        self.meta = type("Meta", (), {})()
+        self.meta.client = type("Client", (), {})()
+        self.meta.client.transact_write_items = self._transact_write_items
+
+    def _transact_write_items(self, TransactItems):
+        return FakeTable(self, "__transactions__")._transact_write_items(TransactItems)
 
     def Table(self, name):
         return self.tables.setdefault(name, FakeTable(self, name))
@@ -30,6 +36,8 @@ class FakeDynamo:
 
     @staticmethod
     def _key(table_name, item):
+        if "clientId" in item and "recordKey" in item:
+            return item["clientId"], item["recordKey"]
         if "id" in item:
             return (item["id"],)
         if "gameId" in item and "playerId" in item:
@@ -127,6 +135,8 @@ class FakeTable:
                         item = deepcopy(data["Key"])
                         table_items[key] = item
                     self._apply_update(item, data["UpdateExpression"], values, names)
+                elif kind == "Delete":
+                    table_items.pop(key, None)
             if failed:
                 raise FakeDynamoError("TransactionCanceledException", reasons)
             for name, items in staged.items():
@@ -145,6 +155,16 @@ class FakeTable:
             return "count" not in item or item["count"] < values[":limit"]
         if "attribute_not_exists(id)" in condition:
             return not exists
+        if "attribute_not_exists(clientId)" in condition:
+            return not exists
+        if "attribute_exists(clientId)" in condition:
+            return exists
+        if "attribute_not_exists(ownerUserId) OR ownerUserId = :owner" in condition:
+            return not exists or item.get("ownerUserId") == values[":owner"]
+        if "ownerUserId = :owner AND participationCount = :one" in condition:
+            return exists and item.get("ownerUserId") == values[":owner"] and item.get("participationCount") == values[":one"]
+        if "ownerUserId = :owner AND participationCount = :expected" in condition:
+            return exists and item.get("ownerUserId") == values[":owner"] and item.get("participationCount") == values[":expected"]
         if "challengeId = :cid" in condition:
             return item is not None and item.get("challengeId") == values[":cid"]
         if "attempts < :max AND expiresAt > :now AND #state IN" in condition:
@@ -165,8 +185,8 @@ class FakeTable:
             )
         if "attribute_not_exists(playerId)" in condition:
             return not exists
-        if "attribute_exists(playerId) AND kivlyMembership = :previous" in condition:
-            return exists and item.get("kivlyMembership") == values[":previous"]
+        if "attribute_exists(playerId) AND #kivly = :previous" in condition:
+            return exists and item.get("kivly") == values[":previous"]
         if "attribute_exists(playerId) AND attribute_not_exists(" in condition:
             attribute = condition.split("attribute_not_exists(", 1)[1].split(")", 1)[0]
             return exists and "playerId" in item and names.get(attribute, attribute) not in item
@@ -190,8 +210,20 @@ class FakeTable:
 
     @staticmethod
     def _apply_update(item, expression, values, names):
-        if expression == "SET kivlyMembership = :m":
-            item["kivlyMembership"] = deepcopy(values[":m"])
+        if "ADD participationCount :one" in expression:
+            item["ownerUserId"] = values[":owner"]
+            item.setdefault("email", values[":email"])
+            if ":name" in values:
+                item.setdefault(names["#name"], values[":name"])
+            if ":phone" in values:
+                item.setdefault("phone", values[":phone"])
+            item["participationCount"] = int(item.get("participationCount", 0)) + int(values[":one"])
+            return
+        if "ADD participationCount :minus" in expression:
+            item["participationCount"] = int(item.get("participationCount", 0)) + int(values[":minus"])
+            return
+        if expression == "SET #kivly = :kivly":
+            item["kivly"] = deepcopy(values[":kivly"])
             return
         if "ADD attempts :one" in expression:
             item["attempts"] = int(item.get("attempts", 0)) + int(values[":one"])
@@ -215,13 +247,13 @@ class FakeTable:
         if "if_not_exists(verifiedAt, :now)" in expression:
             item.setdefault("verifiedAt", values[":now"])
             return
-        if expression.startswith("SET #username = :new") or expression.startswith("SET #phone = :new"):
+        if expression.startswith("SET #") and expression.endswith(" = :new"):
             field_token = expression.split(" ", 2)[1]
             item[names[field_token]] = values[":new"]
             return
-        if "emailVerifiedAt = if_not_exists" in expression:
-            item.setdefault("emailVerifiedAt", values[":at"])
-            item["emailVerificationMethod"] = values[":method"]
+        if "verifiedAt = if_not_exists" in expression:
+            item.setdefault("verifiedAt", values[":at"])
+            item["verificationMethod"] = values[":method"]
             return
         if "SET lastJoinAt" in expression:
             item.update(lastJoinAt=values[":now"], updatedAt=values[":now"])

@@ -1,11 +1,13 @@
 # lambda_function.py  (handler: lambda_function.lambda_handler)
 import os
+from stand_common import game_forms
 import json
 import base64
 
 import boto3
 from stand_common.utils import log, _json_sanitize, _resp, _get_claims
 from stand_common.rulet4_gameplay import spin as rulet4_spin
+from stand_common import stack_prizes
 
 import games.t1mer as t1mer
 import games.stack as stack
@@ -92,6 +94,16 @@ def _handle_post(event):
         return _resp(500, {"ok": False, "error": "MissingGameType"})
 
     log("score_post_request", {"gameId": game_id, "gameType": game_type})
+    if game_forms.moment(meta) == "after_registration" and body.get("action") != "finish":
+        try:
+            player_id = int(body.get("playerId") or 0)
+        except (ValueError, TypeError):
+            return _resp(400, {"ok": False, "error": "InvalidPlayerId"})
+        player = gp_table.get_item(
+            Key={"gameId": game_id, "playerId": player_id}, ConsistentRead=True,
+        ).get("Item") or {}
+        if game_forms.pending(meta, player, "after_registration"):
+            return _resp(409, {"ok": False, "error": "QuizRequired"})
 
     if game_type == "RULET4":
         owner = _get_claims(event).get("sub")
@@ -123,12 +135,18 @@ def _handle_post(event):
         return _resp(200, {"ok": True, "gameId": game_id, "gameType": game_type})
 
     if game_type == "T1MER":
+        def persist(**update):
+            stack_prizes.transact(dynamo_r, [
+                stack_prizes.game_update(meta, "", {":active": True}, extra=" AND isActive = :active"),
+                {"Update": {"TableName": GAMEPLAYER_TABLE, **update}},
+            ])
         result = t1mer.store_score(
             game_id=game_id,
             game_type_upper=game_type,
             gp_table=gp_table,
             payload=body,
             log_fn=log,
+            persist=persist,
         )
 
         return _resp(200 if result.get("ok") else 400, result)
@@ -199,6 +217,10 @@ def lambda_handler(event, context):
 
         return _resp(405, {"ok": False, "error": "MethodNotAllowed", "method": m})
 
+    except game_forms.FormError as exc:
+        return _resp(exc.status, {"ok": False, "error": exc.code})
+    except stack_prizes.PrizeError as exc:
+        return _resp(exc.status, {"ok": False, "error": exc.code})
     except Exception as e:
         log("score_internal_error", {"error": repr(e)})
         return _resp(500, {"ok": False, "error": "internal_error", "detail": repr(e)})

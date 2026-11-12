@@ -8,13 +8,16 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _iso_now, normalize_email, issue_player_token
+from stand_common.utils import (
+    log, _json_sanitize, _iso_now, normalize_email, issue_player_token, GAME_MUTABLE_CONDITION,
+    OPTIONAL_PARTICIPANT_FIELDS,
+)
 from stand_common.email_verification import (
     VerificationError, RegistrationError, registration_values, verification_table,
     require_verified_registration, complete_registration, identity_id,
     find_existing_player_by_email, find_verified_player,
 )
-from stand_common import kivly_registration, kivly_participation
+from stand_common import game_access, kivly_registration, kivly_participation, client_index
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -45,6 +48,7 @@ def _ensure_game_counters(game_id: str):
             "validatedCount = if_not_exists(validatedCount, :z)"
         ),
         ExpressionAttributeValues={":z": 0},
+        ConditionExpression=GAME_MUTABLE_CONDITION,
     )
 
 def _reserve_player_slot(game_id: str, max_players: int, now_iso: str) -> bool:
@@ -56,7 +60,7 @@ def _reserve_player_slot(game_id: str, max_players: int, now_iso: str) -> bool:
         games_table.update_item(
             Key={"gameId": game_id},
             UpdateExpression="ADD playersCount :one SET lastJoinAt = :now, updatedAt = :now",
-            ConditionExpression="attribute_not_exists(playersCount) OR playersCount < :max",
+            ConditionExpression=GAME_MUTABLE_CONDITION + " AND (attribute_not_exists(playersCount) OR playersCount < :max)",
             ExpressionAttributeValues={":one": 1, ":now": now_iso, ":max": int(max_players)},
         )
         return True
@@ -73,6 +77,7 @@ def _rollback_player_slot(game_id: str, now_iso: str):
         Key={"gameId": game_id},
         UpdateExpression="ADD playersCount :neg SET updatedAt = :now",
         ExpressionAttributeValues={":neg": -1, ":now": now_iso},
+        ConditionExpression=GAME_MUTABLE_CONDITION,
     )
 
 
@@ -123,7 +128,7 @@ def _find_existing_player_by_email(game_id: str, email: str) -> dict | None:
     return find_existing_player_by_email(gp_table, game_id, email, Key)
 
 
-WEB_ASSIGN_GAME_TYPES = frozenset({"EMPAREJA2", "T1MER", "STACK", "RULET4"})
+WEB_ASSIGN_GAME_TYPES = frozenset(game_access.GAME_ACCESS_CAPABILITIES)
 
 
 def _empareja2_web_assignment(player: dict) -> dict:
@@ -204,7 +209,7 @@ def _apply_resume_fields(existing, values, resume):
         return
     if int(existing.get("playerId", -1)) != int(resume.get("playerId", -2)):
         raise VerificationError("VerificationSuperseded", 409)
-    allowed = {"username", "phone"}
+    allowed = {"username", "phone", *OPTIONAL_PARTICIPANT_FIELDS}
     fields = resume.get("fields")
     if not isinstance(fields, list) or any(field not in allowed for field in fields):
         raise VerificationError("VerificationUnavailable", 503)
@@ -216,8 +221,10 @@ def _apply_resume_fields(existing, values, resume):
         if field == "username":
             current_valid = (isinstance(old, str) and bool(old.strip()) and len(old.strip()) <= 100
                              and not re.search(r"[\x00-\x1f\x7f-\x9f]", old.strip()))
-        else:
+        elif field == "phone":
             current_valid = kivly_registration.is_valid_phone(old)
+        else:
+            current_valid = isinstance(old, str) and bool(old.strip())
         if current_valid:
             continue
         name = f"#{field}"
@@ -237,19 +244,27 @@ def _apply_resume_fields(existing, values, resume):
         existing[field] = value
 
 
-def _complete_verified_player(table, record, game_id, player_id):
+def _complete_verified_player(table, record, player):
+    game_id = player["gameId"]
+    player_id = player["playerId"]
     verified_at = datetime.fromtimestamp(int(record["verifiedAt"]), timezone.utc).isoformat().replace("+00:00", "Z")
     gp_table.update_item(
         Key={"gameId": game_id, "playerId": int(player_id)},
-        UpdateExpression="SET emailVerifiedAt = if_not_exists(emailVerifiedAt, :at), emailVerificationMethod = :method",
+        UpdateExpression="SET verifiedAt = if_not_exists(verifiedAt, :at), verificationMethod = :method",
         ConditionExpression="attribute_exists(playerId)",
         ExpressionAttributeValues={":at": verified_at, ":method": "email-code"},
     )
     complete_registration(table, record, player_id)
+    return {
+        **player,
+        "verifiedAt": player.get("verifiedAt") or verified_at,
+        "verificationMethod": "email-code",
+    }
 
 
-def _existing_web_response(table, record, game_id, game_type, player):
-    _complete_verified_player(table, record, game_id, player["playerId"])
+def _existing_web_response(table, record, game_id, game_type, player, owner_id):
+    player = _complete_verified_player(table, record, player)
+    client_index.index_player(dynamo_r, owner_id, game_id, player, PLAYER_TOKEN_SECRET)
     return _json_sanitize({
         "ok": True, "created_new": False, "already_joined": True,
         "gameId": game_id, "gameType": game_type,
@@ -292,7 +307,7 @@ def _put_verified_player(table, record, player, max_players, now):
             "ExpressionAttributeValues": {":now": int(time.time()), ":max": 5},
         }},
     ]
-    membership = player.get("kivlyMembership")
+    membership = (player.get("kivly") or {}).get("membership")
     if membership:
         transactions.append({"Put": {
             "TableName": os.environ["KIVLY_REGISTRATION_TABLE"],
@@ -362,7 +377,7 @@ def _handle_web_assign(event: dict) -> dict:
         if linked:
             existing = linked
         if existing:
-            old_membership = existing.get("kivlyMembership") or {}
+            old_membership = (existing.get("kivly") or {}).get("membership") or {}
             old_id = old_membership.get("customerId")
             if (old_id and old_id != "pending-reconciliation"
                     and old_id != membership["customerId"]):
@@ -375,9 +390,11 @@ def _handle_web_assign(event: dict) -> dict:
         if membership:
             kivly_participation.bind_existing_player(dynamo_r, existing, membership)
             kivly_participation.require_unique_player(
-                dynamo_r, {**existing, "kivlyMembership": membership},
+                dynamo_r, {**existing, "kivly": {**(existing.get("kivly") or {}), "membership": membership}},
             )
-        return _existing_web_response(verified_table, verified_record, game_id, game_type, existing)
+        return _existing_web_response(
+            verified_table, verified_record, game_id, game_type, existing, meta["ownerUserId"],
+        )
 
     now = _iso_now()
     if not email:
@@ -393,23 +410,25 @@ def _handle_web_assign(event: dict) -> dict:
         base_item = {
             "gameId": game_id,
             "playerId": new_pid,
-            "joinSource": "web",
             "joinedAt": now,
             "validated": False,
             "validationCode": _code4(),
         }
         if email:
             base_item["email"] = email
-            base_item["emailVerifiedAt"] = datetime.fromtimestamp(
+            base_item["verifiedAt"] = datetime.fromtimestamp(
                 int(verified_record["verifiedAt"]), timezone.utc,
             ).isoformat().replace("+00:00", "Z")
-            base_item["emailVerificationMethod"] = "email-code"
+            base_item["verificationMethod"] = "email-code"
         if phone:
             base_item["phone"] = phone
         if username:
             base_item["username"] = username
+        for field in OPTIONAL_PARTICIPANT_FIELDS:
+            if field in values:
+                base_item[field] = values[field]
         if membership:
-            base_item["kivlyMembership"] = membership
+            base_item["kivly"] = {"membership": membership}
 
         assigner = ASSIGNERS.get(game_type, assign_generic)
         patch = assigner({
@@ -444,7 +463,7 @@ def _handle_web_assign(event: dict) -> dict:
                     if not winner:
                         raise VerificationError("VerificationUnavailable", 503)
                     if membership:
-                        previous_membership = winner.get("kivlyMembership") or {}
+                        previous_membership = (winner.get("kivly") or {}).get("membership") or {}
                         if (previous_membership.get("customerId")
                                 not in (None, "pending-reconciliation", membership["customerId"])):
                             raise kivly_registration.RegistrationError("KivlyIdentityConflict", 409)
@@ -452,9 +471,14 @@ def _handle_web_assign(event: dict) -> dict:
                     if membership:
                         kivly_participation.bind_existing_player(dynamo_r, winner, membership)
                         kivly_participation.require_unique_player(
-                            dynamo_r, {**winner, "kivlyMembership": membership},
+                            dynamo_r, {**winner, "kivly": {**(winner.get("kivly") or {}), "membership": membership}},
                         )
-                    return _existing_web_response(verified_table, verified_record, game_id, game_type, winner)
+                    return _existing_web_response(
+                        verified_table, verified_record, game_id, game_type, winner, meta["ownerUserId"],
+                    )
+                client_index.index_player(
+                    dynamo_r, meta["ownerUserId"], game_id, base_item, PLAYER_TOKEN_SECRET,
+                )
                 complete_registration(verified_table, verified_record, new_pid)
             else:
                 _put_player(base_item)

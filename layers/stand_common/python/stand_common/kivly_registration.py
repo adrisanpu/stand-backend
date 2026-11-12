@@ -27,7 +27,7 @@ PENDING_CUSTOMER_ID = "pending-reconciliation"
 
 
 def is_pending_membership(player):
-    membership = player.get("kivlyMembership") or {}
+    membership = (player.get("kivly") or {}).get("membership") or {}
     return membership.get("customerId") == PENDING_CUSTOMER_ID
 
 
@@ -227,7 +227,7 @@ def require_player(dynamo, meta, player):
     if not settings["enabled"]:
         return
     _required_connection(dynamo, meta)
-    membership = player.get("kivlyMembership") or {}
+    membership = (player.get("kivly") or {}).get("membership") or {}
     if (
         membership.get("locationId") != settings["locationId"]
         or membership.get("consentVersion") != settings["consentVersion"]

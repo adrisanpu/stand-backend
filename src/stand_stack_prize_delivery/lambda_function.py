@@ -10,8 +10,10 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from stand_common import kivly_registration as registration
 from stand_common import stack_prizes as prizes
-from stand_common.reward_email import build_message
-from stand_common.utils import _iso_now, is_valid_email, is_valid_phone, log
+from stand_common import game_lifecycle
+from stand_common import game_forms
+from stand_common.reward_email import build_reward_message
+from stand_common.utils import _iso_now, is_valid_email, issue_prize_token, log
 
 dynamo = boto3.resource("dynamodb")
 
@@ -29,10 +31,44 @@ class RewardEmailAssetError(Exception):
     pass
 
 
+def _pause_if_archived(row):
+    game = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item")
+    if game and not any(game.get(key) for key in ("archivedAt", "deletionStartedAt", "deletedAt")):
+        return False
+    try:
+        prizes.table(dynamo).update_item(
+            Key={"gameId": row["gameId"], "id": row["id"]},
+            UpdateExpression="SET dueAt = :later",
+            ConditionExpression="#w = :pending",
+            ExpressionAttributeNames={"#w": "work"},
+            ExpressionAttributeValues={":later": int(time.time()) + 300, ":pending": "pending"},
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+    return True
+
+
 def _award_player(dynamo, row):
     return dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
         Key={"gameId": row["gameId"], "playerId": row["playerId"]}, ConsistentRead=True,
     ).get("Item") or {}
+
+
+def _pause_for_quiz(row):
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item") or {}
+    if not meta or not game_forms.pending(meta, _award_player(dynamo, row), "prize"):
+        return False
+    prizes.table(dynamo).update_item(
+        Key={"gameId": row["gameId"], "id": row["id"]},
+        UpdateExpression="SET dueAt = :later",
+        ExpressionAttributeValues={":later": int(time.time()) + 60},
+    )
+    return True
 
 
 def _valid_customer_id(value):
@@ -41,7 +77,7 @@ def _valid_customer_id(value):
 
 
 def _confirmed_membership(player, row):
-    membership = player.get("kivlyMembership") or {}
+    membership = (player.get("kivly") or {}).get("membership") or {}
     return (
         _valid_customer_id(row.get("customerId"))
         and membership.get("locationId") == row["prize"]["locationId"]
@@ -53,16 +89,16 @@ def _confirmed_membership(player, row):
 def _block_award(key, row, reason):
     update = "SET #s = :blocked"
     values = {":blocked": "connection_required", ":queued": "queued"}
-    if row.get("deliveryChannel") == "email":
+    if (row.get("prize") or {}).get("source") == "kivly":
         update += ", emailState = :email_blocked, emailError = :error"
         values[":email_blocked"] = "blocked"
         values[":error"] = reason
     update += " REMOVE #w, dueAt"
     try:
-        prizes.table(dynamo).update_item(
-            Key=key, UpdateExpression=update, ConditionExpression="#s = :queued",
-            ExpressionAttributeNames={"#s": "state"}, ExpressionAttributeValues=values,
-        )
+        prizes.prize_inventory.update_delivery(dynamo, row, "connection_required", {
+            "Key": key, "UpdateExpression": update, "ConditionExpression": "#s = :queued",
+            "ExpressionAttributeNames": {"#s": "state", "#w": "work"}, "ExpressionAttributeValues": values,
+        })
     except ClientError as exc:
         if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
@@ -141,12 +177,31 @@ def _email_branding(dynamo, row, conn, context, customer):
     return context.location_name, wallet_url, logo_png
 
 
+def _kivly_wallet_link(dynamo, row, conn, context, customer):
+    if context.location_id != conn["locationId"] or context.owner_id != conn["ownerId"]:
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item")
+    if not meta or meta.get("ownerUserId") != row["ownerUserId"] or meta.get("gameType") != "STACK":
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    program = meta.get("stackPrizeProgram") or prizes.legacy_program(meta)
+    origin = prizes.resolved_storefront(program, conn)
+    if not origin or customer.get("id") != row.get("customerId"):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    return origin + "/add-to-wallet?" + urlencode({
+        "customer_id": customer["id"], "location_id": conn["locationId"],
+    })
+
+
 def dispatch():
     page = prizes.table(dynamo).query(
         IndexName="pending-work", KeyConditionExpression=Key("work").eq("pending") & Key("dueAt").lte(int(time.time())),
         Limit=100,
     )
     for row in page.get("Items", []):
+        if _pause_if_archived(row):
+            continue
         if not prizes.enqueue(row):
             continue
         try:
@@ -165,6 +220,8 @@ def grant(row):
     meta = {"gameId": row["gameId"], "ownerUserId": row["ownerUserId"]}
     program = prizes.upgrade_program(row["program"])
     conditions = {"completed", "top_finish", "score"} if row["condition"] == "finish" else {row["condition"]}
+    if row.get("closure"):
+        conditions = {"top_final", "top_finish"}
     existing_records = prizes.records(dynamo, row["gameId"])
     for winner in row["winners"][:5]:
         player = dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
@@ -174,11 +231,14 @@ def grant(row):
             raise prizes.PrizeError("AwardPlayerMissing")
         if (player.get("type") or {}).get("STACK", {}).get("attempt", {}).get("status") == "excluded":
             continue
-        if ("top_final" in conditions
+        if ("top_final" in conditions and not row.get("closure")
                 and "prizeProgram" not in (player.get("type") or {}).get("STACK", {}).get("attempt", {})):
             continue
+        player_conditions = conditions
+        if row.get("closure") and "prizeProgram" not in (player.get("type") or {}).get("STACK", {}).get("attempt", {}):
+            player_conditions = conditions | {"completed", "score"}
         for rule in program["rules"]:
-            if rule["condition"] in conditions and not (
+            if rule["condition"] in player_conditions and not (
                 rule["condition"].startswith("top_")
                 and (winner.get("rank") is None or winner["rank"] > rule["topX"])
             ) and (rule["condition"] != "score" or prizes.score_matches(rule, winner.get("score"))):
@@ -206,6 +266,9 @@ def finish_close(row):
     ).get("Item")
     if not meta:
         raise prizes.PrizeError("GameNotFound")
+    if row.get("cycle") and row["cycle"] != meta.get("closeCycle"):
+        game_lifecycle.complete(dynamo, row)
+        return
     prizes.close(dynamo, meta, [])
     current = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
         Key={"gameId": row["gameId"]}, ConsistentRead=True,
@@ -221,12 +284,15 @@ def deliver(row):
     key = {"gameId": row["gameId"], "id": row["id"]}
     if row["state"] == "sending":
         # An interrupted earn may have succeeded; never issue it again.
-        prizes.table(dynamo).update_item(
-            Key=key, UpdateExpression="SET #s = :s REMOVE #w, dueAt",
-            ExpressionAttributeNames={"#s": "state", "#w": "work"}, ExpressionAttributeValues={":s": "reconciliation_required"},
-        )
+        prizes.prize_inventory.update_delivery(dynamo, row, "reconciliation_required", {
+            "Key": key, "UpdateExpression": "SET #s = :s REMOVE #w, dueAt",
+            "ExpressionAttributeNames": {"#s": "state", "#w": "work"},
+            "ExpressionAttributeValues": {":s": "reconciliation_required"},
+        })
         return
     if row["state"] != "queued":
+        return
+    if _pause_for_quiz(row):
         return
     try:
         conn = registration.connection(dynamo, row["ownerUserId"])
@@ -271,6 +337,18 @@ def deliver(row):
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
             return
         raise
+    if _pause_if_archived(row):
+        try:
+            prizes.table(dynamo).update_item(
+                Key=key, UpdateExpression="SET #s = :queued",
+                ConditionExpression="#s = :sending",
+                ExpressionAttributeNames={"#s": "state"},
+                ExpressionAttributeValues={":queued": "queued", ":sending": "sending"},
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        return
     stage = "earn"
     failure = None
     try:
@@ -297,17 +375,13 @@ def deliver(row):
             ":http": getattr(failure, "http_status", None),
         })
     else:
-        if row.get("deliveryChannel") == "email":
-            update = "SET #s = :s, emailState = :pending, #w = :pending, dueAt = :now REMOVE emailError, redemptionId, lastError, lastErrorStage, lastErrorHttpStatus"
-            values = {":s": state, ":pending": "pending", ":now": 0}
-        else:
-            update = "SET #s = :s REMOVE redemptionId, #w, dueAt, lastError, lastErrorStage, lastErrorHttpStatus"
-            values = {":s": state}
-    prizes.table(dynamo).update_item(
-        Key=key, UpdateExpression=update,
-        ExpressionAttributeNames={"#s": "state", "#w": "work"},
-        ExpressionAttributeValues=values,
-    )
+        update = "SET #s = :s, emailState = :pending, #w = :pending, dueAt = :now REMOVE emailError, redemptionId, lastError, lastErrorStage, lastErrorHttpStatus"
+        values = {":s": state, ":pending": "pending", ":now": 0}
+    prizes.prize_inventory.update_delivery(dynamo, row, state, {
+        "Key": key, "UpdateExpression": update,
+        "ExpressionAttributeNames": {"#s": "state", "#w": "work"},
+        "ExpressionAttributeValues": values,
+    })
 
 
 def email_status(key, state, error=None, attempts=0, retry=False, message_id=None):
@@ -320,6 +394,7 @@ def email_status(key, state, error=None, attempts=0, retry=False, message_id=Non
         update += ", emailMessageId = :message, emailAcceptedAt = :accepted"
         values[":message"] = message_id
         values[":accepted"] = _iso_now()
+        update += " REMOVE emailError"
     if retry:
         update += ", dueAt = :later"
         values[":later"] = int(time.time()) + 60 * max(1, attempts)
@@ -342,8 +417,10 @@ def notify(row):
         return
     if row.get("emailState") != "pending":
         return
-    if (os.environ.get("STACK_REWARD_EMAIL_ENABLED", "false").lower() != "true"
-            or os.environ.get("KIVLY_EXTERNAL_WRITES_ENABLED", "true").lower() != "true"):
+    if _pause_for_quiz(row):
+        return
+    if os.environ.get("REWARD_EMAIL_ENABLED", os.environ.get(
+            "STACK_REWARD_EMAIL_ENABLED", "false")).lower() != "true":
         prizes.table(dynamo).update_item(
             Key=key, UpdateExpression="SET dueAt = :later",
             ExpressionAttributeValues={":later": int(time.time()) + 3600},
@@ -352,7 +429,8 @@ def notify(row):
     attempts = int(row.get("emailAttempts", 0)) + 1
     player = _award_player(dynamo, row)
     email = player.get("email")
-    if not player.get("emailVerifiedAt") or not is_valid_email(email or ""):
+    if (not player.get("verifiedAt") or player.get("verificationMethod") != "email-code"
+            or not is_valid_email(email or "")):
         email_status(key, "failed", "VerifiedEmailRequired")
         return
     sender = os.environ.get("EMAIL_SENDER_ADDRESS")
@@ -360,48 +438,84 @@ def notify(row):
         email_status(key, "failed", "RewardEmailUnavailable")
         return
     try:
-        conn = registration.connection(dynamo, row["ownerUserId"])
-        if not conn or conn["locationId"] != row["prize"]["locationId"]:
-            email_status(key, "failed", "KivlyConnectionChanged")
+        prize = row.get("prize") or {}
+        source = prize.get("source")
+        expected_state = row.get("state")
+        links = []
+        qr_value = None
+        if source == "kivly":
+            if expected_state != "confirmed":
+                email_status(key, "failed", "KivlyRewardNotConfirmed")
+                return
+            conn = registration.connection(dynamo, row["ownerUserId"])
+            if not conn or conn["locationId"] != prize.get("locationId"):
+                email_status(key, "failed", "KivlyConnectionChanged")
+                return
+            client = registration._client(conn)
+            customer = _customer_by_confirmed_id(client, conn, row, player)
+            if not customer:
+                email_status(key, "failed", "KivlyCustomerInvalid")
+                return
+            wallet_url = _kivly_wallet_link(dynamo, row, conn, client.get_context(), customer)
+            links.append(("Kivly Wallet", wallet_url))
+        elif source == "stand":
+            if expected_state not in ("available", "delivered"):
+                email_status(key, "failed", "RewardNotAvailable")
+                return
+            token = issue_prize_token(
+                row["gameId"], row["playerId"], "a", os.environ["PLAYER_TOKEN_SECRET"],
+                ttl_seconds=315360000, award_id=row["id"],
+            )
+            base_url = os.environ.get("PUBLIC_API_BASE_URL", "").rstrip("/")
+            if not base_url.startswith("https://"):
+                email_status(key, "failed", "RewardEmailUnavailable")
+                return
+            query = urlencode({"token": token})
+            links.extend([
+                ("Apple Wallet", f"{base_url}/v1/public/wallet/pass?{query}&platform=apple"),
+                ("Google Wallet", f"{base_url}/v1/public/wallet/pass?{query}&platform=google"),
+            ])
+            qr_value = token
+        else:
+            email_status(key, "failed", "RewardSourceUnsupported")
             return
-        client = registration._client(conn)
-        customer = _customer_by_confirmed_id(client, conn, row, player)
-        context = client.get_context()
+        message = build_reward_message(
+            sender, email, player.get("username") or "", prize,
+            qr_value=qr_value, wallet_links=links,
+        )
     except (registration.RegistrationError, registration.KivlyError) as exc:
         retry = attempts < 3
         email_status(key, "pending" if retry else "failed",
                      getattr(exc, "code", "KivlyUnavailable"), attempts, retry=retry)
         return
-    if not customer:
-        email_status(key, "failed", "KivlyCustomerInvalid")
-        return
-    phone = customer.get("phone")
-    if not is_valid_phone(phone):
-        email_status(key, "failed", "KivlyPhoneRequired")
-        return
-    try:
-        club_name, wallet_url, logo_png = _email_branding(dynamo, row, conn, context, customer)
-        message = build_message(
-            sender, email, player.get("username") or "", row["prize"], phone,
-            club_name=club_name, wallet_url=wallet_url, logo_png=logo_png,
-        )
-    except Exception:
+    except (RewardEmailAssetError, KeyError, TypeError, ValueError):
         email_status(key, "failed", "RewardEmailAssetsUnavailable")
         return
     try:
         prizes.table(dynamo).update_item(
             Key=key, UpdateExpression="SET emailState = :sending, emailAttempts = :attempts",
-            ConditionExpression="emailState = :pending AND #s = :confirmed",
+            ConditionExpression="emailState = :pending AND #s = :expected",
             ExpressionAttributeNames={"#s": "state"},
             ExpressionAttributeValues={
                 ":sending": "sending", ":pending": "pending", ":attempts": attempts,
-                ":confirmed": "confirmed",
+                ":expected": expected_state,
             },
         )
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
             return
         raise
+    if _pause_if_archived(row):
+        try:
+            prizes.table(dynamo).update_item(
+                Key=key, UpdateExpression="SET emailState = :pending",
+                ConditionExpression="emailState = :sending",
+                ExpressionAttributeValues={":pending": "pending", ":sending": "sending"},
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+        return
     try:
         result = boto3.client(
             "ses", region_name="us-east-1",
@@ -445,10 +559,16 @@ def lambda_handler(event, context):
             key = json.loads(record["body"])
             row = prizes.table(dynamo).get_item(Key=key, ConsistentRead=True).get("Item")
             if row and row.get("work") == "pending":
-                if row.get("kind") == "close":
+                if _pause_if_archived(row):
+                    continue
+                elif row.get("kind") == "lifecycle":
+                    game_lifecycle.finish(dynamo, row)
+                elif row.get("kind") == "close":
                     finish_close(row)
                 elif row.get("kind") == "grant":
                     grant(row)
+                elif row.get("emailState") in ("pending", "sending"):
+                    notify(row)
                 elif row.get("state") == "confirmed" and row.get("deliveryChannel") == "email":
                     notify(row)
                 else:

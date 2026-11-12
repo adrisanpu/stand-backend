@@ -9,7 +9,7 @@ import pytest
 from stand_common import stack_prizes as prizes
 from stand_common.utils import issue_prize_token, verify_prize_token
 from tests.email_fake import FakeDynamoError
-from tests.stack_prize_fake import PrizeDynamo
+from tests.stack_prize_fake import PrizeDynamo, Condition
 
 LEGACY_PROGRAM = {"version": 1, "storefrontUrl": "https://example.kivly.store", "catalog": [
     {"id": "pizza", "source": "stand", "name": "Pizza", "imageKey": None, "limit": None},
@@ -24,7 +24,7 @@ PROGRAM = prizes.upgrade_program(LEGACY_PROGRAM)
 META = {"gameId": "ABC123", "ownerUserId": "owner", "gameType": "STACK", "isActive": True,
         "stackPrizeProgram": PROGRAM}
 PLAYER = {"gameId": "ABC123", "playerId": 1, "username": "Player",
-          "kivlyMembership": {"locationId": "loc", "customerId": "customer"},
+          "kivly": {"membership": {"locationId": "loc", "customerId": "customer"}},
           "type": {"STACK": {}}}
 ATTEMPT = {"attemptId": "a1", "status": "started", "startedAt": "2026-10-26T12:00:00Z",
            "configVersion": "1"}
@@ -32,13 +32,17 @@ ATTEMPT = {"attemptId": "a1", "status": "started", "startedAt": "2026-10-26T12:0
 
 @pytest.fixture
 def rig(monkeypatch):
-    for key, value in {"GAMES_TABLE": "games", "GAMEPLAYER_TABLE": "players", "STACK_PRIZES_TABLE": "prizes"}.items():
+    for key, value in {
+        "GAMES_TABLE": "games", "USERS_TABLE": "users",
+        "GAMEPLAYER_TABLE": "players", "STACK_PRIZES_TABLE": "prizes",
+    }.items():
         monkeypatch.setenv(key, value)
     dynamo = PrizeDynamo()
     dynamo.Table("games").put_item(Item=deepcopy(META))
     dynamo.Table("players").put_item(Item=deepcopy(PLAYER))
     monkeypatch.setattr(prizes, "ClientError", FakeDynamoError)
     monkeypatch.setattr(prizes, "BotoCoreError", FakeDynamoError)
+    monkeypatch.setattr(prizes, "Key", Condition)
     return dynamo
 
 
@@ -366,9 +370,10 @@ def test_zero_score_finish_persists_grant_job_atomically(rig, monkeypatch):
     assert rows[0]["condition"] == "finish"
     process_grants(rig, monkeypatch)
     awards = [r for r in prizes.records(rig, "ABC123") if r["id"].startswith("award_")]
-    assert len(awards) == 4
-    assert sum(r["state"] == "available" for r in awards) == 2
+    assert len(awards) == 2
+    assert sum(r["state"] == "available" for r in awards) == 1
     assert sum(r.get("work") == "pending" for r in awards) == 2
+    assert next(r for r in awards if r["prize"]["source"] == "stand")["emailState"] == "pending"
     assert player(rig)["type"]["STACK"]["rankAtFinish"] == 1
 
 
@@ -451,18 +456,18 @@ def test_enqueue_failure_keeps_successful_finish_and_recoverable_job(rig, monkey
     assert rig.Table("prizes").get_item(Key={"gameId": task["gameId"], "id": task["id"]})["Item"]["dueAt"] > 0
 
 
-def test_allocation_immediately_enqueues_only_committed_kivly_awards(rig, monkeypatch):
+def test_allocation_immediately_enqueues_committed_delivery_and_email_awards(rig, monkeypatch):
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
     finish(rig)
     sent = []
     def enqueue(row):
         stored = rig.Table("prizes").get_item(Key={"gameId": row["gameId"], "id": row["id"]})["Item"]
-        assert stored["state"] == "queued" and stored["work"] == "pending"
+        assert stored["state"] in ("queued", "available") and stored["work"] == "pending"
         sent.append(row)
         return True
     monkeypatch.setattr(prizes, "enqueue", enqueue)
     process_grants(rig, monkeypatch)
-    assert len(sent) == 2 and all(r["prize"]["source"] == "kivly" for r in sent)
+    assert len(sent) == 2 and {r["prize"]["source"] for r in sent} == {"stand", "kivly"}
     process_grants(rig, monkeypatch)
     assert len(sent) == 2
 
@@ -531,10 +536,12 @@ def test_finish_to_delivery_runs_from_queue_without_scheduler(rig, monkeypatch):
         assert worker.lambda_handler(event, None) == {"batchItemFailures": []}
     assert processed == 3
     rows = prizes.records(rig, "ABC123")
-    assert sum(r.get("state") == "available" for r in rows) == 2
-    assert sum(r.get("state") == "confirmed" and r.get("customerId") == "customer" for r in rows) == 2
-    assert not any(r.get("work") == "pending" for r in rows)
-    assert client.earn_reward.call_count == 2
+    assert sum(r.get("state") == "available" for r in rows) == 1
+    assert sum(r.get("state") == "confirmed" and r.get("customerId") == "customer" for r in rows) == 1
+    pending = [r for r in rows if r.get("work") == "pending"]
+    assert len(pending) == 2
+    assert all(r["state"] in ("available", "confirmed") and r["emailState"] == "pending" for r in pending)
+    assert client.earn_reward.call_count == 1
     client.customer_rewards.assert_not_called()
 
 
@@ -546,7 +553,7 @@ def test_rule_snapshot_is_taken_at_start(rig, monkeypatch):
     rig.Table("games").put_item(Item=changed)
     finish(rig)
     process_grants(rig, monkeypatch)
-    assert len([r for r in prizes.records(rig, "ABC123") if r["id"].startswith("award_")]) == 4
+    assert len([r for r in prizes.records(rig, "ABC123") if r["id"].startswith("award_")]) == 2
 
 
 def test_concurrent_finish_revision_conflict_rolls_back_score_and_awards(rig):
@@ -573,7 +580,7 @@ def test_close_blocks_starts_waits_then_freezes_once(rig):
     prizes.close(rig, meta(rig), [])
     assert meta(rig)["stackPrizeState"] == "closed"
     tasks = [r for r in prizes.records(rig, "ABC123") if r.get("kind") == "grant"]
-    assert len(tasks) == 2 and any(t["winners"] == [{"playerId": 1, "rank": 1}] for t in tasks)
+    assert len(tasks) == 2 and any(t["winners"] == [{"playerId": 1, "rank": 1, "score": 0}] for t in tasks)
     prizes.close(rig, meta(rig), [])
     assert len([r for r in prizes.records(rig, "ABC123") if r.get("kind") == "grant"]) == 2
 
@@ -590,6 +597,9 @@ def test_excluded_attempt_cannot_finish_or_receive_final_awards(rig):
 
 
 def test_individual_qr_can_only_redeem_one_stand_award(rig, monkeypatch):
+    saved = meta(rig)
+    saved["stackPrizeProgram"]["rules"][0]["groups"][0]["allocations"][0]["quantity"] = 2
+    rig.Table("games").put_item(Item=saved)
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
     finish(rig)
     process_grants(rig, monkeypatch)
@@ -621,6 +631,34 @@ def delivery_module(monkeypatch, rig):
     return module
 
 
+def test_worker_defers_pending_jobs_for_archived_games(rig, monkeypatch):
+    import time
+
+    worker = delivery_module(monkeypatch, rig)
+    worker.grant = MagicMock(side_effect=AssertionError("archived work must not be processed"))
+    rig.Table("games").update_item(
+        Key={"gameId": "ABC123"}, UpdateExpression="SET archivedAt = :now",
+        ExpressionAttributeValues={":now": "2026-11-04T00:00:00Z"},
+    )
+    row = {
+        "gameId": "ABC123", "id": "job_archived", "kind": "grant", "work": "pending", "dueAt": 0,
+        "program": PROGRAM, "condition": "finish", "winners": [{"playerId": 1, "rank": 1, "score": 0}],
+        "ownerUserId": "owner",
+    }
+    rig.Table("prizes").put_item(Item=row)
+
+    result = worker.lambda_handler({"Records": [{
+        "messageId": "archived-job",
+        "body": json.dumps({"gameId": "ABC123", "id": "job_archived"}),
+    }]}, None)
+
+    assert result == {"batchItemFailures": []}
+    worker.grant.assert_not_called()
+    deferred = rig.Table("prizes").get_item(Key={"gameId": "ABC123", "id": "job_archived"})["Item"]
+    assert deferred["work"] == "pending"
+    assert deferred["dueAt"] >= int(time.time()) + 299
+
+
 def process_grants(rig, monkeypatch):
     worker = delivery_module(monkeypatch, rig)
     for row in prizes.records(rig, "ABC123"):
@@ -629,6 +667,9 @@ def process_grants(rig, monkeypatch):
 
 
 def test_worker_earns_once_without_browser_and_handles_multiple_identical_rewards(rig, monkeypatch):
+    saved = meta(rig)
+    saved["stackPrizeProgram"]["rules"][0]["groups"][0]["allocations"][1]["quantity"] = 2
+    rig.Table("games").put_item(Item=saved)
     worker = delivery_module(monkeypatch, rig)
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
     finish(rig)
@@ -672,7 +713,8 @@ def test_success_ack_confirms_even_when_kivly_redemption_history_is_empty(rig, m
     current = rig.Table("prizes").get_item(Key={"gameId": row["gameId"], "id": row["id"]})["Item"]
     assert current["state"] == "confirmed"
     assert "redemptionId" not in current
-    assert "work" not in current
+    assert current["work"] == "pending"
+    assert current["emailState"] == "pending"
     client.customer_rewards.assert_not_called()
     assert client.earn_reward.call_count == 1
 
@@ -746,10 +788,10 @@ def test_v3_grant_deserialized_from_dynamodb_allocates_once(rig, monkeypatch):
     worker.grant(task)
     worker.grant(task)
     awards = [r for r in prizes.records(rig, "ABC123") if r["id"].startswith("award_")]
-    assert len(awards) == 4
-    assert sum(r["state"] == "available" for r in awards) == 2
-    assert sum(r["state"] == "queued" for r in awards) == 2
-    assert meta(rig)["stackPrizeStock"]["pizza"]["remaining"] == 998
+    assert len(awards) == 2
+    assert sum(r["state"] == "available" for r in awards) == 1
+    assert sum(r["state"] == "queued" for r in awards) == 1
+    assert meta(rig)["stackPrizeStock"]["pizza"]["remaining"] == 999
 
 
 @pytest.mark.parametrize("quantity", [True, "1", 1.5, Decimal("1.5"),
@@ -760,7 +802,7 @@ def test_award_units_rejects_invalid_quantities(quantity):
                            PROGRAM["catalog"][0], quantity)
 
 
-def test_stock_is_shared_across_rules_and_shortage_grants_only_remaining_units(rig, monkeypatch):
+def test_same_reward_is_not_duplicated_across_rules(rig, monkeypatch):
     worker = delivery_module(monkeypatch, rig)
     program = prizes.upgrade_program(PROGRAM)
     program["catalog"][0]["stockTotal"] = 5
@@ -783,12 +825,12 @@ def test_stock_is_shared_across_rules_and_shortage_grants_only_remaining_units(r
     worker.grant(task)
 
     awards = [r for r in prizes.records(rig, "ABC123") if r.get("id", "").startswith("award_")]
-    assert len(awards) == 5
+    assert len(awards) == 3
     assert all(r["prize"]["id"] == "pizza" for r in awards)
-    assert meta(rig)["stackPrizeStock"]["pizza"] == {"total": 5, "remaining": 0}
+    assert meta(rig)["stackPrizeStock"]["pizza"] == {"total": 5, "remaining": 2}
     ledgers = [r for r in prizes.records(rig, "ABC123") if r.get("kind") == "allocation"]
     assert len(ledgers) == 2
-    assert sorted(sum(p["quantity"] for p in row["awarded"]) for row in ledgers) == [2, 3]
+    assert sorted(sum(p["quantity"] for p in row["awarded"]) for row in ledgers) == [3, 3]
 
 
 def test_random_one_chooses_only_a_prize_with_stock_and_persists_result(rig, monkeypatch):
@@ -920,7 +962,7 @@ def test_wallet_uses_verified_membership_without_earning_a_reward(rig, monkeypat
     result = prizes.public_awards(rig, META, PLAYER, lambda _: "unused")
     assert result["awards"] == []
     assert result["walletUrl"] == "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc"
-    wrong = {**PLAYER, "kivlyMembership": {"locationId": "other", "customerId": "customer"}}
+    wrong = {**PLAYER, "kivly": {"membership": {"locationId": "other", "customerId": "customer"}}}
     assert prizes.wallet_link(rig, META, wrong) is None
 
 
@@ -1012,13 +1054,13 @@ def test_owner_and_public_metadata_expose_same_normalized_promotional_rules(rig,
     assert owner["stackPrizeRules"][0]["prizes"][0] == {"id": "pizza", "name": "Pizza", "imageUrl": None}
 
 
-def test_close_keeps_active_until_pending_finish_then_atomically_deactivates(rig):
+def test_close_blocks_participation_but_allows_pending_finish(rig):
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
     with pytest.raises(prizes.PrizeError, match="StackClosingStarted"):
         prizes.close(rig, meta(rig), [])
-    assert meta(rig)["isActive"] is True
+    assert meta(rig)["isActive"] is False
     prizes.close(rig, meta(rig), [])
-    assert meta(rig)["stackPrizeState"] == "closing" and meta(rig)["isActive"] is True
+    assert meta(rig)["stackPrizeState"] == "closing" and meta(rig)["isActive"] is False
     finish(rig)
     prizes.close(rig, meta(rig), [])
     assert meta(rig)["stackPrizeState"] == "closed" and meta(rig)["isActive"] is False
@@ -1038,19 +1080,20 @@ def test_close_api_supports_stack_without_saved_program(rig, monkeypatch):
     first = stack_prize_api.handle(event, "POST", rig, lambda _: True, lambda _: b"")
     assert first["statusCode"] == 200
     assert json.loads(first["body"])["state"] == "closing"
-    assert meta(rig)["isActive"] is True and meta(rig)["stackPrizeProgram"]["version"] == 3
+    assert meta(rig)["isActive"] is False and meta(rig)["stackPrizeProgram"]["version"] == 3
     final = stack_prize_api.handle(event, "POST", rig, lambda _: True, lambda _: b"")
     assert final["statusCode"] == 200
-    assert json.loads(final["body"])["state"] == "closed" and meta(rig)["isActive"] is False
+    assert json.loads(final["body"])["state"] == "closing" and meta(rig)["isActive"] is False
 
 
-def test_generic_stack_deactivation_requires_dedicated_close(rig, monkeypatch):
+def test_generic_stack_deactivation_uses_common_close(rig, monkeypatch):
     from tests.test_stack_integration import game, operator_event
     monkeypatch.setattr(game, "games_table", rig.Table("games"))
+    monkeypatch.setattr(game, "dynamodb", rig)
     response = game._handle_put(operator_event({"gameId": "ABC123", "isActive": False}))
-    assert response["statusCode"] == 409
-    assert json.loads(response["body"])["error"] == "StackCloseRequired"
-    assert meta(rig)["isActive"] is True
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"])["game"]["lifecycleState"] == "closing"
+    assert meta(rig)["isActive"] is False
 
 
 def test_real_sdk_serializes_native_transaction_values_once(rig):
@@ -1075,10 +1118,13 @@ def test_top_finish_award_survives_a_later_better_score(rig, monkeypatch):
     }}
     rig.Table("players").put_item(Item=another)
     assert len([r for r in prizes.records(rig, "ABC123")
-                if r.get("condition") == "top_finish"]) == 2
+                if r.get("condition") == "completed" and r["id"].startswith("award_")]) == 2
 
 
 def test_final_prizes_are_delivered_by_worker_without_a_player_request(rig, monkeypatch):
+    saved = meta(rig)
+    saved["stackPrizeProgram"]["rules"] = [saved["stackPrizeProgram"]["rules"][2]]
+    rig.Table("games").put_item(Item=saved)
     worker = delivery_module(monkeypatch, rig)
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
     finish(rig)
@@ -1164,7 +1210,7 @@ def test_managed_score_handler_start_finish_and_retry_preserve_one_set_of_awards
     assert result["ok"] and result["score"] == 1 and result["rank"] == 1
     assert stack.store_score("ABC123", rig.Table("players"), payload, game) == result
     process_grants(rig, monkeypatch)
-    assert len([r for r in prizes.records(rig, "ABC123") if r["id"].startswith("award_")]) == 4
+    assert len([r for r in prizes.records(rig, "ABC123") if r["id"].startswith("award_")]) == 2
 
 
 def test_worker_defers_pre_earn_failures_with_visible_error_and_recovers(rig, monkeypatch):
@@ -1219,7 +1265,7 @@ def test_closed_paused_game_metadata_and_earned_prizes_remain_accessible(rig, mo
     response = public_mod._player_response(game, player(rig), "ABC123", 1, "player-token")
     assert response["statusCode"] == 200
     result = json.loads(response["body"])
-    assert len(result["stackPrizes"]["awards"]) == 4
+    assert len(result["stackPrizes"]["awards"]) == 2
     assert result["prizes"] == []
 
 

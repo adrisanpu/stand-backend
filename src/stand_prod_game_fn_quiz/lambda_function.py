@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, _as_int, _get_claims, GAME_MUTABLE_CONDITION
+from stand_common.form_responses import get_form_responses
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -51,11 +52,9 @@ def _parse_http_event(event: dict):
 
 # ----------------- Quiz meta (game-table) -----------------
 
-def _save_quiz_meta(game_id: str, questions: list[dict]):
+def _normalize_quiz_questions(questions: list[dict]):
     """
-    Guarda en games table:
-      quizOrder: [q1, q2...]
-      quizQuestions: { q1: {text, options:[{title,payload}]} ... }
+    Normaliza quizOrder y quizQuestions.
     """
     quiz_order = []
     quiz_questions = {}
@@ -82,10 +81,19 @@ def _save_quiz_meta(game_id: str, questions: list[dict]):
     if not quiz_order:
         raise ValueError("No valid questions provided")
 
+    return quiz_order, quiz_questions
+
+
+def _save_quiz_meta(game_id: str, questions: list[dict]):
+    quiz_order, quiz_questions = _normalize_quiz_questions(questions)
     games_table.update_item(
         Key={"gameId": game_id},
         UpdateExpression="SET quizOrder = :o, quizQuestions = :q",
         ExpressionAttributeValues={":o": quiz_order, ":q": quiz_questions},
+        ConditionExpression=(
+            GAME_MUTABLE_CONDITION
+            + " AND attribute_not_exists(quizLockedAt) AND attribute_not_exists(formConfig)"
+        ),
     )
     log("quiz_meta_saved", {"gameId": game_id, "quizOrder": quiz_order})
 
@@ -180,6 +188,15 @@ def _scan_players_in_game(game_id: str):
     return out
 
 
+def _has_completed_quiz(game_id: str, game_type: str) -> bool:
+    for item in _scan_players_in_game(game_id):
+        type_map = item.get("type") or {}
+        game_blob = type_map.get(game_type) or {} if isinstance(type_map, dict) else {}
+        if isinstance(game_blob, dict) and game_blob.get("quizCompleted"):
+            return True
+    return False
+
+
 # ----------------- Quiz state en type.<GAME_TYPE_UPPER> -----------------
 
 
@@ -227,6 +244,8 @@ def lambda_handler(event, context):
 
         # -------- GET export --------
         if method == "GET":
+            if qs.get("analytics") == "1":
+                return get_form_responses(event, qs.get("gameId"), games_table, gp_table)
             game_id = (qs.get("gameId") or body.get("gameId") or "").strip()
             if not game_id:
                 return _resp(400, {"ok": False, "error": "MissingGameId"})
@@ -315,13 +334,34 @@ def lambda_handler(event, context):
             if not isinstance(questions, list) or not questions:
                 return _resp(400, {"ok": False, "error": "MissingOrInvalidQuestions"})
 
+            owner_id = (_get_claims(event).get("sub") or "").strip()
+            if not owner_id:
+                return _resp(401, {"ok": False, "error": "Unauthorized"})
             quiz_order, quiz_questions, meta = _get_quiz_meta(game_id)
             if not meta:
                 return _resp(404, {"ok": False, "error": "GameNotFound"})
+            if meta.get("ownerUserId") != owner_id:
+                return _resp(403, {"ok": False, "error": "Forbidden"})
+            if "formConfig" in meta:
+                return _resp(409, {"ok": False, "error": "FormEditorRequired"})
+            game_type = (meta.get("gameType") or "").upper()
+            if meta.get("quizLockedAt") or _has_completed_quiz(game_id, game_type):
+                return _resp(409, {"ok": False, "error": "QuizLocked"})
 
             try:
+                next_order, next_questions = _normalize_quiz_questions(questions)
+                if next_order == quiz_order and next_questions == quiz_questions:
+                    return _resp(200, {
+                        "ok": True, "gameId": game_id, "questions": len(questions),
+                        "prepared": {"playersSeen": 0, "playersUpdated": 0}, "unchanged": True,
+                    })
                 _save_quiz_meta(game_id, questions)
             except Exception as e:
+                error = getattr(e, "response", {}).get("Error", {}).get("Code")
+                if error == "ConditionalCheckFailedException":
+                    latest = _get_quiz_meta(game_id)[2] or {}
+                    error = "FormEditorRequired" if "formConfig" in latest else "QuizLocked"
+                    return _resp(409, {"ok": False, "error": error})
                 log("quiz_meta_error", {"error": repr(e)})
                 return _resp(500, {"ok": False, "error": "quiz_meta_error", "message": str(e)})
 

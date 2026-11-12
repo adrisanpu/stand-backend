@@ -130,6 +130,11 @@ def get_game_type_blob(game_item: dict, game_type_upper: str) -> dict:
     return t.get((game_type_upper or "").upper()) or {}
 
 
+GAME_MUTABLE_CONDITION = (
+    "attribute_exists(gameId) AND attribute_not_exists(archivedAt) AND attribute_not_exists(deletedAt)"
+)
+
+
 def set_game_type_blob(table, game_id: str, game_type_upper: str, payload: dict, *, updated_at: str | None = None, condition_expression: str | None = None, condition_values: dict | None = None):
     """
     Write the type-specific blob for a game in stand-prod-game-table.
@@ -143,6 +148,9 @@ def set_game_type_blob(table, game_id: str, game_type_upper: str, payload: dict,
     """
     g = (game_type_upper or "").upper()
     key = {"gameId": game_id}
+    condition = GAME_MUTABLE_CONDITION
+    if condition_expression:
+        condition += " AND (" + condition_expression + ")"
 
     # 1) Ensure the type map exists (single path [type]); avoids "invalid document path" when type is missing.
     kwargs1 = {
@@ -151,15 +159,14 @@ def set_game_type_blob(table, game_id: str, game_type_upper: str, payload: dict,
         "ExpressionAttributeNames": {"#type": "type"},
         "ExpressionAttributeValues": {":empty": {}},
     }
-    if condition_expression:
-        kwargs1["ConditionExpression"] = condition_expression
+    kwargs1["ConditionExpression"] = condition
     if condition_values:
         kwargs1["ExpressionAttributeValues"] = {**kwargs1["ExpressionAttributeValues"], **condition_values}
     table.update_item(**kwargs1)
 
     # 2) Set the game-type blob (single path [type, <g>]); no overlap with first call.
     names = {"#type": "type", "#g": g}
-    values = {":payload": payload}
+    values = {":payload": payload, **(condition_values or {})}
     expr = "SET #type.#g = :payload"
     if updated_at is not None:
         expr += ", updatedAt = :now"
@@ -169,6 +176,7 @@ def set_game_type_blob(table, game_id: str, game_type_upper: str, payload: dict,
         UpdateExpression=expr,
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
+        ConditionExpression=condition,
     )
 
 
@@ -220,13 +228,13 @@ def mask_email(email: str) -> str:
     return f"{show}@{domain}"
 
 
+OPTIONAL_PARTICIPANT_FIELDS = ("address", "company", "jobTitle", "birthDate")
+
+
 def default_participant_fields(game_type: str) -> dict:
-    if (game_type or "").upper() == "STACK":
-        return {"email": {"required": True}, "instagram": {"required": False},
-                "phone": {"required": True, "enabled": True}}
-    if (game_type or "").upper() in ("EMPAREJA2", "T1MER", "STACK"):
-        return {"email": {"required": True}, "instagram": {"required": False}, "phone": {"required": False}}
-    return {"email": {"required": False}, "instagram": {"required": True}, "phone": {"required": False}}
+    return {"email": {"required": True}, "instagram": {"required": False},
+            "phone": {"required": True, "enabled": True},
+            **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS}}
 
 
 def normalize_participant_fields(game_type: str, fields: dict | None = None, *, strict=False) -> dict:
@@ -241,7 +249,8 @@ def normalize_participant_fields(game_type: str, fields: dict | None = None, *, 
             raise ValueError(f"Unsupported participant field: {name}.")
         if not isinstance(config, dict):
             raise ValueError(f"participantFields.{name} must be an object.")
-        allowed = {"required", "enabled"} if name == "phone" else {"required"}
+        allowed = ({"enabled"} if name in OPTIONAL_PARTICIPANT_FIELDS
+                   else {"required", "enabled"} if name == "phone" else {"required"})
         if set(config) - allowed:
             raise ValueError(f"Unsupported participantFields.{name} option.")
         if "required" in config:
@@ -252,21 +261,16 @@ def normalize_participant_fields(game_type: str, fields: dict | None = None, *, 
             if not isinstance(config["enabled"], bool):
                 raise ValueError(f"participantFields.{name}.enabled must be a boolean.")
             result[name]["enabled"] = config["enabled"]
-    if (game_type or "").upper() == "STACK":
-        if strict and (result["email"]["required"] is False
-                       or result["phone"]["required"] is False or result["phone"]["enabled"] is False):
-            raise ValueError("STACK requires name, email and phone.")
-        result["email"] = {"required": True}
-        result["phone"] = {"required": True, "enabled": True}
+    if strict and (result["email"]["required"] is False
+                   or result["phone"]["required"] is False or result["phone"]["enabled"] is False):
+        raise ValueError("All games require name, email and phone.")
+    result["email"] = {"required": True}
+    result["phone"] = {"required": True, "enabled": True}
     return result
 
 
 def web_participant_fields(game_type: str, fields: dict | None = None) -> dict:
     result = normalize_participant_fields(game_type, fields)
-    result["email"] = {"required": True}
-    phone = result["phone"]
-    result["phone"] = {"required": (game_type or "").upper() == "STACK",
-                       "enabled": phone.get("enabled", phone["required"])}
     return result
 
 
@@ -331,7 +335,7 @@ def issue_prize_token(
     return f"{body}.{sig}"
 
 
-def verify_prize_token(token: str, secret: str) -> dict | None:
+def verify_prize_token(token: str, secret: str, allow_expired: bool = False) -> dict | None:
     if not token or not secret or "." not in token:
         return None
     body, sig = token.rsplit(".", 1)
@@ -343,7 +347,7 @@ def verify_prize_token(token: str, secret: str) -> dict | None:
         payload = json.loads(base64.urlsafe_b64decode(body + pad).decode("utf-8"))
     except Exception:
         return None
-    if int(payload.get("exp") or 0) < int(time.time()):
+    if not allow_expired and int(payload.get("exp") or 0) < int(time.time()):
         return None
     gid = (payload.get("gid") or "").strip()
     pid = payload.get("pid")

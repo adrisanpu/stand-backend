@@ -22,13 +22,19 @@ DEFAULT_STAND_LOGO_LIGHT_KEY = os.environ.get(
 
 MAX_FILES_PER_REQUEST = 10
 MAX_LOGO_SIZE = 5 * 1024 * 1024
+MAX_HOME_VIDEO_SIZE = 100 * 1024 * 1024
 PRESIGNED_TTL = 3600
 
 LOGO_ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/svg+xml"}
+HOME_BACKGROUND_IMAGE_TYPES = LOGO_ALLOWED_TYPES
+HOME_BACKGROUND_VIDEO_TYPES = {"video/mp4", "video/webm"}
 
 
 def _empty_media() -> dict:
-    return {"logo": {"items": [], "selectedId": None}}
+    return {
+        "logo": {"items": [], "selectedId": None},
+        "home-background": {"items": []},
+    }
 
 
 def _ensure_media_shape(item: dict | None) -> dict:
@@ -37,6 +43,19 @@ def _ensure_media_shape(item: dict | None) -> dict:
     logo.setdefault("items", [])
     logo.setdefault("selectedId", None)
     media["logo"] = logo
+    home_background = dict(media.get("home-background") or {})
+    owner_id = (item or {}).get("userId") or ""
+    items = home_background.get("items")
+    if not isinstance(items, list):
+        items = []
+    home_background["items"] = [
+        entry for entry in items
+        if isinstance(entry, dict)
+        and isinstance(entry.get("key"), str)
+        and entry["key"].startswith(f"users/{owner_id}/home-backgrounds/")
+        and ".." not in entry["key"]
+    ]
+    media["home-background"] = home_background
     return media
 
 
@@ -62,6 +81,8 @@ def _guess_extension(content_type: str) -> str:
         "image/jpeg": "jpg",
         "image/webp": "webp",
         "image/svg+xml": "svg",
+        "video/mp4": "mp4",
+        "video/webm": "webm",
     }
     return mapping.get(content_type, "bin")
 
@@ -107,9 +128,70 @@ def _handle_upload_url(event, user_id: str):
         kind = (file_info.get("kind") or "").strip().lower()
         file_name = _sanitize_file_name(file_info.get("fileName") or "")
         content_type = (file_info.get("contentType") or "").strip().lower()
-        size_bytes = int(file_info.get("sizeBytes") or 0)
+        raw_size_bytes = file_info.get("sizeBytes")
+        size_bytes = int(raw_size_bytes or 0)
         display_name = _sanitize_file_name(file_info.get("name") or file_name.rsplit(".", 1)[0])
 
+        if kind == "profile-photo":
+            if content_type not in {"image/png", "image/jpeg", "image/webp"}:
+                return _resp(400, {"error": "Unsupported profile photo content type."})
+            if not 0 < size_bytes <= MAX_LOGO_SIZE:
+                return _resp(400, {"error": "Profile photo must be between 1 byte and 5MB."})
+            key = f"users/{user_id}/profile-photos/{uuid.uuid4()}.{_guess_extension(content_type)}"
+            put_url = s3.generate_presigned_url(
+                "put_object",
+                Params={
+                    "Bucket": USER_MEDIA_BUCKET, "Key": key,
+                    "ContentType": content_type, "ContentLength": size_bytes,
+                },
+                ExpiresIn=PRESIGNED_TTL,
+            )
+            upload_urls.append({"kind": kind, "key": key, "url": put_url, "expiresIn": PRESIGNED_TTL})
+            continue
+        if kind == "home-background":
+            if type(raw_size_bytes) is not int:
+                return _resp(400, {"error": "Home background sizeBytes must be an integer."})
+            allowed_types = HOME_BACKGROUND_IMAGE_TYPES | HOME_BACKGROUND_VIDEO_TYPES
+            if content_type not in allowed_types:
+                return _resp(400, {
+                    "error": "Unsupported home background content type.",
+                    "allowedTypes": sorted(allowed_types),
+                })
+            max_size = MAX_HOME_VIDEO_SIZE if content_type in HOME_BACKGROUND_VIDEO_TYPES else MAX_LOGO_SIZE
+            if not 0 < size_bytes <= max_size:
+                limit = "100MB" if max_size == MAX_HOME_VIDEO_SIZE else "5MB"
+                return _resp(400, {"error": f"Home background must be between 1 byte and {limit}."})
+            key = f"users/{user_id}/home-backgrounds/{uuid.uuid4()}-{display_name}.{_guess_extension(content_type)}"
+            media_id = str(uuid.uuid4())
+            try:
+                put_url = s3.generate_presigned_url(
+                    "put_object",
+                    Params={
+                        "Bucket": USER_MEDIA_BUCKET, "Key": key,
+                        "ContentType": content_type, "ContentLength": size_bytes,
+                    },
+                    ExpiresIn=PRESIGNED_TTL,
+                )
+            except ClientError as e:
+                log("presign_put_failed", {"key": key, "error": str(e)})
+                return _resp(500, {"error": "PresignFailed", "detail": str(e)})
+            upload_urls.append({
+                "id": media_id,
+                "kind": kind,
+                "key": key,
+                "url": put_url,
+                "expiresIn": PRESIGNED_TTL,
+                "meta": {
+                    "id": media_id,
+                    "kind": kind,
+                    "name": display_name,
+                    "fileName": file_name,
+                    "contentType": content_type,
+                    "sizeBytes": size_bytes,
+                    "key": key,
+                },
+            })
+            continue
         if kind != "logo":
             return _resp(400, {"error": "kind must be 'logo'."})
         if not content_type:
@@ -165,8 +247,41 @@ def _handle_register(event, table, user_id: str):
     now = _iso_now()
     for item in items:
         kind = (item.get("kind") or "").strip().lower()
+        if kind == "home-background":
+            media_id = (item.get("id") or "").strip()
+            key = (item.get("key") or "").strip()
+            content_type = (item.get("contentType") or "").strip().lower()
+            if not media_id or not key or not key.startswith(f"users/{user_id}/home-backgrounds/") or ".." in key:
+                return _resp(400, {"error": "Invalid home background media key."})
+            allowed_types = HOME_BACKGROUND_IMAGE_TYPES | HOME_BACKGROUND_VIDEO_TYPES
+            if content_type not in allowed_types:
+                return _resp(400, {"error": "Unsupported home background content type."})
+            try:
+                metadata = s3.head_object(Bucket=USER_MEDIA_BUCKET, Key=key)
+            except Exception:
+                return _resp(400, {"error": "HomeBackgroundObjectNotFound"})
+            actual_type = (metadata.get("ContentType") or "").lower()
+            actual_size = metadata.get("ContentLength")
+            max_size = MAX_HOME_VIDEO_SIZE if actual_type in HOME_BACKGROUND_VIDEO_TYPES else MAX_LOGO_SIZE
+            if (actual_type != content_type or type(actual_size) is not int
+                    or not 0 < actual_size <= max_size):
+                return _resp(400, {"error": "InvalidHomeBackgroundObject"})
+            media_item = {
+                "id": media_id,
+                "kind": kind,
+                "name": (item.get("name") or "file").strip(),
+                "fileName": (item.get("fileName") or "").strip(),
+                "contentType": actual_type,
+                "sizeBytes": actual_size,
+                "key": key,
+                "createdAt": now,
+            }
+            media["home-background"]["items"] = _upsert_media_item(
+                media["home-background"]["items"], media_item,
+            )
+            continue
         if kind != "logo":
-            return _resp(400, {"error": "kind must be 'logo'."})
+            return _resp(400, {"error": "kind must be 'logo' or 'home-background'."})
         media_item = {
             "id": (item.get("id") or "").strip(),
             "kind": kind,
@@ -239,14 +354,19 @@ def _handle_delete(event, table, user_id: str):
     body = _read_json_body(event) or {}
     kind = (body.get("kind") or "").strip().lower()
     media_id = (body.get("mediaId") or "").strip()
-    if kind != "logo" or not media_id:
-        return _resp(400, {"error": "kind must be 'logo' and mediaId is required."})
+    if kind not in {"logo", "home-background"} or not media_id:
+        return _resp(400, {"error": "kind must be 'logo' or 'home-background' and mediaId is required."})
 
     _, media = _load_user_with_media(table, user_id)
     now = _iso_now()
-    media["logo"]["items"] = [it for it in media["logo"]["items"] if (it.get("id") or "") != media_id]
-    if media["logo"]["selectedId"] == media_id:
-        media["logo"]["selectedId"] = None
+    if kind == "logo":
+        media["logo"]["items"] = [it for it in media["logo"]["items"] if (it.get("id") or "") != media_id]
+        if media["logo"]["selectedId"] == media_id:
+            media["logo"]["selectedId"] = None
+    else:
+        media["home-background"]["items"] = [
+            it for it in media["home-background"]["items"] if (it.get("id") or "") != media_id
+        ]
 
     table.update_item(
         Key={"userId": user_id},
@@ -263,6 +383,12 @@ def _handle_get(table, user_id: str):
     for item in media["logo"]["items"]:
         logo_items.append({**item, "url": _presign_get_url(item.get("key") or "")})
     selected_logo = next((it for it in logo_items if it.get("id") == media["logo"]["selectedId"]), None)
+    home_background_items = []
+    home_prefix = f"users/{user_id}/home-backgrounds/"
+    for item in media["home-background"]["items"]:
+        key = item.get("key") or ""
+        if isinstance(key, str) and key.startswith(home_prefix) and ".." not in key:
+            home_background_items.append({**item, "url": _presign_get_url(key)})
 
     logo_defaults = {}
     if DEFAULT_STAND_LOGO_DARK_KEY:
@@ -301,6 +427,7 @@ def _handle_get(table, user_id: str):
                 "selected": selected_logo,
                 "defaults": logo_defaults,
             },
+            "home-background": {"items": home_background_items},
         },
     )
 

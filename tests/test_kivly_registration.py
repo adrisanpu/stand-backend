@@ -220,7 +220,7 @@ def test_verified_challenge_waits_then_retries_same_code_without_duplicate_playe
     drain(club)
     joined = join(club, challenge, sent_code(club))
     assert joined["statusCode"] == 200
-    assert club["dynamo"].rows("players")[0]["kivlyMembership"]["status"] == "confirmed"
+    assert club["dynamo"].rows("players")[0]["kivly"]["membership"]["status"] == "confirmed"
     again = join(club, challenge, sent_code(club))
     assert again["statusCode"] == 200
     assert response_body(joined)["playerToken"] == response_body(again)["playerToken"]
@@ -578,8 +578,8 @@ def test_request_key_normalizes_contacts_and_is_independent_of_challenge(club):
     {"customerId": ""},
 ])
 def test_player_gate_rejects_placeholder_pending_and_invalid_phone(club, membership):
-    player = {"kivlyMembership": {"locationId": "location",
-                                "consentVersion": club["settings"]["consentVersion"], **membership}}
+    player = {"kivly": {"membership": {"locationId": "location",
+                                "consentVersion": club["settings"]["consentVersion"], **membership}}}
     with pytest.raises(registration.RegistrationError, match="KivlyMembershipRequired"):
         registration.require_player(club["dynamo"], club["meta"], player)
 
@@ -588,8 +588,8 @@ def test_historical_real_membership_without_status_remains_valid(club, monkeypat
     from stand_common import kivly_participation
     unique = MagicMock()
     monkeypatch.setattr(kivly_participation, "require_unique_player", unique)
-    player = {"kivlyMembership": {"locationId": "location", "customerId": "real",
+    player = {"kivly": {"membership": {"locationId": "location", "customerId": "real",
                                 "phone": "+34 612345678",
-                                "consentVersion": club["settings"]["consentVersion"]}}
+                                "consentVersion": club["settings"]["consentVersion"]}}}
     registration.require_player(club["dynamo"], club["meta"], player)
     unique.assert_called_once_with(club["dynamo"], player)
