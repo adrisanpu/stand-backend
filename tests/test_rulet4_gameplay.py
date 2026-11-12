@@ -227,6 +227,7 @@ def test_web_assign_creates_rulet4_participant_with_verified_email(verified_web_
          patch.object(assign_mod, "_put_player") as put:
         response = assign_mod._handle_web_assign({
             "source": "web", "game_id": "ABC123", "username": "Player", "email": "player@club.test",
+            "phone": "+34612345678",
         })
     assert response["ok"] is True
     assert response["assignment"]["gameType"] == "RULET4"
@@ -255,6 +256,9 @@ def test_rulet4_registration_respects_game_and_capacity(meta, reason, verified_w
          patch.object(assign_mod, "_find_existing_player_by_email", return_value=None), \
          patch.object(assign_mod, "_put_verified_player", return_value="full"), \
          patch.object(assign_mod, "_put_player") as put:
-        response = assign_mod._handle_web_assign({"game_id": "ABC123", "username": "Player", "email": "player@club.test"})
+        response = assign_mod._handle_web_assign({
+            "game_id": "ABC123", "username": "Player", "email": "player@club.test",
+            "phone": "+34612345678",
+        })
     assert response["reason"] == reason
     put.assert_not_called()

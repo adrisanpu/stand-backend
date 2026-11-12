@@ -35,12 +35,12 @@ def test_stack_always_requires_phone(channel, phone, error):
     }
 
 
-def test_stack_rejects_disabling_phone_on_settings_write_but_reads_old_settings():
+def test_stack_rejects_disabling_phone_and_normalizes_legacy_settings():
     fields = {"phone": {"enabled": False, "required": False}}
-    with pytest.raises(ValueError, match="STACK requires"):
+    with pytest.raises(ValueError, match="All games require name, email and phone"):
         normalize_participant_fields("STACK", fields, strict=True)
     assert normalize_participant_fields("STACK", fields)["phone"]["required"] is True
-    assert web_participant_fields("T1MER", fields)["phone"]["enabled"] is False
+    assert web_participant_fields("T1MER", fields)["phone"]["enabled"] is True
 
 
 def test_program_channel_is_legacy_only_and_normalizes_to_wallet():
