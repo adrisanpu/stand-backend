@@ -132,6 +132,45 @@ def test_text_limits_and_allowed_fields():
             home_canvas.validate(invalid)
 
 
+@pytest.mark.parametrize("item_type", sorted(home_canvas.ITEM_TYPES))
+def test_optional_canvas_and_component_styles_survive_normalization(item_type):
+    canvas = home_canvas.empty()
+    style = {"backgroundColor": "#123456", "accentColor": "#AbCdEf", "color": "#ffffff", "fontSize": 96, "bold": True}
+    canvas["landscape"].update(style)
+    w, h = home_canvas.MIN_SIZE[item_type]
+    canvas["landscape"]["items"] = [{
+        "id": "styled", "type": item_type, "x": 0, "y": 0, "w": w, "h": h, **style,
+    }]
+    stored = json.loads(json.dumps(canvas), parse_int=Decimal)
+    assert home_canvas.resolved({"homeCanvas": stored}) == canvas
+    assert home_canvas.validate(canvas)["portrait"] == {"background": None, "items": []}
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("backgroundColor", "red"), ("accentColor", "#fff"), ("color", None),
+    ("fontSize", 15), ("fontSize", 161), ("fontSize", 24.5),
+    ("fontSize", True), ("fontSize", "48"), ("accentColor", 123),
+    ("bold", 1), ("bold", "true"), ("bold", None),
+])
+@pytest.mark.parametrize("component", [False, True])
+def test_invalid_style_fields_rejected_at_both_levels(field, value, component):
+    canvas = home_canvas.empty()
+    if component:
+        canvas["landscape"]["items"] = [_text(**{field: value})]
+    else:
+        canvas["landscape"][field] = value
+    with pytest.raises(home_canvas.HomeCanvasError):
+        home_canvas.validate(canvas)
+
+
+def test_canvas_background_must_be_solid_hex_and_unknown_style_fields_are_rejected():
+    for fields in ({"backgroundColor": "transparent"}, {"fontFamily": "Arial"}):
+        canvas = home_canvas.empty()
+        canvas["landscape"].update(fields)
+        with pytest.raises(home_canvas.HomeCanvasError):
+            home_canvas.validate(canvas)
+
+
 def test_canvas_validation_rejects_duplicate_singletons_and_more_than_forty_items():
     canvas = home_canvas.empty()
     canvas["landscape"]["items"] = [
@@ -266,6 +305,10 @@ def test_free_home_save_allows_layout_and_text_but_uses_independent_revision():
     canvas["landscape"]["items"].append(_text(0, 9, text="Welcome"))
     canvas["portrait"]["items"].append(_text(0, 20, text="Welcome"))
     canvas["landscape"]["items"][0]["backgroundColor"] = "#123456"
+    canvas["landscape"]["fontSize"] = 96
+    canvas["landscape"]["bold"] = True
+    canvas["landscape"]["items"][0]["bold"] = False
+    canvas["landscape"]["items"][0]["fontSize"] = 32
     canvas["portrait"]["items"][0]["backgroundColor"] = "transparent"
     expected = home_canvas.revision(home_canvas.initial(item))
     table = MagicMock()
@@ -317,6 +360,60 @@ def test_free_home_save_rejects_premium_background_or_custom_text_color(change):
     assert response["statusCode"] == 403
     assert response_body(response)["error"] == "PlanUpgradeRequired"
     table.update_item.assert_not_called()
+
+
+@pytest.mark.parametrize("orientation", ["landscape", "portrait"])
+@pytest.mark.parametrize(("field", "component"), [
+    ("backgroundColor", False), ("accentColor", False), ("color", False),
+    ("accentColor", True), ("color", True),
+])
+def test_free_home_style_color_changes_are_gated(orientation, field, component):
+    canvas = home_canvas.empty()
+    if component:
+        canvas[orientation]["items"] = [_text(**{field: "#123456"})]
+    else:
+        canvas[orientation][field] = "#123456"
+    item = {
+        "gameId": "ABC123", "gameType": "INFOCARDS", "ownerUserId": "owner",
+        "isActive": True, "homeCanvas": home_canvas.empty(), "homeRevision": "r1",
+    }
+    table = MagicMock()
+    table.get_item.return_value = {"Item": item}
+    with patch.object(game, "games_table", table), \
+            patch.object(game, "_get_user", return_value={"plan": "FREE"}):
+        response = game.lambda_handler(_canvas_event("PUT", body={
+            "gameId": "ABC123", "homeCanvas": canvas, "expectedHomeRevision": "r1",
+        }), None)
+    assert response["statusCode"] == 403
+    assert response_body(response)["error"] == "PlanUpgradeRequired"
+    table.update_item.assert_not_called()
+
+
+@pytest.mark.parametrize("pro", [False, True])
+def test_style_save_preserves_premium_colors_and_independent_orientations(pro):
+    stored = home_canvas.empty()
+    stored["landscape"].update(backgroundColor="#123456", accentColor="#abcdef", color="#ffffff")
+    stored["landscape"]["items"] = [_text(color="#fedcba", accentColor="#654321")]
+    canvas = json.loads(json.dumps(stored))
+    canvas["landscape"]["fontSize"] = 96
+    canvas["landscape"]["items"][0]["fontSize"] = 32
+    canvas["portrait"]["fontSize"] = 24
+    if pro:
+        canvas["portrait"].update(backgroundColor="#222222", accentColor="#aaaaaa", color="#eeeeee")
+    item = {
+        "gameId": "ABC123", "gameType": "INFOCARDS", "ownerUserId": "owner",
+        "isActive": True, "homeCanvas": stored, "homeRevision": "r1",
+    }
+    table = MagicMock()
+    table.get_item.return_value = {"Item": item}
+    with patch.object(game, "games_table", table), \
+            patch.object(game, "_is_user_pro", return_value=pro):
+        response = game.lambda_handler(_canvas_event("PUT", body={
+            "gameId": "ABC123", "homeCanvas": canvas, "expectedHomeRevision": "r1",
+        }), None)
+    assert response["statusCode"] == 200
+    assert response_body(response)["homeCanvas"] == canvas
+    assert table.update_item.call_args.kwargs["ExpressionAttributeValues"][":canvas"] == canvas
 
 
 def test_home_save_rejects_stale_revision_and_inactive_game_without_writes():

@@ -242,12 +242,15 @@ def _save_home_canvas(item, owner_user_id, body):
                 new_composition = canvas[orientation]
                 if old_composition["background"] != new_composition["background"]:
                     return _resp(403, {"error": "PlanUpgradeRequired"})
-                previous_text_colors = {
-                    element["id"]: element.get("color")
-                    for element in old_composition["items"] if element["type"] == "text"
+                if any(old_composition.get(key) != new_composition.get(key)
+                       for key in ("backgroundColor", "accentColor", "color")):
+                    return _resp(403, {"error": "PlanUpgradeRequired"})
+                previous_colors = {
+                    element["id"]: (element.get("color"), element.get("accentColor"))
+                    for element in old_composition["items"]
                 }
                 for element in new_composition["items"]:
-                    if element["type"] == "text" and element.get("color") != previous_text_colors.get(element["id"]):
+                    if (element.get("color"), element.get("accentColor")) != previous_colors.get(element["id"], (None, None)):
                         return _resp(403, {"error": "PlanUpgradeRequired"})
         _home_backgrounds_owned(canvas, owner_user_id)
     except home_canvas.HomeCanvasError as exc:

@@ -24,10 +24,28 @@ MIN_SIZE = {
 ITEM_TYPES = set(MIN_SIZE)
 _ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _COLOR = re.compile(r"#[0-9a-fA-F]{6}\Z")
+STYLE_FIELDS = {"backgroundColor", "accentColor", "color", "fontSize", "bold"}
 
 
 class HomeCanvasError(ValueError):
     pass
+
+
+def _validate_style(style, transparent=False):
+    if "bold" in style and type(style["bold"]) is not bool:
+        raise HomeCanvasError("InvalidHomeCanvasBold")
+    for field in ("backgroundColor", "accentColor", "color"):
+        if field not in style:
+            continue
+        color = style[field]
+        if not isinstance(color, str) or not (
+            (transparent and field == "backgroundColor" and color == "transparent")
+            or _COLOR.fullmatch(color)
+        ):
+            error = "InvalidHomeCanvasBackgroundColor" if field == "backgroundColor" else "InvalidHomeCanvasColor"
+            raise HomeCanvasError(error)
+    if "fontSize" in style and (type(style["fontSize"]) is not int or not 16 <= style["fontSize"] <= 160):
+        raise HomeCanvasError("InvalidHomeCanvasFontSize")
 
 
 def empty():
@@ -79,8 +97,10 @@ def validate(value, owner_user_id=None):
     normalized = {"version": VERSION}
     for orientation, (columns, rows) in (("landscape", LANDSCAPE), ("portrait", PORTRAIT)):
         composition = value[orientation]
-        if not isinstance(composition, dict) or set(composition) != {"background", "items"}:
+        if (not isinstance(composition, dict) or not {"background", "items"} <= set(composition)
+                or set(composition) - ({"background", "items"} | STYLE_FIELDS)):
             raise HomeCanvasError("InvalidHomeCanvasComposition")
+        _validate_style(composition)
         background = composition["background"]
         if background is not None:
             if not isinstance(background, dict) or set(background) != {"key", "type"}:
@@ -100,9 +120,9 @@ def validate(value, owner_user_id=None):
         for item in items:
             if not isinstance(item, dict):
                 raise HomeCanvasError("InvalidHomeCanvasItem")
-            allowed = {"id", "type", "x", "y", "w", "h", "backgroundColor"}
+            allowed = {"id", "type", "x", "y", "w", "h"} | STYLE_FIELDS
             if item.get("type") == "text":
-                allowed |= {"text", "fontSize", "color", "align"}
+                allowed |= {"text", "align"}
             if set(item) - allowed or not {"id", "type", "x", "y", "w", "h"} <= set(item):
                 raise HomeCanvasError("InvalidHomeCanvasItem")
             item_id, item_type = item["id"], item["type"]
@@ -121,21 +141,11 @@ def validate(value, owner_user_id=None):
             min_w, min_h = MIN_SIZE[item_type]
             if x < 0 or y < 0 or w < min_w or h < min_h or x + w > columns or y + h > rows:
                 raise HomeCanvasError("InvalidHomeCanvasBounds")
-            if "backgroundColor" in item:
-                background_color = item["backgroundColor"]
-                if (not isinstance(background_color, str) or (
-                        background_color != "transparent" and not _COLOR.fullmatch(background_color))):
-                    raise HomeCanvasError("InvalidHomeCanvasBackgroundColor")
+            _validate_style(item, transparent=True)
             if item_type == "text":
                 text = item.get("text", "")
                 if not isinstance(text, str) or len(text) > MAX_TEXT_LENGTH:
                     raise HomeCanvasError("InvalidHomeCanvasText")
-                font_size = item.get("fontSize")
-                if font_size is not None and (type(font_size) is not int or not 16 <= font_size <= 160):
-                    raise HomeCanvasError("InvalidHomeCanvasFontSize")
-                color = item.get("color")
-                if color is not None and (not isinstance(color, str) or not _COLOR.fullmatch(color)):
-                    raise HomeCanvasError("InvalidHomeCanvasColor")
                 align = item.get("align")
                 if align is not None and (
                     not isinstance(align, str) or align not in {"left", "center", "right"}
@@ -152,6 +162,7 @@ def validate(value, owner_user_id=None):
                         and second["y"] < first["y"] + first["h"]):
                     raise HomeCanvasError("HomeCanvasOverlap")
         normalized[orientation] = {"background": background, "items": normalized_items}
+        normalized[orientation].update({key: composition[key] for key in STYLE_FIELDS if key in composition})
     return normalized
 
 
