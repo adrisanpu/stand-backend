@@ -132,11 +132,14 @@ parameter to `false` and redeploy to restore read-only protection; new customer
 creation then returns `KivlyWritesDisabled` and prize delivery stays queued.
 
 The dev configuration also enables `StackRewardEmailEnabled=true` for authorized
-testing. Existing campaigns/attempts keep wallet unless Email is selected for
-new attempts. Reward mail uses the verified SES sender above and the phone
+testing. This enables the shared native STAND prize notification for all web
+game types; Kivly awards keep their separate per-STACK-attempt Wallet/Email
+choice. Existing campaigns/attempts keep wallet unless Email is selected for
+new attempts. Kivly reward mail uses the verified SES sender above and the phone
 stored in Kivly; confirm scanner acceptance with a designated test participant.
 Deployment alone does not send a test email or prove physical redemption.
-Set `StackRewardEmailEnabled=false` and redeploy to pause pending reward emails.
+Set `StackRewardEmailEnabled=false` and redeploy to pause pending reward emails
+across games.
 The template default remains false and production configuration does not enable it.
 
 Note outputs:

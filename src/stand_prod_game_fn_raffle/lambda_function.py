@@ -1,5 +1,6 @@
 # raffle.py  (handler: raffle.lambda_handler)
 import os
+from stand_common import game_forms
 import json
 import base64
 import random
@@ -9,7 +10,7 @@ import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 from stand_common.utils import log, _resp, _iso_now, _as_int, get_game_type_blob, _get_claims
-from stand_common import stack_prizes
+from stand_common import stack_prizes, game_lifecycle
 
 # ============ ENV VARS ============
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -143,15 +144,11 @@ def _save_raffle_winners_to_game(game_id: str, winners: list[dict], only_validat
 
     final_winners = existing_winners + new_winners
 
-    games_table.update_item(
-        Key={"gameId": game_id},
-        UpdateExpression="SET raffleWinners = :w, raffleLastRunAt = :t, raffleOnlyValidated = :ov",
-        ExpressionAttributeValues={
-            ":w": final_winners,
-            ":t": win_ts,
-            ":ov": bool(only_validated),
-        },
-    )
+    stack_prizes.transact(dynamo_r, [stack_prizes.game_update(
+        existing_game, ", raffleWinners = :w, raffleLastRunAt = :t, raffleOnlyValidated = :ov",
+        {":w": final_winners, ":t": win_ts, ":ov": bool(only_validated), ":active": True},
+        extra=" AND isActive = :active",
+    )])
 
 
 def _query_all_players(game_id: str):
@@ -276,6 +273,7 @@ def lambda_handler(event, context):
             won = {int(w["playerId"]) for w in previous}
             pool = [p for p in stack_prizes.players(dynamo_r, game_id)
                     if int(p["playerId"]) not in won
+                    and not game_forms.pending(game, p, "raffle")
                     and get_game_type_blob(p, "STACK").get("attempt", {}).get("status") != "excluded" and (
                         not only_validated or get_game_type_blob(p, "STACK").get("attempt", {}).get("status") == "finished")]
             selected = random.sample(pool, min(len(pool), n_winners))
@@ -304,6 +302,8 @@ def lambda_handler(event, context):
             pid = _as_int(it.get("playerId"))
             if pid is None or pid <= 0:
                 continue
+            if game_forms.pending(game, it, "raffle"):
+                continue
             # raffleEligible check: read type.<gameType>.raffleEligible; default True if missing
             t = it.get("type") or {}
             tb = t.get(game_type) or {}
@@ -330,7 +330,7 @@ def lambda_handler(event, context):
                 return True
             if use_validation_filter:
                 return _is_validated(it)
-            return not quiz_configured or _is_quiz_completed(it, game_type)
+            return "formConfig" in game or not quiz_configured or _is_quiz_completed(it, game_type)
 
         winners = []
         tried_indices: set[int] = set()
@@ -357,16 +357,22 @@ def lambda_handler(event, context):
 
         win_ts = _iso_now()
         # Persistimos winners a nivel game para polling del frontend
-        try:
-            _save_raffle_winners_to_game(game_id, winners, only_validated, win_ts)
-        except Exception as e:
-            log("raffle_save_to_game_error", {"error": repr(e), "gameId": game_id})
+        _save_raffle_winners_to_game(game_id, winners, only_validated, win_ts)
 
         # 4) persistimos win individual por jugador
         for w in winners:
             pid = int(w["playerId"])
             try:
                 _mark_winner(game_id, pid, game_type, win_ts)
+                if (game.get("prizeCatalog") or {}).get("raffle", {}).get("name"):
+                    player = gp_table.get_item(
+                        Key={"gameId": game_id, "playerId": pid}, ConsistentRead=True,
+                    ).get("Item")
+                    if player:
+                        current_meta = game_lifecycle.current(dynamo_r, game_id)
+                        game_lifecycle.issue_native_award(
+                            dynamo_r, current_meta, player, "raffle",
+                        )
             except Exception as e:
                 log("raffle_update_error", {"error": repr(e), "gameId": game_id, "playerId": pid})
 

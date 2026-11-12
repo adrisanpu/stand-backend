@@ -68,6 +68,12 @@ def _setup(monkeypatch, game_type="EMPAREJA2", owner="owner", game_id="ABC123", 
         item["prizeCatalog"] = catalog
     table.get_item.return_value = {"Item": item}
     mod.games_table = table
+    table.query.return_value = {"Items": []}
+    mod.users_table = MagicMock()
+    mod.users_table.get_item.return_value = {"Item": {
+        "userId": owner, "sharedPrizeCatalog": [],
+        "sharedPrizeCatalogRevision": 1, "sharedPrizeCatalogState": "ready",
+    }}
     mod.USER_MEDIA_BUCKET = "media"
     mod.prize_s3 = MagicMock()
     mod.prize_s3.generate_presigned_url.return_value = "https://signed"
@@ -487,3 +493,172 @@ def test_upload_url_rejects_unauthenticated_and_foreign_games(monkeypatch):
         _event("POST", body, path="/v1/game/prizes", action="upload-url"), None,
     )
     assert response["statusCode"] == 403
+
+
+def _shared_catalog_setup(monkeypatch, catalog=None, revision=1, games=None):
+    monkeypatch.setattr(mod, "USER_MEDIA_BUCKET", "media")
+    users = MagicMock()
+    users.get_item.return_value = {"Item": {
+        "userId": "owner",
+        "sharedPrizeCatalog": catalog or [],
+        "sharedPrizeCatalogRevision": revision,
+        "sharedPrizeCatalogState": "ready",
+    }}
+    mod.users_table = users
+    mod.games_table = MagicMock()
+    monkeypatch.setattr(mod.shared_prizes, "migrate", lambda *_: catalog or [])
+    monkeypatch.setattr(mod.shared_prizes, "_read_games", lambda *_: games or [])
+    monkeypatch.setattr(mod.shared_prizes, "synchronize", MagicMock())
+    return users
+
+
+def test_shared_catalog_put_checks_revision_and_propagates_master_edits(monkeypatch):
+    current = [{"id": "gift", "name": "Old gift", "imageKey": None}]
+    users = _shared_catalog_setup(monkeypatch, current)
+    response = mod.lambda_handler(_event("PUT", {
+        "catalog": [{"id": "gift", "name": "New gift", "imageKey": None}],
+        "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"ok": True, "revision": 2}
+    assert users.update_item.call_args.kwargs["ExpressionAttributeValues"][":catalog"] == [
+        {"id": "gift", "name": "New gift", "imageKey": None},
+    ]
+    mod.shared_prizes.synchronize.assert_called_once_with(
+        mod.games_table, "owner", [{"id": "gift", "name": "New gift", "imageKey": None}],
+    )
+
+
+@pytest.mark.parametrize("operation", ["delete", "rename"])
+def test_shared_catalog_put_does_not_download_unchanged_images(monkeypatch, operation):
+    current = [
+        {"id": f"gift-{index}", "name": f"Gift {index}",
+         "imageKey": f"games/owner/ABC123/ranking/{index}.png"}
+        for index in range(15)
+    ]
+    users = _shared_catalog_setup(monkeypatch, current)
+    monkeypatch.setattr(mod.prize_inventory, "enabled", lambda: False)
+    s3 = MagicMock()
+    monkeypatch.setattr(mod, "prize_s3", s3)
+    updated = [dict(prize) for prize in current[1:]]
+    if operation == "rename":
+        updated = [dict(prize) for prize in current]
+        updated[0]["name"] = "Renamed gift"
+
+    response = mod.lambda_handler(_event("PUT", {
+        "catalog": updated, "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == 200
+    s3.head_object.assert_not_called()
+    s3.get_object.assert_not_called()
+    assert users.update_item.call_args.kwargs["ExpressionAttributeValues"][":catalog"] == updated
+    mod.shared_prizes.synchronize.assert_called_once_with(mod.games_table, "owner", updated)
+
+
+@pytest.mark.parametrize("new_entry", [False, True])
+@pytest.mark.parametrize("valid_image", [False, True])
+def test_shared_catalog_put_validates_new_or_changed_images(monkeypatch, new_entry, valid_image):
+    current = [{"id": "gift", "name": "Gift", "imageKey": "prizes/owner/old.png"}]
+    users = _shared_catalog_setup(monkeypatch, current)
+    key = "prizes/owner/new.png"
+    updated = [{"id": "gift", "name": "Gift", "imageKey": key}]
+    if new_entry:
+        updated = current + [{"id": "new-gift", "name": "New gift", "imageKey": key}]
+    s3 = MagicMock()
+    data = _png() if valid_image else b"not png"
+    s3.head_object.return_value = {"ContentLength": len(data)}
+    s3.get_object.return_value = {"Body": io.BytesIO(data)}
+    monkeypatch.setattr(mod, "prize_s3", s3)
+
+    response = mod.lambda_handler(_event("PUT", {
+        "catalog": updated, "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == (200 if valid_image else 400)
+    s3.head_object.assert_called_once_with(Bucket="media", Key=key)
+    s3.get_object.assert_called_once_with(Bucket="media", Key=key)
+    if valid_image:
+        users.update_item.assert_called_once()
+    else:
+        users.update_item.assert_not_called()
+        mod.shared_prizes.synchronize.assert_not_called()
+
+
+def test_shared_catalog_put_checks_ownership_even_for_unchanged_images(monkeypatch):
+    current = [{"id": "gift", "name": "Gift", "imageKey": "prizes/another-owner/gift.png"}]
+    users = _shared_catalog_setup(monkeypatch, current)
+    read_image = MagicMock()
+    monkeypatch.setattr(mod, "_read_verified_prize_image", read_image)
+
+    response = mod.lambda_handler(_event("PUT", {
+        "catalog": current, "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == 400
+    read_image.assert_not_called()
+    users.update_item.assert_not_called()
+
+
+@pytest.mark.parametrize("in_use", ["initialized", "assigned", "historicalAssigned"])
+def test_shared_catalog_put_rejects_deleting_inventory_in_use(monkeypatch, in_use):
+    users = _shared_catalog_setup(monkeypatch, [{"id": "gift", "name": "Gift", "imageKey": None}])
+    monkeypatch.setattr(mod.prize_inventory, "enabled", lambda: True)
+    stock = {"initialized": False, "assigned": 0, "historicalAssigned": 0}
+    stock[in_use] = 1
+    monkeypatch.setattr(mod.prize_inventory, "balance", lambda *_: stock)
+
+    response = mod.lambda_handler(_event("PUT", {
+        "catalog": [], "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == 409
+    assert json.loads(response["body"])["error"] == "SharedPrizeInUse"
+    users.update_item.assert_not_called()
+
+
+def test_shared_catalog_put_rejects_stale_revision_and_referenced_deletion(monkeypatch):
+    catalog = [{"id": "gift", "name": "Gift", "imageKey": None}]
+    users = _shared_catalog_setup(monkeypatch, catalog, revision=2)
+    stale = mod.lambda_handler(_event("PUT", {
+        "catalog": [], "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+    assert stale["statusCode"] == 409
+    users.update_item.assert_not_called()
+
+    _shared_catalog_setup(monkeypatch, catalog, revision=2, games=[{
+        "prizeCatalog": {"ranking": {"sharedPrizeId": "gift"}},
+        "stackPrizeProgram": {"catalog": []},
+    }])
+    referenced = mod.lambda_handler(_event("PUT", {
+        "catalog": [], "expectedRevision": 2,
+    }, path="/v1/prizes/catalog"), None)
+    assert referenced["statusCode"] == 409
+    assert json.loads(referenced["body"])["error"] == "SharedPrizeInUse"
+    mod.users_table.update_item.assert_not_called()
+
+
+def test_shared_catalog_reports_partial_propagation_failure(monkeypatch):
+    users = _shared_catalog_setup(monkeypatch)
+    mod.shared_prizes.synchronize.side_effect = RuntimeError("game update failed")
+    response = mod.lambda_handler(_event("PUT", {
+        "catalog": [{"id": "gift", "name": "Gift", "imageKey": None}],
+        "expectedRevision": 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == 500
+    assert json.loads(response["body"]) == {
+        "error": "SharedPrizeCatalogSyncFailed", "catalogUpdated": True,
+    }
+    users.update_item.assert_called_once()
+
+
+def test_shared_catalog_upload_url_rejects_invalid_png_metadata(monkeypatch):
+    _shared_catalog_setup(monkeypatch)
+    response = mod.lambda_handler(_event("POST", {
+        "action": "upload-url", "contentType": "image/png", "sizeBytes": 5 * 1024 * 1024 + 1,
+    }, path="/v1/prizes/catalog"), None)
+
+    assert response["statusCode"] == 400
+    mod.prize_s3.generate_presigned_url.assert_not_called()

@@ -52,7 +52,8 @@ def staged_prize_image_key(owner_id: str, game_id: str, slot: str, image_key: st
 
 def validate_prize_catalog(catalog, game_type: str, raffles_enabled: bool,
                            owner_id: str, game_id: str,
-                           existing_catalog: dict | None = None) -> dict:
+                           existing_catalog: dict | None = None,
+                           shared_catalog: list | None = None) -> dict:
     """Validate a catalog; omitted imageKey keeps its existing association, null removes it."""
     if not isinstance(catalog, dict):
         raise ValueError("prizeCatalog must be an object.")
@@ -71,7 +72,7 @@ def validate_prize_catalog(catalog, game_type: str, raffles_enabled: bool,
     for slot, prize in catalog.items():
         if not isinstance(prize, dict):
             raise ValueError(f"prizeCatalog.{slot} must be an object.")
-        allowed_fields = {"name", "limit", "imageKey"}
+        allowed_fields = {"name", "limit", "imageKey", "sharedPrizeId"}
         if slot == "ranking":
             allowed_fields.add("topX")
         if set(prize) - allowed_fields:
@@ -79,18 +80,30 @@ def validate_prize_catalog(catalog, game_type: str, raffles_enabled: bool,
         name = prize.get("name")
         if not isinstance(name, str):
             raise ValueError(f"prizeCatalog.{slot}.name must be a string.")
+        shared_id = prize.get("sharedPrizeId")
+        shared_prize = None
+        if shared_id is not None:
+            if not isinstance(shared_id, str):
+                raise ValueError(f"prizeCatalog.{slot}.sharedPrizeId must be a string.")
+            shared_prize = next((entry for entry in shared_catalog or []
+                                 if isinstance(entry, dict) and entry.get("id") == shared_id), None)
+            if not shared_prize:
+                raise ValueError(f"prizeCatalog.{slot}.sharedPrizeId is not in the shared catalog.")
+            name = shared_prize["name"]
         limit = prize.get("limit")
         if limit is not None and (type(limit) is not int or limit < 0):
             raise ValueError(f"prizeCatalog.{slot}.limit must be a non-negative integer or null.")
         existing_prize = existing_catalog.get(slot) or {}
-        image_key = prize.get("imageKey", existing_prize.get("imageKey"))
+        image_key = shared_prize.get("imageKey") if shared_prize else prize.get("imageKey", existing_prize.get("imageKey"))
         key_is_committed = image_key is None or prize_image_key(owner_id, game_id, slot, image_key)
         key_is_staged = image_key is not None and staged_prize_image_key(
             owner_id, game_id, slot, image_key,
         )
-        if image_key is not None and not (key_is_committed or key_is_staged):
+        if image_key is not None and shared_prize is None and not (key_is_committed or key_is_staged):
             raise ValueError(f"prizeCatalog.{slot}.imageKey is not a valid uploaded image for this game.")
         normalized_prize = {"name": name, "limit": limit, "imageKey": image_key}
+        if shared_prize:
+            normalized_prize["sharedPrizeId"] = shared_id
         if slot == "ranking":
             if "topX" in prize:
                 top_x = prize["topX"]
@@ -108,6 +121,8 @@ def validate_prize_catalog(catalog, game_type: str, raffles_enabled: bool,
                 "limit": previous.get("limit"),
                 "imageKey": previous.get("imageKey"),
             }
+            if previous.get("sharedPrizeId") is not None:
+                previous_prize["sharedPrizeId"] = previous["sharedPrizeId"]
             if normalized_prize != previous_prize or key_is_staged:
                 raise ValueError("Existing raffle prize cannot be changed without the required plan.")
         normalized[slot] = normalized_prize

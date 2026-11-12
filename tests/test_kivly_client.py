@@ -27,6 +27,40 @@ def token_response(**changes):
         **changes,
     }}
 
+def test_delete_reward_uses_scoped_delete_and_accepts_empty_204(client):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    response = MagicMock()
+    response.status = 204
+    response.read.return_value = b""
+    client._opener.open.return_value.__enter__.return_value = response
+    assert client.delete_reward("location", "owner", "reward/id") is None
+    request = client._opener.open.call_args.args[0]
+    assert request.method == "DELETE"
+    assert request.full_url == kivly.BASE_URL + "/api/v1/rewards/reward%2Fid"
+    assert request.data is None
+
+
+def test_delete_reward_checks_location_before_external_write(client):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    with pytest.raises(KivlyError, match="KivlyScopeMismatch"):
+        client.delete_reward("another", "owner", "reward")
+    client._opener.open.assert_not_called()
+
+
+def test_delete_reward_never_retries_uncertain_write(client):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    client._opener.open.side_effect = URLError("timeout")
+    with pytest.raises(KivlyError, match="KivlyRewardDeletionUncertain"):
+        client.delete_reward("location", "owner", "reward")
+    client._opener.open.assert_called_once()
+
+
+def test_scoped_delete_cannot_target_customers(client):
+    client._authenticate = lambda: _Token("token", "location", "owner", 99999)
+    with pytest.raises(KivlyError, match="KivlyRequestNotAllowed"):
+        client._scoped_request("location", "owner", "/api/v1/customers/customer", method="DELETE")
+    client._opener.open.assert_not_called()
+
 
 def context_response(**changes):
     return {

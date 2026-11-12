@@ -247,9 +247,9 @@ def test_pending_legacy_membership_cannot_play(monkeypatch):
     monkeypatch.setattr(registration, "_required_connection", lambda *_: {"locationId": "location"})
     result = {"status": "pending", "customerId": "pending-reconciliation",
               "locationId": "location", "consentVersion": "version", "phone": "+34 612345678"}
-    assert registration.is_pending_membership({"kivlyMembership": result})
+    assert registration.is_pending_membership({"kivly": {"membership": result}})
     with pytest.raises(registration.RegistrationError, match="KivlyMembershipRequired"):
-        registration.require_player(MagicMock(), meta, {"kivlyMembership": result})
+        registration.require_player(MagicMock(), meta, {"kivly": {"membership": result}})
 
 
 def test_account_saves_shared_club_without_replacing_credentials(monkeypatch):
@@ -289,10 +289,10 @@ def test_shared_storefront_save_and_get_preserve_legal_consent_and_membership(mo
             "participantFields": {"email": {"required": True}}}
     from stand_common import kivly_participation
     monkeypatch.setattr(kivly_participation, "require_unique_player", lambda *_: None)
-    registration.require_player(dynamo, game, {"kivlyMembership": {
+    registration.require_player(dynamo, game, {"kivly": {"membership": {
         "customerId": "customer", "locationId": "location", "consentVersion": before["consentVersion"],
         "phone": "+34 612345678",
-    }})
+    }}})
     client = MagicMock()
     client.get_context.return_value = type("Context", (), {
         "location_id": "location", "owner_id": "kivly-owner", "location_name": "Club",

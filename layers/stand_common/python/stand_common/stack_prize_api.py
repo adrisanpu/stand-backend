@@ -6,8 +6,43 @@ import boto3
 from botocore.exceptions import ClientError
 from stand_common import kivly_registration as registration
 from stand_common import stack_prizes as prizes
+from stand_common import game_lifecycle, reward_conditions, prize_inventory
 from stand_common.prizes import staged_prize_image_key
 from stand_common.utils import _get_claims, _read_json_body, _resp, _json_sanitize, get_game_type_blob
+
+
+def release_unused_reservations(dynamo, meta, program, stock, rows):
+    selected = {allocation["prizeId"] for rule in program["rules"]
+                for group in rule["groups"] for allocation in group["allocations"]}
+    removed = {prize["id"] for prize in program["catalog"]} - selected
+    if not removed:
+        return program, stock
+    consumed = {
+        prize["id"]: max(
+            stock[prize["id"]]["total"] - stock[prize["id"]]["remaining"]
+            if stock[prize["id"]]["total"] is not None else 0,
+            sum(row.get("id", "").startswith("award_")
+                and row.get("prize", {}).get("id") == prize["id"] for row in rows),
+        ) for prize in program["catalog"]
+    }
+    if prize_inventory.enabled():
+        identities = {p["id"]: prize_inventory.prize_id(p) for p in program["catalog"]}
+        for pid in {identities[local_id] for local_id in removed} - {None}:
+            assigned = prize_inventory.event_usage(dynamo, meta["ownerUserId"], pid).get(
+                meta["gameId"], {}).get("assigned", 0)
+            # Movement history survives deleted awards and can predate local stock counters.
+            missing = max(0, assigned - sum(consumed[local_id] for local_id in identities if identities[local_id] == pid))
+            local_id = next(p["id"] for p in program["catalog"] if p["id"] in removed and identities[p["id"]] == pid)
+            consumed[local_id] += missing
+    catalog = []
+    stock = {**stock}
+    for prize in program["catalog"]:
+        if prize["id"] in removed:
+            quantity = consumed[prize["id"]]
+            prize = {**prize, "stockTotal": quantity}
+            stock[prize["id"]] = {"total": quantity, "remaining": 0}
+        catalog.append(prize)
+    return {**program, "catalog": catalog}, stock
 
 
 def handle(event, method, dynamo, raffles_enabled, read_image):
@@ -37,10 +72,9 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
                 try:
                     prizes.table(dynamo).update_item(
                         Key=key, UpdateExpression="SET emailState = :pending, emailAttempts = :zero, #w = :pending, dueAt = :zero REMOVE emailError",
-                        ConditionExpression="#s = :confirmed AND deliveryChannel = :email AND emailState = :failed",
-                        ExpressionAttributeNames={"#s": "state", "#w": "work"},
-                        ExpressionAttributeValues={":pending": "pending", ":zero": 0, ":confirmed": "confirmed",
-                                                   ":email": "email", ":failed": "failed"},
+                        ConditionExpression="emailState = :failed",
+                        ExpressionAttributeNames={"#w": "work"},
+                        ExpressionAttributeValues={":pending": "pending", ":zero": 0, ":failed": "failed"},
                     )
                 except ClientError as exc:
                     if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -54,16 +88,13 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
             if (not isinstance(excluded, list) or len(excluded) > 100
                     or any(type(pid) is not int or pid < 1 for pid in excluded)):
                 raise prizes.PrizeError("InvalidExcludedPlayers", 400)
-            try:
-                prizes.close(dynamo, meta, excluded)
-            except prizes.PrizeError as exc:
-                if exc.code != "StackClosingStarted":
-                    raise
-            current = games.get_item(Key={"gameId": meta["gameId"]}, ConsistentRead=True)["Item"]
+            if excluded:
+                raise prizes.PrizeError("PendingAttemptsMustFinish")
+            current = game_lifecycle.change_active(dynamo, meta, False)
             return response(dynamo, current)
         if method != "PUT":
             return _resp(405, {"ok": False, "error": "MethodNotAllowed"})
-        if meta.get("stackPrizeState", "open") != "open":
+        if meta.get("archivedAt") or not meta.get("isActive", True) or meta.get("stackPrizeState", "open") != "open":
             raise prizes.PrizeError("StackClosing")
         if "stackPrizeProgram" not in meta and any(
             get_game_type_blob(p, "STACK").get("attempt", {}).get("status") == "started"
@@ -71,7 +102,22 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
         ):
             raise prizes.PrizeError("ActiveLegacyAttempts")
         conn = registration.connection(dynamo, owner)
-        raw = body.get("program")
+        conditions_only = body.get("action") == "rules"
+        existing = prizes.upgrade_program(prizes.effective_program(dynamo, meta))
+        if conditions_only:
+            if set(body) != {"gameId", "action", "expectedRevision", "rules"}:
+                raise prizes.PrizeError("InvalidStackPrizeRules", 400)
+            if body["expectedRevision"] != reward_conditions.revision(existing):
+                raise prizes.PrizeError("RewardConditionsChanged")
+            raw = {**_json_sanitize(existing), "rules": body["rules"]}
+        elif body.get("action") == "catalog":
+            if set(body) != {"gameId", "action", "program"} or not isinstance(body["program"], dict):
+                raise prizes.PrizeError("InvalidStackPrizeProgram", 400)
+            raw = {**body["program"], "rules": _json_sanitize(existing["rules"])}
+        else:
+            if body.get("action") is not None:
+                raise prizes.PrizeError("InvalidAction", 400)
+            raw = body.get("program")
         if not isinstance(raw, dict) or not isinstance(raw.get("catalog"), list):
             raise prizes.PrizeError("InvalidStackPrizeProgram", 400)
         rewards = []
@@ -95,15 +141,23 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
                         Body=image, ContentType="image/png",
                     )
                     p["imageKey"] = committed
-        program = prizes.validate_program(raw, meta, conn, rewards, raffles_enabled(owner))
-        stock = prizes.updated_stock(meta, program, prizes.records(dynamo, meta["gameId"]))
+        users = dynamo.Table(os.environ["USERS_TABLE"])
+        shared_catalog = (users.get_item(Key={"userId": owner}, ConsistentRead=True).get("Item") or {}).get("sharedPrizeCatalog") or []
+        program = prizes.validate_program(raw, meta, conn, rewards, raffles_enabled(owner), shared_catalog)
+        rows = prizes.records(dynamo, meta["gameId"])
+        stock = prizes.updated_stock(meta, program, rows)
+        if conditions_only:
+            program, stock = release_unused_reservations(dynamo, meta, program, stock, rows)
         # Keep existing participants on their legacy flow; new attempts opt in at start.
+        active_condition = "isActive = :active" if "isActive" in meta else "attribute_not_exists(isActive)"
         prizes.transact(dynamo, [prizes.game_update(
             meta, ", stackPrizeProgram = :program, stackPrizeStock = :stock",
-            {":program": program, ":stock": stock},
+            {":program": program, ":stock": stock, **({":active": True} if "isActive" in meta else {})},
+            extra=" AND " + active_condition + " AND attribute_not_exists(archivedAt)",
         )])
         return _resp(200, _json_sanitize({
             "ok": True, "program": prizes.program_view(prizes.effective_program(dynamo, meta, program), meta),
+            "programRevision": reward_conditions.revision(prizes.effective_program(dynamo, meta, program)),
         }))
     except prizes.PrizeError as exc:
         return _resp(exc.status, {"ok": False, "error": exc.code})
@@ -131,13 +185,20 @@ def response(dynamo, meta):
               for r in rows if r["id"].startswith("award_")]
     program = prizes.effective_program(dynamo, meta)
     stock = meta.get("stackPrizeStock") or prizes.initial_stock(program, rows)
+    general = prize_inventory.capacity(dynamo, meta["ownerUserId"], program["catalog"], meta)
     return _resp(200, _json_sanitize({
         "ok": True, "program": prizes.program_view(program, meta),
-        "enabled": "stackPrizeProgram" in meta, "state": meta.get("stackPrizeState", "open"),
+        "programRevision": reward_conditions.revision(prizes.upgrade_program(program)),
+        "enabled": "stackPrizeProgram" in meta,
+        "state": "closing" if game_lifecycle.state(meta) == "closing" else meta.get("stackPrizeState", "open"),
         "emailAvailable": os.environ.get("STACK_REWARD_EMAIL_ENABLED", "false").lower() == "true",
         "pendingPlayers": pending, "awards": awards,
         "inventory": [{"prizeId": pid, **value} for pid, value in stock.items()],
+        "globalInventory": [{"prizeId": pid, "inventoryPrizeId": value["prizeId"],
+                             "remaining": value["remaining"], "reason": value["reason"]}
+                            for pid, value in general.items()] if general is not None else None,
         "allocations": [{"playerId": r["playerId"], "ruleId": r["ruleId"],
-                         "awarded": r.get("awarded", []), "state": r["state"]}
+                         "awarded": r.get("awarded", []), "state": r["state"],
+                         "inventoryReasons": r.get("inventoryReasons", {})}
                         for r in rows if r.get("kind") == "allocation"],
     }))

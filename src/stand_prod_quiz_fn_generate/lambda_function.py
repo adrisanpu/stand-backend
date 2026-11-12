@@ -1,9 +1,10 @@
 import os
+from stand_common import game_forms
 import json
 import uuid
 import boto3
 from botocore.exceptions import ClientError
-from stand_common.utils import log, _resp, _get_claims, _read_json_body, _iso_now
+from stand_common.utils import log, _resp, _get_claims, _read_json_body, _iso_now, GAME_MUTABLE_CONDITION
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -164,7 +165,11 @@ def _handle_infocards_invoke(event: dict):
 
         if (item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+        if not item.get("isActive", True) or item.get("archivedAt"):
+            return _resp(409, {"error": "GameInactive"})
 
+        if "formConfig" in item or game_forms.locked(dynamodb, item):
+            return _resp(409, {"error": "QuizLockedOrFormEditorRequired"})
         prompt = _build_prompt(text, num_questions, num_options, use_emojis)
         log("Calling Bedrock (infocards invoke)", {"gameId": game_id, "modelId": BEDROCK_MODEL_ID})
 
@@ -189,6 +194,7 @@ def _handle_infocards_invoke(event: dict):
             return _resp(502, {"error": "NoQuestionsGenerated", "detail": "All generated questions were invalid."})
 
         now = _iso_now()
+        active_condition = "isActive = :active" if "isActive" in item else "attribute_not_exists(isActive)"
         try:
             games_table.update_item(
                 Key={"gameId": game_id},
@@ -197,8 +203,10 @@ def _handle_infocards_invoke(event: dict):
                     ":o": quiz_order,
                     ":q": quiz_questions,
                     ":now": now,
+                    **({":active": True} if "isActive" in item else {}),
                 },
-                ConditionExpression="attribute_exists(gameId)",
+                ConditionExpression=GAME_MUTABLE_CONDITION + " AND " + active_condition
+                    + " AND attribute_not_exists(quizLockedAt) AND attribute_not_exists(formConfig)",
             )
         except ClientError as e:
             log("UpdateItem failed", {"error": str(e)})
@@ -281,6 +289,12 @@ def lambda_handler(event, context):
         if (item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
+        if not item.get("isActive", True) or item.get("archivedAt"):
+            return _resp(409, {"error": "GameInactive"})
+        if game_forms.locked(dynamodb, item):
+            return _resp(409, {"error": "QuizLocked"})
+        if "formConfig" in item and body.get("draftOnly") is not True:
+            return _resp(409, {"error": "FormEditorRequired"})
         # Build prompt and call Bedrock
         prompt = _build_prompt(text, num_questions, num_options, use_emojis)
         log("Calling Bedrock", {"gameId": game_id, "modelId": BEDROCK_MODEL_ID, "numQuestions": num_questions, "numOptions": num_options, "useEmojis": use_emojis})
@@ -307,6 +321,12 @@ def lambda_handler(event, context):
         if not quiz_order:
             return _resp(502, {"error": "NoQuestionsGenerated", "detail": "All generated questions were invalid."})
 
+        if body.get("draftOnly") is True:
+            try:
+                draft = game_forms.normalize_questions(questions_response, game_id)
+            except game_forms.FormError:
+                return _resp(502, {"error": "InvalidGeneratedQuiz"})
+            return _resp(200, {"ok": True, "gameId": game_id, "questions": draft})
         # Save to DynamoDB
         now = _iso_now()
         try:
@@ -318,7 +338,7 @@ def lambda_handler(event, context):
                     ":q": quiz_questions,
                     ":now": now,
                 },
-                ConditionExpression="attribute_exists(gameId)",
+                ConditionExpression=GAME_MUTABLE_CONDITION + " AND attribute_not_exists(quizLockedAt) AND attribute_not_exists(formConfig)",
             )
         except ClientError as e:
             log("UpdateItem failed", {"error": str(e)})

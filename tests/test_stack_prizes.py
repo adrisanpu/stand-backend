@@ -31,6 +31,8 @@ class ClientError(Exception):
 @pytest.fixture(autouse=True)
 def client_error_type(monkeypatch):
     monkeypatch.setattr(public_mod, "ClientError", ClientError)
+    monkeypatch.setenv("GAMES_TABLE", "games")
+    monkeypatch.setenv("GAMEPLAYER_TABLE", "players")
 
 
 @pytest.mark.parametrize("rank,prize,eligible", [
@@ -89,7 +91,10 @@ def redeem(player=PLAYER, meta=META, rank=1, kind="k", table=None):
          patch.object(public_mod, "gp_table", table), \
          patch.object(public_mod, "stack_ranking", return_value={
              "results": [{"playerId": 1, "rank": rank}] if rank is not None else [],
-         }):
+         }), \
+         patch.object(public_mod.stack_prizes, "transact", side_effect=lambda _, operations: table.update_item(**{
+             key: value for key, value in operations[1]["Update"].items() if key != "TableName"
+         })):
         response = public_mod._handle_redeem(_redeem_event(
             issue_prize_token("ABC123", 1, kind, SECRET),
         ))

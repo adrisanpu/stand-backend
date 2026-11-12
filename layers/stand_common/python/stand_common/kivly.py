@@ -207,6 +207,10 @@ class KivlyClient:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise KivlyError("KivlyResponseTooLarge")
+                if expected_status == 204:
+                    if raw:
+                        raise KivlyError("KivlyResponseInvalid")
+                    return None
                 result = json.loads(raw)
         except HTTPError as exc:
             status = exc.code
@@ -334,12 +338,13 @@ class KivlyClient:
                 or base_path == "/api/v1/redemptions/rewards/earn"):
             raise KivlyError("KivlyRequestNotAllowed")
         request_method = method or ("POST" if body is not None else "GET")
-        if request_method not in ("GET", "POST", "PUT") or (
-            request_method == "GET" and body is not None
-        ) or (request_method != "GET" and body is None):
+        if request_method not in ("GET", "POST", "PUT", "DELETE") or (
+            request_method in ("GET", "DELETE") and body is not None
+        ) or (request_method in ("POST", "PUT") and body is None):
             raise KivlyError("KivlyRequestNotAllowed")
         if (
-            reward_detail_path and request_method not in ("GET", "PUT")
+            request_method == "DELETE" and not reward_detail_path
+            or reward_detail_path and request_method not in ("GET", "PUT", "DELETE")
             or base_path == "/api/v1/rewards/" and request_method not in ("GET", "POST")
         ):
             raise KivlyError("KivlyRequestNotAllowed")
@@ -530,6 +535,21 @@ class KivlyClient:
         ):
             raise KivlyError("KivlyRewardUpdateUncertain", 200)
         return {"id": reward_id, "name": result["title"]}
+
+    def delete_reward(self, location_id, owner_id, reward_id):
+        if not _text(reward_id, 512):
+            raise KivlyError("KivlyRewardInvalid")
+        try:
+            self._scoped_request(
+                location_id, owner_id, "/api/v1/rewards/" + quote(reward_id, safe=""),
+                method="DELETE", expected_status=204,
+            )
+        except KivlyError as exc:
+            if exc.code in ("KivlyUnavailable", "KivlyResponseInvalid") or (
+                exc.http_status is not None and exc.http_status >= 500
+            ):
+                raise KivlyError("KivlyRewardDeletionUncertain", exc.http_status, exc.retry_after) from None
+            raise
 
     def customer_rewards(self, location_id, owner_id, customer_id):
         if not _text(customer_id, 512):

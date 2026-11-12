@@ -1,0 +1,1620 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: STAND Backend - Fully Managed Infrastructure
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+    - prod
+    - dev
+    Description: Deployment environment (prod or dev)
+  CognitoUserPoolId:
+    Type: String
+    Default: us-east-1_54eXBuNq1
+    Description: Cognito User Pool ID for JWT authorizer
+  CognitoAppClientId:
+    Type: String
+    Default: 52ekpup21eo5ic4caokn2a33k3
+    Description: Cognito App Client ID (JWT audience)
+  StripeSuccessUrl:
+    Type: String
+    Default: https://playstand.app/home
+    Description: Stripe checkout success redirect URL
+  StripeCancelUrl:
+    Type: String
+    Default: https://playstand.app/home
+    Description: Stripe checkout cancel redirect URL
+  StripeLayerArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:781283585341:layer:stripe-layer:5
+    Description: ARN of the Stripe Lambda layer (created manually in AWS)
+  PlayerTokenSecret:
+    Type: String
+    MinLength: 32
+    NoEcho: true
+    Description: Required private HMAC secret (at least 32 characters) for participant
+      sessions
+  KivlyExternalWritesEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Description: Allow Kivly customer creation and reward assignment
+  EmailSenderAddress:
+    Type: String
+    Default: no-reply@playstand.app
+    Description: Verified SES From address for participant verification and reward
+      emails
+  StackRewardEmailEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Description: Enable STACK reward email after SES setup and authorized Kivly QR
+      acceptance
+  EmailIdentityName:
+    Type: String
+    Default: playstand.app
+    Description: Existing shared SES domain identity in us-east-1 (managed outside
+      this stack)
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+    - x86_64
+    Timeout: 30
+    MemorySize: 128
+    Tracing: PassThrough
+    Environment:
+      Variables:
+        STAGE:
+          Ref: Environment
+        GAMES_TABLE:
+          Ref: StandProdGameTable
+        USERS_TABLE:
+          Ref: StandProdUserTable
+        GAMEPLAYER_TABLE:
+          Ref: StandProdGameplayerTable
+        CATALOG_TABLE:
+          Ref: StandProdCatalogTable
+        STRIPE_SECRET_NAME:
+          Fn::Sub: stand/${Environment}/stripe
+        PLAYER_TOKEN_SECRET:
+          Ref: PlayerTokenSecret
+        STACK_PRIZES_TABLE:
+          Ref: StandStackPrizesTable
+        KIVLY_EXTERNAL_WRITES_ENABLED:
+          Ref: KivlyExternalWritesEnabled
+        STACK_REWARD_EMAIL_ENABLED:
+          Ref: StackRewardEmailEnabled
+Resources:
+  StandStackPrizesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-stack-prizes
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+      - AttributeName: gameId
+        AttributeType: S
+      - AttributeName: id
+        AttributeType: S
+      - AttributeName: work
+        AttributeType: S
+      - AttributeName: dueAt
+        AttributeType: N
+      KeySchema:
+      - AttributeName: gameId
+        KeyType: HASH
+      - AttributeName: id
+        KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: pending-work
+        KeySchema:
+        - AttributeName: work
+          KeyType: HASH
+        - AttributeName: dueAt
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+    Metadata:
+      SamResourceId: StandStackPrizesTable
+  StandStackPrizeDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+    Metadata:
+      SamResourceId: StandStackPrizeDeadLetterQueue
+  StandStackPrizeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      VisibilityTimeout: 360
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn:
+          Fn::GetAtt:
+          - StandStackPrizeDeadLetterQueue
+          - Arn
+        maxReceiveCount: 5
+    Metadata:
+      SamResourceId: StandStackPrizeQueue
+  StandStackPrizeDelivery:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-stack-prize-delivery
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/28ea35ff8f75d431c02763eb06aea232
+      Handler: lambda_function.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          STACK_PRIZES_QUEUE:
+            Ref: StandStackPrizeQueue
+          EMAIL_SENDER_ADDRESS:
+            Ref: EmailSenderAddress
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: StandStackPrizesTable
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: StandProdGameTable
+      - DynamoDBReadPolicy:
+          TableName:
+            Ref: StandProdGameplayerTable
+      - DynamoDBReadPolicy:
+          TableName:
+            Ref: StandProdUserTable
+      - SQSSendMessagePolicy:
+          QueueName:
+            Fn::GetAtt:
+            - StandStackPrizeQueue
+            - QueueName
+      - Statement:
+        - Effect: Allow
+          Action: secretsmanager:GetSecretValue
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*
+        - Effect: Allow
+          Action: ses:SendRawEmail
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:ses:us-east-1:${AWS::AccountId}:identity/${EmailIdentityName}
+          Condition:
+            StringEquals:
+              ses:FromAddress:
+                Ref: EmailSenderAddress
+      Events:
+        RecoverOutbox:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+        Deliver:
+          Type: SQS
+          Properties:
+            Queue:
+              Fn::GetAtt:
+              - StandStackPrizeQueue
+              - Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+            - ReportBatchItemFailures
+    Metadata:
+      SamResourceId: StandStackPrizeDelivery
+  StandProdGameRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: stand-${Environment}-game-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - Ref: StandProdGameRolePolicy
+      Policies:
+      - PolicyName: KivlyOwnerCredentials
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:CreateSecret
+            - secretsmanager:DeleteSecret
+            - secretsmanager:GetSecretValue
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*
+    Metadata:
+      SamResourceId: StandProdGameRole
+  StandProdGameRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName:
+        Fn::Sub: stand-${Environment}-game-role-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: CloudWatchLogs
+          Effect: Allow
+          Action:
+          - logs:CreateLogGroup
+          - logs:CreateLogStream
+          - logs:PutLogEvents
+          Resource:
+            Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+        - Sid: DynamoDB
+          Effect: Allow
+          Action:
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:DeleteItem
+          - dynamodb:Query
+          - dynamodb:Scan
+          - dynamodb:BatchGetItem
+          - dynamodb:BatchWriteItem
+          - dynamodb:TransactWriteItems
+          - dynamodb:ConditionCheckItem
+          Resource:
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+            - TableName:
+                Ref: StandProdGameTable
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-ownerUserId
+            - TableName:
+                Ref: StandProdGameTable
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-gameName
+            - TableName:
+                Ref: StandProdGameTable
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+            - TableName:
+                Ref: StandProdUserTable
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+            - TableName:
+                Ref: StandProdGameplayerTable
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/gsi-raffleEligible
+            - TableName:
+                Ref: StandProdGameplayerTable
+          - Fn::Sub:
+            - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+            - TableName:
+                Ref: StandProdCatalogTable
+          - Fn::GetAtt:
+            - StandEmailVerificationTable
+            - Arn
+          - Fn::GetAtt:
+            - StandStackPrizesTable
+            - Arn
+          - Fn::Sub: ${StandStackPrizesTable.Arn}/index/pending-work
+        - Sid: StackPrizeEnqueue
+          Effect: Allow
+          Action: sqs:SendMessage
+          Resource:
+            Fn::GetAtt:
+            - StandStackPrizeQueue
+            - Arn
+        - Sid: LambdaInvoke
+          Effect: Allow
+          Action: lambda:InvokeFunction
+          Resource:
+            Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-*
+        - Sid: S3Presign
+          Effect: Allow
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub:
+            - arn:aws:s3:::${BucketName}/*
+            - BucketName:
+                Ref: StandProdEmpareja2CharBucket
+        - Sid: SSMParameters
+          Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - ssm:GetParameters
+          Resource:
+            Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/config/*
+        - Sid: S3ClientLogos
+          Effect: Allow
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub: ${UserMediaBucket.Arn}/users/*/logos/*
+        - Sid: S3GamePrizeImages
+          Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:PutObject
+          Resource:
+            Fn::Sub: ${UserMediaBucket.Arn}/games/*
+        - Sid: S3ParticipantPhotosRead
+          Effect: Allow
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub: ${UserMediaBucket.Arn}/players/*
+        - Sid: S3StagedPrizeImageTags
+          Effect: Allow
+          Action:
+          - s3:PutObjectTagging
+          - s3:DeleteObjectTagging
+          Resource:
+            Fn::Sub: ${UserMediaBucket.Arn}/games/staged/*
+    Metadata:
+      SamResourceId: StandProdGameRolePolicy
+  StandPublicRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: stand-${Environment}-public-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - Ref: StandProdGameRolePolicy
+      Policies:
+      - PolicyName: KivlyCompletionRewards
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            Resource:
+              Fn::GetAtt:
+              - StandKivlyRegistrationTable
+              - Arn
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*
+      - PolicyName: EmailVerification
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: VerificationRecords
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:ConditionCheckItem
+            Resource:
+              Fn::GetAtt:
+              - StandEmailVerificationTable
+              - Arn
+          - Sid: SendVerificationEmail
+            Effect: Allow
+            Action: ses:SendEmail
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ses:us-east-1:${AWS::AccountId}:identity/${EmailIdentityName}
+            Condition:
+              StringEquals:
+                ses:FromAddress:
+                  Ref: EmailSenderAddress
+      - PolicyName: ParticipantPhotoUploads
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: UploadParticipantPhotos
+            Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource:
+              Fn::Sub: ${UserMediaBucket.Arn}/players/*
+    Metadata:
+      SamResourceId: StandPublicRole
+  StandAssignRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: stand-${Environment}-assign-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - Ref: StandProdGameRolePolicy
+      Policies:
+      - PolicyName: KivlyRegistration
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            Resource:
+              Fn::GetAtt:
+              - StandKivlyRegistrationTable
+              - Arn
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*
+      - PolicyName: EmailVerification
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: ConsumeVerification
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:ConditionCheckItem
+            Resource:
+              Fn::GetAtt:
+              - StandEmailVerificationTable
+              - Arn
+    Metadata:
+      SamResourceId: StandAssignRole
+  StandProdBillingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: stand-${Environment}-billing-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName:
+          Fn::Sub: stand-${Environment}-billing-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Sid: DynamoDB
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+            - dynamodb:ConditionCheckItem
+            Resource:
+            - Fn::Sub:
+              - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+              - TableName:
+                  Ref: StandProdUserTable
+          - Sid: SecretsManager
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              Fn::Sub: arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/stripe*
+          - Sid: S3UserMedia
+            Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            Resource:
+              Fn::Sub: arn:aws:s3:::stand-${Environment}-user-media-${AWS::AccountId}/*
+    Metadata:
+      SamResourceId: StandProdBillingRole
+  StandCommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: stand-common
+      Description: Shared utilities (log, _resp, _iso_now, etc.) for all Stand Lambda
+        functions.
+      ContentUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/e5699fa71f18b338d7421a42f296778d
+      CompatibleRuntimes:
+      - python3.13
+      RetentionPolicy: Delete
+    Metadata:
+      SamResourceId: StandCommonLayer
+  StandKivlyRegistrationTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-kivly-registration-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: id
+        KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+    Metadata:
+      SamResourceId: StandKivlyRegistrationTable
+  StandEmailVerificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-email-verification-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: id
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+    Metadata:
+      SamResourceId: StandEmailVerificationTable
+  StandProdUserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-user-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: userId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: userId
+        KeyType: HASH
+    Metadata:
+      SamResourceId: StandProdUserTable
+  StandProdGameTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-game-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: gameId
+        AttributeType: S
+      - AttributeName: ownerUserId
+        AttributeType: S
+      - AttributeName: gameName
+        AttributeType: S
+      KeySchema:
+      - AttributeName: gameId
+        KeyType: HASH
+      GlobalSecondaryIndexes:
+      - IndexName: gsi-ownerUserId
+        KeySchema:
+        - AttributeName: ownerUserId
+          KeyType: HASH
+        Projection:
+          ProjectionType: ALL
+      - IndexName: gsi-gameName
+        KeySchema:
+        - AttributeName: gameName
+          KeyType: HASH
+        Projection:
+          ProjectionType: ALL
+    Metadata:
+      SamResourceId: StandProdGameTable
+  StandProdGameplayerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-gameplayer-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: gameId
+        AttributeType: S
+      - AttributeName: playerId
+        AttributeType: N
+      - AttributeName: instagramPSID
+        AttributeType: S
+      - AttributeName: eligibleForGameId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: gameId
+        KeyType: HASH
+      - AttributeName: playerId
+        KeyType: RANGE
+      GlobalSecondaryIndexes:
+      - IndexName: gsi-instagramPSID
+        KeySchema:
+        - AttributeName: instagramPSID
+          KeyType: HASH
+        - AttributeName: gameId
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+      - IndexName: gsi-raffleEligible
+        KeySchema:
+        - AttributeName: eligibleForGameId
+          KeyType: HASH
+        - AttributeName: playerId
+          KeyType: RANGE
+        Projection:
+          ProjectionType: KEYS_ONLY
+    Metadata:
+      SamResourceId: StandProdGameplayerTable
+  StandProdCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Fn::Sub: stand-${Environment}-catalog-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: catalogId
+        AttributeType: S
+      - AttributeName: pairId
+        AttributeType: S
+      KeySchema:
+      - AttributeName: catalogId
+        KeyType: HASH
+      - AttributeName: pairId
+        KeyType: RANGE
+    Metadata:
+      SamResourceId: StandProdCatalogTable
+  StandProdEmpareja2CharBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: stand-${Environment}-empareja2-characters-${AWS::AccountId}
+    Metadata:
+      SamResourceId: StandProdEmpareja2CharBucket
+  InfocardsUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: stand-${Environment}-infocards-uploads-${AWS::AccountId}
+      CorsConfiguration:
+        CorsRules:
+        - AllowedHeaders:
+          - '*'
+          AllowedMethods:
+          - PUT
+          - GET
+          AllowedOrigins:
+          - '*'
+          MaxAge: 3600
+    Metadata:
+      SamResourceId: InfocardsUploadsBucket
+  UserMediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: stand-${Environment}-user-media-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+        - Id: ExpireUncommittedGamePrizeImages
+          Status: Enabled
+          Prefix: games/staged/
+          TagFilters:
+          - Key: staged
+            Value: 'true'
+          ExpirationInDays: 7
+      CorsConfiguration:
+        CorsRules:
+        - AllowedHeaders:
+          - '*'
+          AllowedMethods:
+          - PUT
+          - POST
+          - GET
+          - DELETE
+          AllowedOrigins:
+          - '*'
+          MaxAge: 3600
+    Metadata:
+      SamResourceId: UserMediaBucket
+  WebhooksApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name:
+        Fn::Sub: stand-${Environment}-webhook-api
+      StageName: prod
+    Metadata:
+      SamResourceId: WebhooksApi
+  GameApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name:
+        Fn::Sub: stand-${Environment}-game-api
+      StageName: prod
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer:
+                Fn::Sub: https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}
+              audience:
+              - Ref: CognitoAppClientId
+        DefaultAuthorizer: CognitoAuthorizer
+      CorsConfiguration:
+        AllowOrigins:
+        - '*'
+        AllowMethods:
+        - GET
+        - POST
+        - PUT
+        - DELETE
+        - OPTIONS
+        AllowHeaders:
+        - authorization
+        - content-type
+    Metadata:
+      SamResourceId: GameApi
+  StandProdCorsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-cors-fn
+      Description: Handles OPTIONS preflight for GameApi; no JWT so preflight passes.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/a7906f9be45c66ea6412a913980bbd3d
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Events:
+        OptionsProxy:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /{proxy+}
+            Method: OPTIONS
+            Auth:
+              Authorizer: NONE
+    Metadata:
+      SamResourceId: StandProdCorsFn
+  StandProdWebhookFnStripe:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-webhook-fn-stripe
+      Description: Processes Stripe webhook events to handle payments, subscriptions,
+        and billing state changes.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/298effd88a3336198723e4b02c313d67
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdBillingRole
+        - Arn
+      Layers:
+      - Ref: StripeLayerArn
+      - Ref: StandCommonLayer
+      Events:
+        StripePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: WebhooksApi
+            Path: /webhook/stripe
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdWebhookFnStripe
+  StandProdGameFnGame:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-fn-game
+      Description: Handles game lifecycle (create, list, update and delete games).
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/c35a4abc6501f8acf59ba64c0f8ecadc
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET:
+            Ref: UserMediaBucket
+          EMAIL_VERIFICATION_TABLE:
+            Ref: StandEmailVerificationTable
+      Events:
+        GameCrudGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game
+            Method: GET
+        GameCrudPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game
+            Method: POST
+        GameCrudPut:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game
+            Method: PUT
+        GameCrudDelete:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game
+            Method: DELETE
+        GamePlayersGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/players
+            Method: GET
+        GamePlayersDelete:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/players
+            Method: DELETE
+        GamePrizeUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/prizes
+            Method: POST
+        KivlyAccountGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/kivly
+            Method: GET
+        KivlyAccountPut:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/kivly
+            Method: PUT
+        KivlyAccountDelete:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/kivly
+            Method: DELETE
+        GameKivlyGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/kivly
+            Method: GET
+        GameKivlyPut:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/kivly
+            Method: PUT
+        GameKivlyRewardsGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/kivly/rewards
+            Method: GET
+        GameKivlyRewardsPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/kivly/rewards
+            Method: POST
+        StackPrizesGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/stack/prizes
+            Method: GET
+        StackPrizesPut:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/stack/prizes
+            Method: PUT
+        StackPrizesClose:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/stack/prizes
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameFnGame
+  StandProdGameFnAssign:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-fn-assign
+      Description: Assigns players to games, enforces plan limits, prevents duplicates,
+        and initializes per-game player state.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/3f3e0bd962303b862dc0a8488435382c
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandAssignRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          CHAR_BUCKET:
+            Ref: StandProdEmpareja2CharBucket
+          EMAIL_VERIFICATION_TABLE:
+            Ref: StandEmailVerificationTable
+          KIVLY_REGISTRATION_TABLE:
+            Ref: StandKivlyRegistrationTable
+      Events:
+        AssignPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/assign
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameFnAssign
+  StandProdGameValidate:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-validate
+      Description: Validates player participation and game actions based on game rules,
+        feature flags, and completion status.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/0136695f627a2ecd91877e50a68c4bbf
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          CHAR_BUCKET:
+            Ref: StandProdEmpareja2CharBucket
+          USER_MEDIA_BUCKET:
+            Ref: UserMediaBucket
+      Events:
+        ValidatePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/validate
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameValidate
+  StandProdGameFnPublic:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-fn-public
+      Description: Public participant APIs (join, validate, display) without Cognito
+        auth.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/ebcd8d114c4dc254611f7b10a997e283
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandPublicRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          ASSIGN_LAMBDA:
+            Ref: StandProdGameFnAssign
+          VALIDATE_LAMBDA:
+            Ref: StandProdGameValidate
+          SCORE_LAMBDA:
+            Ref: StandProdGameScore
+          USER_MEDIA_BUCKET:
+            Ref: UserMediaBucket
+          CHAR_BUCKET:
+            Ref: StandProdEmpareja2CharBucket
+          CHAR_URL_TTL: '120'
+          EMAIL_VERIFICATION_TABLE:
+            Ref: StandEmailVerificationTable
+          EMAIL_SENDER_ADDRESS:
+            Ref: EmailSenderAddress
+          EMAIL_IDENTITY_NAME:
+            Ref: EmailIdentityName
+          EMAIL_MAX_PER_HOUR: '5'
+          EMAIL_IP_MAX_PER_HOUR: '3000'
+          EMAIL_GLOBAL_MAX_PER_HOUR: '20000'
+          KIVLY_REGISTRATION_TABLE:
+            Ref: StandKivlyRegistrationTable
+      Events:
+        PublicGameGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/game
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        PublicEmailRequestPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/email/request
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicJoinPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/join
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicValidatePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/validate
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicPlayerGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/player
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        PublicPlayerPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/player
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicPlayerPhotoPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/player/photo
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicRedeemPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/redeem
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicScorePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/score
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicRulet4SpinPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/rulet4/spin
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        PublicKivlyRewardPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/public/kivly/reward
+            Method: POST
+            Auth:
+              Authorizer: NONE
+    Metadata:
+      SamResourceId: StandProdGameFnPublic
+  StandProdGameScore:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-score
+      Description: Stores player scores and provides rankings for games that support
+        scoring.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/5775c0e7d420e2f80af2a6f4cef905cd
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET:
+            Ref: UserMediaBucket
+          STACK_PRIZES_QUEUE:
+            Ref: StandStackPrizeQueue
+      Events:
+        ScoreGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/score
+            Method: GET
+        ScorePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/score
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameScore
+  StandProdGameFnQuiz:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-fn-quiz
+      Description: Manages quiz configuration, quiz flow, and player quiz responses
+        for games that include quizzes.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/031df430e577b1e0bf7c23f76ba4ecbc
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Events:
+        QuizGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/quiz
+            Method: GET
+        QuizPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/quiz
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameFnQuiz
+  StandProdGameFnRaffle:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-fn-raffle
+      Description: Executes game raffles, selects eligible winners, and persists raffle
+        results.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/597774734c1bd72f869a7008d26abd4c
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Events:
+        RafflePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/raffle
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameFnRaffle
+  StandProdGameFnImpostor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-game-fn-impostor
+      Description: Manages impostor game state, rounds, voting, and result resolution.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/6f8358265770abbee4e96779464d1a46
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdGameRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET:
+            Ref: UserMediaBucket
+      Events:
+        ImpostorGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/impostor
+            Method: GET
+        ImpostorPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/impostor
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdGameFnImpostor
+  StandProdBillingFnCheckout:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-billing-fn-checkout
+      Description: Creates and manages Stripe checkout sessions for purchasing plans
+        and subscriptions.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/6a82dac20d30393b99afe4bae19b5111
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdBillingRole
+        - Arn
+      Layers:
+      - Ref: StripeLayerArn
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          STRIPE_SUCCESS_URL:
+            Ref: StripeSuccessUrl
+          STRIPE_CANCEL_URL:
+            Ref: StripeCancelUrl
+      Events:
+        CheckoutPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/billing/checkout
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdBillingFnCheckout
+  StandProdUserFnUser:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-user-fn-user
+      Description: Manages user accounts, authentication-related data, and user-level
+        configuration and limits.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/0a1c2ae32946af60975557bc38601fa6
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdBillingRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Events:
+        UserPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/user
+            Method: POST
+        MeGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/user/me
+            Method: GET
+    Metadata:
+      SamResourceId: StandProdUserFnUser
+  StandProdUserFnMedia:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-user-fn-media
+      Description: Manages per-user logo media with S3-backed storage.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/79c9614e7461863b2976295c46b3a632
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdBillingRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          USER_MEDIA_BUCKET:
+            Ref: UserMediaBucket
+          DEFAULT_STAND_LOGO_DARK_KEY: defaults/logo/logo_stand_letters_white.png
+          DEFAULT_STAND_LOGO_LIGHT_KEY: defaults/logo/logo_stand_letters_black.png
+      Events:
+        UserMediaGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/user/media
+            Method: GET
+        UserMediaPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/user/media
+            Method: POST
+        UserMediaPut:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/user/media
+            Method: PUT
+        UserMediaDelete:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/user/media
+            Method: DELETE
+    Metadata:
+      SamResourceId: StandProdUserFnMedia
+  StandProdInfocardsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: stand-${Environment}-infocards-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName:
+          Fn::Sub: stand-${Environment}-infocards-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+              Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Sid: DynamoDB
+            Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            Resource:
+            - Fn::Sub:
+              - arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}
+              - TableName:
+                  Ref: StandProdGameTable
+          - Sid: S3InfocardsUploads
+            Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:PutObject
+            Resource:
+              Fn::Sub: arn:aws:s3:::stand-${Environment}-infocards-uploads-${AWS::AccountId}/*
+          - Sid: S3InfocardsPresign
+            Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource:
+              Fn::Sub: arn:aws:s3:::stand-${Environment}-infocards-uploads-${AWS::AccountId}/*
+          - Sid: BedrockInvoke
+            Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            Resource:
+              Fn::Sub: arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0
+          - Sid: LambdaInvokeQuizGenerate
+            Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+              Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-quiz-fn-generate
+    Metadata:
+      SamResourceId: StandProdInfocardsRole
+  StandProdInfocardsFnGet:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-infocards-fn-get
+      Description: Returns info cards for an INFOCARDS game (GET) and persists updated
+        cards with media keys (PUT).
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/4ae727e29a0e4c91a74af281772aae47
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdInfocardsRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Environment:
+        Variables:
+          INFOCARDS_BUCKET:
+            Ref: InfocardsUploadsBucket
+      Events:
+        InfocardsGet:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/infocards
+            Method: GET
+        InfocardsPut:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/infocards
+            Method: PUT
+    Metadata:
+      SamResourceId: StandProdInfocardsFnGet
+  StandProdInfocardsFnUploadUrl:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-infocards-fn-upload-url
+      Description: Generates S3 presigned PUT URLs for infocards content uploads.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/04d30010653f30a38ae140ff0867f1a3
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdInfocardsRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Timeout: 15
+      Environment:
+        Variables:
+          INFOCARDS_BUCKET:
+            Ref: InfocardsUploadsBucket
+      Events:
+        InfocardsUploadUrlPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/infocards/upload-url
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdInfocardsFnUploadUrl
+  StandProdInfocardsFnProcess:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-infocards-fn-process
+      Description: Processes uploaded content with Bedrock AI to generate info cards
+        (and optionally a quiz).
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/61b8af6ea252cefe1c5a4cf4ecb22d12
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdInfocardsRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          INFOCARDS_BUCKET:
+            Ref: InfocardsUploadsBucket
+          BEDROCK_REGION: us-east-1
+          BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
+          QUIZ_GENERATE_FUNCTION_NAME:
+            Fn::Sub: stand-${Environment}-quiz-fn-generate
+      Events:
+        InfocardsProcessPost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/infocards/process
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdInfocardsFnProcess
+  StandProdQuizFnGenerate:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: stand-${Environment}-quiz-fn-generate
+      Description: Generates quiz questions from a text prompt using Bedrock AI and
+        saves them.
+      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/d5021628be10d133a3ef6b7062012fea
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - StandProdInfocardsRole
+        - Arn
+      Layers:
+      - Ref: StandCommonLayer
+      Timeout: 60
+      Environment:
+        Variables:
+          BEDROCK_REGION: us-east-1
+          BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
+      Events:
+        QuizGeneratePost:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: GameApi
+            Path: /v1/game/quiz/generate
+            Method: POST
+    Metadata:
+      SamResourceId: StandProdQuizFnGenerate
+Outputs:
+  Environment:
+    Value:
+      Ref: Environment
+  WebhooksApiUrl:
+    Value:
+      Fn::Sub: https://${WebhooksApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+  GameApiUrl:
+    Value:
+      Fn::Sub: https://${GameApi}.execute-api.${AWS::Region}.amazonaws.com/prod

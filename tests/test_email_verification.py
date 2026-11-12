@@ -58,6 +58,7 @@ def rig(monkeypatch):
     ses = FakeSes()
     invoke = FakeLambda()
     monkeypatch.setenv("EMAIL_VERIFICATION_TABLE", "verification")
+    monkeypatch.setenv("CLIENT_INDEX_TABLE", "clients")
     monkeypatch.setenv("EMAIL_SENDER_ADDRESS", "no-reply@playstand.app")
     monkeypatch.setenv("PLAYER_TOKEN_SECRET", SECRET)
     monkeypatch.setenv("EMAIL_MAX_PER_HOUR", "5")
@@ -85,6 +86,7 @@ def rig(monkeypatch):
     monkeypatch.setattr(public_mod.boto3, "client", lambda service: ses if service == "ses" else MagicMock())
     dynamo.seed("games", {
         "gameId": GAME_ID,
+        "ownerUserId": "owner",
         "gameType": "T1MER",
         "isActive": True,
         "maxPlayers": 10,
@@ -111,7 +113,7 @@ def response_body(response):
 
 
 def request_code(email=EMAIL, game_id=GAME_ID, ip="203.0.113.8", **overrides):
-    body = {"gameId": game_id, "email": email, "username": "Player", "consent": True, **overrides}
+    body = {"gameId": game_id, "email": email, "username": "Player", "phone": "+34612345678", "consent": True, **overrides}
     return api_call("email/request", body, ip)
 
 
@@ -128,8 +130,8 @@ def resume_request(**overrides):
 
 def seed_returning_player(rig, **overrides):
     player = {
-        "gameId": GAME_ID, "playerId": 1, "email": EMAIL, "username": "Original",
-        "emailVerifiedAt": "2026-01-01T00:00:00Z", "emailVerificationMethod": "email-code",
+        "gameId": GAME_ID, "playerId": 1, "email": EMAIL, "username": "Original", "phone": "+34612345678",
+        "verifiedAt": "2026-01-01T00:00:00Z", "verificationMethod": "email-code",
         "validated": True, "validationCode": 1234, "type": {"T1MER": {"score": 99, "timer": 1.0}},
         "profilePicUrl": "https://example.test/profile.png", **overrides,
     }
@@ -143,7 +145,7 @@ def test_resume_unknown_email_requests_details_without_email_or_personal_data(ri
     body = response_body(response)
     assert body == {
         "ok": True, "detailsRequired": True, "existingPlayer": False,
-        "fields": {"username": True, "phone": False, "consent": True, "loyaltyConsent": False},
+        "fields": {"username": True, "phone": True, "consent": True, "loyaltyConsent": False},
     }
     assert rig["ses"].sent == []
     assert rig["dynamo"].rows("verification") == []
@@ -177,7 +179,7 @@ def test_resume_does_not_reuse_another_games_registration(rig):
 
 
 def test_resume_legacy_player_requires_only_unproven_consent(rig):
-    seed_returning_player(rig, emailVerifiedAt=None)
+    seed_returning_player(rig, verifiedAt=None)
     body = response_body(resume_request())
     assert body["fields"] == {"username": False, "phone": False, "consent": True, "loyaltyConsent": False}
     assert rig["ses"].sent == []
@@ -210,7 +212,7 @@ def test_resume_fills_missing_name_only_after_code_verification(rig):
 
 
 def test_resume_missing_required_phone_cannot_skip_details(rig):
-    seed_returning_player(rig)
+    seed_returning_player(rig, phone=None)
     game = rig["dynamo"].rows("games")[0]
     game["gameType"] = "STACK"
     rig["dynamo"].seed("games", game)
@@ -245,9 +247,9 @@ def test_resume_rejects_invalid_email(rig, email):
 
 def test_resume_changed_club_terms_need_explicit_acceptance(rig, monkeypatch):
     from stand_common import kivly_registration
-    seed_returning_player(rig, kivlyMembership={
+    seed_returning_player(rig, kivly={"membership": {
         "consentVersion": "old-version", "locationId": "location1", "customerId": "customer1",
-    })
+    }})
     monkeypatch.setattr(kivly_registration, "game_settings", lambda meta: {
         "enabled": True, "consentVersion": "new-version", "locationId": "location1",
     })
@@ -263,9 +265,9 @@ def test_resume_changed_club_terms_need_explicit_acceptance(rig, monkeypatch):
 
 
 def test_resume_current_club_consent_does_not_need_acceptance_again(rig, monkeypatch):
-    seed_returning_player(rig, kivlyMembership={
+    seed_returning_player(rig, kivly={"membership": {
         "consentVersion": "current-version", "locationId": "location1", "customerId": "customer1",
-    })
+    }})
     monkeypatch.setattr(verification, "game_settings", lambda meta: {
         "enabled": True, "consentVersion": "current-version", "locationId": "location1",
     })
@@ -324,7 +326,7 @@ def test_request_issues_six_digit_code_including_leading_zero_and_needs_no_ident
         ({"email": "not-an-email"}, {}, 400, "invalid_email"),
         ({"language": "fr"}, {}, 400, "InvalidLanguage"),
         ({}, {"isActive": False}, 403, "GameInactive"),
-        ({}, {"gameType": "IMPOSTOR"}, 400, "unsupported_game_type"),
+        ({}, {"gameType": "UNSUPPORTED"}, 400, "unsupported_game_type"),
     ],
 )
 def test_request_rejects_invalid_registration_before_sending(
@@ -334,7 +336,7 @@ def test_request_rejects_invalid_registration_before_sending(
         game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
         game.update(game_change)
         rig["dynamo"].seed("games", game)
-    response = api_call("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "consent": True, **body_change})
+    response = api_call("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "phone": "+34612345678", "consent": True, **body_change})
     assert response["statusCode"] == expected_status
     assert response_body(response)["error"] == expected_error
     assert rig["ses"].sent == []
@@ -356,7 +358,7 @@ def test_email_registration_ignores_legacy_instagram_participant_field(rig):
         "email/request",
         {
             "gameId": GAME_ID, "email": EMAIL, "username": "Player",
-            "instagram": "@legacy", "consent": True,
+            "instagram": "@legacy", "consent": True, "phone": "+34612345678",
         },
     )
     assert response["statusCode"] == 200
@@ -366,10 +368,10 @@ def test_email_registration_ignores_legacy_instagram_participant_field(rig):
         item for item in rig["dynamo"].rows("verification")
         if item.get("id", "").startswith("challenge:")
     )
-    assert challenge["registration"] == {"email": EMAIL, "username": "Player"}
+    assert challenge["registration"] == {"email": EMAIL, "username": "Player", "phone": "+34612345678"}
 
 
-def test_optional_phone_is_bound_to_the_verified_form_not_the_final_join_body(rig):
+def test_phone_is_bound_to_the_verified_form_not_the_final_join_body(rig):
     game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
     game["participantFields"] = {"phone": {"required": False, "enabled": True}}
     rig["dynamo"].seed("games", game)
@@ -388,9 +390,9 @@ def test_optional_phone_is_bound_to_the_verified_form_not_the_final_join_body(ri
 def test_request_requires_source_ip_and_configured_sender(rig, monkeypatch, missing):
     if missing == "sender":
         monkeypatch.delenv("EMAIL_SENDER_ADDRESS")
-        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "consent": True})
+        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "phone": "+34612345678", "consent": True})
     else:
-        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "consent": True})
+        event = api_event("email/request", {"gameId": GAME_ID, "email": EMAIL, "username": "Player", "phone": "+34612345678", "consent": True})
         event["requestContext"]["http"].pop("sourceIp")
     response = public_mod.lambda_handler(event, None)
     assert response["statusCode"] == 503
@@ -530,6 +532,7 @@ def test_assign_rejects_forged_or_misbound_receipts_before_email_recovery(rig, t
         result = assign_mod.lambda_handler({
             "source": "web", "game_id": game_id, "email": email,
             "username": "Player",
+            "phone": "+34612345678",
             "email_verification": receipt,
         }, None)
     finally:
@@ -549,6 +552,7 @@ def test_direct_web_assign_without_receipt_cannot_recover_existing_player(rig, m
     result = assign_mod.lambda_handler({
         "source": "web", "game_id": GAME_ID, "email": EMAIL,
         "username": "Player",
+        "phone": "+34612345678",
     }, None)
     assert result == {"ok": False, "reason": "VerificationRequired"}
     assert rig["dynamo"].rows("players")[0]["playerId"] == 7
@@ -592,8 +596,8 @@ def test_verified_join_atomically_creates_player_count_and_identity(rig):
     assert invoke_payload["email"] == EMAIL
     player = rig["dynamo"].rows("players")[0]
     assert player["email"] == EMAIL
-    assert player["emailVerificationMethod"] == "email-code"
-    assert player["emailVerifiedAt"]
+    assert player["verificationMethod"] == "email-code"
+    assert player["verifiedAt"]
     game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
     assert game["playersCount"] == 1
     mapping = rig["dynamo"].Table("verification").get_item(
@@ -605,6 +609,33 @@ def test_verified_join_atomically_creates_player_count_and_identity(rig):
     )["Item"]
     assert record["state"] == "completed"
     assert record["playerId"] == player["playerId"]
+
+
+@pytest.mark.parametrize("game_type", [
+    "L3TRAS", "CUPIDO", "SEMAFORO", "INFOCARDS", "IMPOSTOR",
+])
+def test_other_web_games_allow_verified_email_join_and_recovery(rig, game_type):
+    game = rig["dynamo"].Table("games").get_item(Key={"gameId": GAME_ID})["Item"]
+    game.update(
+        gameType=game_type,
+        ownerUserId="owner",
+        participantFields=default_participant_fields(game_type),
+    )
+    rig["dynamo"].seed("games", game)
+
+    challenge = response_body(request_code())
+    response = join(rig, challenge["challengeId"], sent_code(rig))
+
+    assert response["statusCode"] == 200
+    result = response_body(response)
+    assert result["ok"] is True
+    assert result["assignment"]
+    player = rig["dynamo"].rows("players")[0]
+    assert player["email"] == EMAIL
+    assert player["verificationMethod"] == "email-code"
+    assert player["verifiedAt"]
+    recovered = public_mod._player_response(game, player, GAME_ID, player["playerId"], result["playerToken"])
+    assert json.loads(recovered["body"])["assignment"]
 
 
 @pytest.mark.parametrize("game_type", ["T1MER", "STACK", "EMPAREJA2"])
@@ -623,7 +654,7 @@ def test_username_is_bound_persisted_recovered_and_used_for_display(rig, monkeyp
     monkeypatch.setattr(assign_mod, "ASSIGNERS", {
         game_type: lambda _event: {"type": {game_type: {}}},
     })
-    contact = {"phone": "+34 612345678"} if game_type == "STACK" else {}
+    contact = {"phone": "+34 612345678"}
     challenge = response_body(request_code(username="  Ana 🌟  ", **contact))
     record = rig["dynamo"].Table("verification").get_item(
         Key={"id": f"challenge:{challenge['challengeId']}"}
@@ -730,7 +761,7 @@ def test_server_receipt_binds_username_against_assignment_tampering(rig, tampere
     )
     result = assign_mod.lambda_handler({
         "source": "web", "game_id": GAME_ID, "email": EMAIL,
-        "username": tampered, "email_verification": receipt,
+        "username": tampered, "email_verification": receipt, "phone": "+34612345678",
     }, None)
     assert result == {"ok": False, "reason": "missing_username" if tampered is None else "VerificationRequired"}
     assert rig["dynamo"].rows("players") == []
@@ -865,6 +896,7 @@ def test_malformed_receipt_signatures_are_rejected_not_internal_errors(rig, sign
     result = assign_mod.lambda_handler({
         "source": "web", "game_id": GAME_ID, "email": EMAIL,
         "email_verification": challenge["challengeId"] + "." + signature,
+        "phone": "+34612345678",
         "username": "Player",
     }, None)
     assert result == {"ok": False, "reason": "VerificationRequired"}

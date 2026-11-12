@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from stand_common.utils import default_participant_fields, normalize_participant_fields
+from stand_common.utils import default_participant_fields, normalize_participant_fields, OPTIONAL_PARTICIPANT_FIELDS
 from stand_common.email_verification import VerificationError
 from tests.test_public_web import assign_mod, public_mod
 
@@ -39,7 +39,8 @@ def operator_event(body):
 
 @pytest.fixture
 def web(monkeypatch, verified_web_assignment):
-    meta = {"gameId": "ABCDEF", "gameType": "T1MER", "isActive": True, "joinChannel": "web"}
+    meta = {"gameId": "ABCDEF", "gameType": "T1MER", "isActive": True,
+            "joinChannel": "web", "ownerUserId": "owner"}
     put, find, reserve = MagicMock(), MagicMock(return_value=None), MagicMock(return_value=True)
     monkeypatch.setattr(assign_mod, "_get_game_meta", lambda _: meta)
     monkeypatch.setattr(assign_mod, "_put_player", put)
@@ -55,23 +56,22 @@ def assign_body(values):
     return {
         "source": "web", "game_id": "ABCDEF",
         "username": "Player",
+        "phone": VALUES["phone"],
         **{("instagram_username" if name == "instagram" else name): value for name, value in values.items()},
     }
 
 
 @pytest.mark.parametrize("gt", WEB_TYPES)
 def test_defaults_and_legacy_partial_config(gt):
-    defaults = {"email": {"required": True}, "instagram": {"required": False}, "phone": {"required": False}}
-    if gt == "STACK":
-        defaults["phone"] = {"required": True, "enabled": True}
+    defaults = {"email": {"required": True}, "instagram": {"required": False},
+                "phone": {"required": True, "enabled": True},
+                **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS}}
     assert default_participant_fields(gt) == defaults
     assert normalize_participant_fields(gt, {}) == defaults
     assert normalize_participant_fields(gt, {"instagram": {"required": True}}) == {
         **defaults, "instagram": {"required": True},
     }
-    assert default_participant_fields("RULET4") == {
-        "email": {"required": False}, "instagram": {"required": True}, "phone": {"required": False},
-    }
+    assert default_participant_fields("RULET4") == defaults
 
 
 @pytest.mark.parametrize("gt", WEB_TYPES)
@@ -79,17 +79,14 @@ def test_defaults_and_legacy_partial_config(gt):
 def test_enabled_only_join_and_persistence(web, gt, config):
     meta, put, find, _ = web
     meta.update(gameType=gt, participantFields=config)
-    submitted = {name: VALUES[name] for name in CONTACT_FIELDS if name == "email" or config[name]["required"] or gt == "STACK"}
+    submitted = {name: VALUES[name] for name in CONTACT_FIELDS}
     submitted["instagram"] = VALUES["instagram"]
     result = assign_mod.lambda_handler(assign_body(submitted), None)
     assert result["ok"] is True
     assert result["playerToken"]
     item = put.call_args.args[0]
     for name, key in (("email", "email"), ("phone", "phone")):
-        if name == "email" or config[name]["required"] or gt == "STACK":
-            assert item[key] == STORED[key]
-        else:
-            assert key not in item
+        assert item[key] == STORED[key]
     assert "instagramUsername" not in item
     assert item["username"] == "Player"
     find.assert_called_once_with("ABCDEF", "ana@example.com")
@@ -106,11 +103,6 @@ def test_enabled_only_join_and_persistence(web, gt, config):
 def test_required_fields_validate_before_reserving_slot(web, field, bad, reason):
     meta, put, _, reserve = web
     meta["participantFields"] = {name: {"required": name == field} for name in FIELDS}
-    if field == "phone" and reason == "missing":
-        result = assign_mod.lambda_handler(assign_body({"email": VALUES["email"], field: bad}), None)
-        assert result["ok"] is True
-        assert "phone" not in put.call_args.args[0]
-        return
     result = assign_mod.lambda_handler(assign_body({"email": VALUES["email"], field: bad}), None)
     assert result == {"ok": False, "reason": f"{reason}_{field}"}
     put.assert_not_called()
@@ -126,19 +118,13 @@ def test_required_email_format_is_validated(web):
 
 
 @pytest.mark.parametrize("gt", WEB_TYPES)
-def test_disabled_values_are_ignored_even_if_malformed(web, gt):
+def test_legacy_disabled_phone_cannot_bypass_phone_validation(web, gt):
     meta, put, find, _ = web
     meta.update(gameType=gt, participantFields={name: {"required": False} for name in FIELDS})
     result = assign_mod.lambda_handler(assign_body({"email": VALUES["email"], "instagram": [], "phone": 123}), None)
-    if gt == "STACK":
-        assert result == {"ok": False, "reason": "invalid_phone"}
-        put.assert_not_called()
-        return
-    assert result["ok"] is True
-    assert not ({"instagramUsername", "phone"} & put.call_args.args[0].keys())
-    assert put.call_args.args[0]["email"] == STORED["email"]
-    assert put.call_args.args[0]["username"] == "Player"
-    find.assert_called_once()
+    assert result == {"ok": False, "reason": "invalid_phone"}
+    put.assert_not_called()
+    find.assert_not_called()
 
 
 @pytest.mark.parametrize("config", CONFIGS)
@@ -191,7 +177,8 @@ def test_public_metadata_and_join_ignore_legacy_instagram_config(web, config, mo
     monkeypatch.setattr(public_mod, "ASSIGN_LAMBDA", "assign")
     response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABCDEF"}})
     assert json.loads(response["body"])["participantFields"] == {
-        "email": {"required": True}, "phone": {"required": False, "enabled": config["phone"]["required"]},
+        "email": {"required": True}, "phone": {"required": True, "enabled": True},
+        **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
 
     invoked_payloads = []
@@ -203,10 +190,10 @@ def test_public_metadata_and_join_ignore_legacy_instagram_config(web, config, mo
         return {"Payload": io.BytesIO(json.dumps(result).encode())}
 
     body = {"gameId": "ABCDEF", "consent": True, "username": "Player"}
-    body.update({name: VALUES[name] for name in CONTACT_FIELDS if name == "email" or config[name]["required"]})
+    body.update({name: VALUES[name] for name in CONTACT_FIELDS})
     body["instagram"] = VALUES["instagram"]
     pending = {
-        name: STORED[name] for name in CONTACT_FIELDS if name == "email" or config[name]["required"]
+        name: STORED[name] for name in CONTACT_FIELDS
     }
     pending["username"] = "Player"
     with patch.object(public_mod, "verification_table"), \
@@ -227,7 +214,8 @@ def test_public_metadata_fills_missing_phone_and_legacy_defaults(monkeypatch):
     monkeypatch.setattr(public_mod, "_client_appearance", lambda _: {})
     response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABCDEF"}})
     assert json.loads(response["body"])["participantFields"] == {
-        "email": {"required": True}, "phone": {"required": False, "enabled": False},
+        "email": {"required": True}, "phone": {"required": True, "enabled": True},
+        **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
 
 
@@ -248,7 +236,7 @@ def test_legacy_required_phone_does_not_bypass_email_verification(web, monkeypat
 
 
 @pytest.mark.parametrize("config", CONFIGS)
-def test_operator_create_update_and_get_preserve_phone_config(config):
+def test_operator_cannot_disable_required_contact_fields(config):
     table = MagicMock()
     with patch.object(game, "games_table", table), \
          patch.object(game, "_get_user", return_value={}), \
@@ -256,14 +244,19 @@ def test_operator_create_update_and_get_preserve_phone_config(config):
          patch.object(game, "_new_join_code", return_value="ABCDEF"), \
          patch.object(game, "_load_default_quiz_from_catalog", return_value=(None, None)):
         created = game._handle_post(operator_event({"gameType": "T1MER", "participantFields": config}))
+        if not config["email"]["required"] or not config["phone"]["required"]:
+            assert created["statusCode"] == 400
+            table.put_item.assert_not_called()
+            return
         assert created["statusCode"] == 201
         stored = table.put_item.call_args.kwargs["Item"]
-        assert stored["participantFields"] == config
+        expected = normalize_participant_fields("T1MER", config)
+        assert stored["participantFields"] == expected
         table.get_item.return_value = {"Item": stored}
         updated = game._handle_put(operator_event({"gameId": "ABCDEF", "participantFields": config}))
     assert updated["statusCode"] == 200
-    assert table.update_item.call_args.kwargs["ExpressionAttributeValues"][":pf"] == config
-    assert game._public_game_shape(stored)["participantFields"] == config
+    assert table.update_item.call_args.kwargs["ExpressionAttributeValues"][":pf"] == expected
+    assert game._public_game_shape(stored)["participantFields"] == expected
 
 
 @pytest.mark.parametrize("config", [
@@ -291,14 +284,18 @@ def test_web_config_accepts_legacy_instagram_campaign_with_web_enrollment(web):
     )
     result = assign_mod.lambda_handler(assign_body({"email": VALUES["email"]}), None)
     assert result["ok"] is True
-    assert put.call_args.args[0]["joinSource"] == "web"
+    assert "joinSource" not in put.call_args.args[0]
     put.assert_called_once()
 
 
 @pytest.mark.parametrize("value,expected", [(None, None), ("", None), ("   ", None), (" +34 612345678 ", "+34 612345678")])
-def test_enabled_phone_is_optional_and_trimmed(web, value, expected):
+def test_phone_is_required_and_trimmed_despite_legacy_optional_flag(web, value, expected):
     meta, put, _, _ = web
     meta["participantFields"] = {"phone": {"enabled": True, "required": False}}
     result = assign_mod.lambda_handler(assign_body({"email": VALUES["email"], "phone": value}), None)
+    if expected is None:
+        assert result == {"ok": False, "reason": "missing_phone"}
+        put.assert_not_called()
+        return
     assert result["ok"] is True
     assert put.call_args.args[0].get("phone") == expected

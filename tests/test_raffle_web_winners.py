@@ -1,6 +1,7 @@
 """Tests for Web-only raffle winner selection in stand_prod_game_fn_raffle."""
 import importlib.util
 import json
+import pytest
 from pathlib import Path
 
 _LAMBDA_PATH = (
@@ -66,19 +67,42 @@ def test_ineligible_players_are_skipped(monkeypatch):
 
 
 def test_save_winners_persists_web_identity_only(monkeypatch):
+    monkeypatch.setenv("GAMES_TABLE", "games")
     calls = []
 
     class FakeTable:
         def get_item(self, Key):
-            return {"Item": {"raffleWinners": []}}
+            return {"Item": {"gameId": "G1", "raffleWinners": []}}
 
         def update_item(self, **kwargs):
             calls.append(kwargs)
 
     monkeypatch.setattr(raffle, "games_table", FakeTable())
+    monkeypatch.setattr(raffle.stack_prizes, "transact", lambda _, operations: calls.append(operations[0]["Update"]))
     raffle._save_raffle_winners_to_game(
         "G1", [{"playerId": 3, "username": "Eva", "validationCode": 1234}], False, "2026-01-01T00:00:00Z",
     )
 
     row = calls[0]["ExpressionAttributeValues"][":w"][0]
     assert row == {"playerId": 3, "username": "Eva", "wonAt": "2026-01-01T00:00:00Z", "validationCode": 1234}
+
+
+@pytest.mark.parametrize("only_validated", [False, True])
+def test_raffle_survey_filters_candidates_even_without_validated_filter(monkeypatch, only_validated):
+    game = {"gameId": "G1", "gameType": "T1MER", "isActive": True,
+            "formConfig": {"quizMoment": "raffle"}, "quizOrder": ["q1"]}
+    candidates = [
+        {"playerId": 1, "username": "Pending", "validated": True,
+         "type": {"T1MER": {"raffleEligible": True, "quizCompleted": False}}},
+        {"playerId": 2, "username": "Complete", "validated": True,
+         "type": {"T1MER": {"raffleEligible": True, "quizCompleted": True}}},
+    ]
+    monkeypatch.setattr(raffle, "_get_game", lambda _: game)
+    monkeypatch.setattr(raffle, "_query_all_players", lambda _: candidates)
+    monkeypatch.setattr(raffle, "_save_raffle_winners_to_game", lambda *_: None)
+    monkeypatch.setattr(raffle, "_mark_winner", lambda *_: None)
+    monkeypatch.setattr(raffle.random, "randrange", lambda *_: 0)
+    result = raffle.lambda_handler(
+        {"gameId": "G1", "numberOfWinners": 1, "applicableOnlyValidated": only_validated}, None,
+    )
+    assert json.loads(result["body"])["winners"] == ["Complete"]

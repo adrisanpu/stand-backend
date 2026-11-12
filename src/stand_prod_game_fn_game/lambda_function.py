@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 
 import boto3
 from stand_common import kivly_settings, stack_prize_api, stack_prizes, kivly_registration_api
+from stand_common import game_lifecycle, game_deletion, reward_conditions
+from stand_common import shared_prizes, prize_inventory
+from stand_common import client_index, clients_api
+from stand_common import game_forms
+from stand_common import home_canvas
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
@@ -14,6 +19,7 @@ from boto3.dynamodb.conditions import Key
 from stand_common.utils import (
     log,
     _json_sanitize,
+    _as_int,
     _resp,
     _iso_now,
     _parse_iso,
@@ -66,6 +72,86 @@ prize_s3 = boto3.client("s3")
 SUPPORTED_GAME_TYPES = {"EMPAREJA2", "T1MER", "RULET4", "L3TRAS", "SEMAFORO", "INFOCARDS", "IMPOSTOR", "STACK"}
 
 JOIN_CODE_MAX_ATTEMPTS = 10
+SETUP_REVIEW_SECTIONS = ("appearance", "configuration", "form", "questionnaire", "conditions", "prizes")
+
+
+def _initial_setup_review():
+    return {"version": 1, "revision": str(uuid.uuid4()), "confirmedSections": [], "completed": False}
+
+
+def _save_setup_review(item, owner_user_id, body):
+    """Keep initial review metadata separate from the event's live lifecycle."""
+    if set(body) != {"gameId", "setupReview"} or not isinstance(body["setupReview"], dict):
+        return _resp(400, {"error": "InvalidSetupReviewUpdate"})
+    update = body["setupReview"]
+    finishing = set(update) == {"finish", "expectedRevision"} and update["finish"] is True
+    confirming = (
+        set(update) == {"section", "confirmed", "expectedRevision"}
+        and isinstance(update["section"], str) and update["section"] in SETUP_REVIEW_SECTIONS
+        and type(update["confirmed"]) is bool
+    )
+    if (not finishing and not confirming) or not isinstance(update.get("expectedRevision"), str) or not update["expectedRevision"]:
+        return _resp(400, {"error": "InvalidSetupReviewUpdate"})
+    if (game_lifecycle.state(item) != "active" or not item.get("isActive", True)
+            or item.get("stackPrizeState") in {"closing", "closed"}
+            or item.get("archivedAt") or item.get("deletedAt") or item.get("deletionStartedAt")):
+        return _resp(409, {"error": "GameInactive"})
+    if "setupReview" not in item:
+        return _resp(409, {"error": "SetupReviewNotRequired"})
+    current = item["setupReview"]
+    if (not isinstance(current, dict) or current.get("version") != 1
+            or not isinstance(current.get("revision"), str) or not current["revision"]
+            or type(current.get("completed")) is not bool
+            or not isinstance(current.get("confirmedSections"), list)
+            or any(not isinstance(section, str) or section not in SETUP_REVIEW_SECTIONS
+                   for section in current["confirmedSections"])
+            or len(set(current["confirmedSections"])) != len(current["confirmedSections"])
+            or (current["completed"] and len(current["confirmedSections"]) != len(SETUP_REVIEW_SECTIONS))):
+        return _resp(409, {"error": "InvalidSetupReviewState"})
+    if update["expectedRevision"] != current["revision"]:
+        return _resp(409, {"error": "SetupReviewChanged"})
+    confirmed = set(current["confirmedSections"])
+    if finishing:
+        if confirmed != set(SETUP_REVIEW_SECTIONS):
+            return _resp(409, {"error": "SetupReviewIncomplete"})
+    elif update["confirmed"]:
+        confirmed.add(update["section"])
+    else:
+        confirmed.discard(update["section"])
+    progress = {
+        "version": 1,
+        "revision": str(uuid.uuid4()),
+        "confirmedSections": [section for section in SETUP_REVIEW_SECTIONS if section in confirmed],
+        "completed": finishing or (current["completed"] and len(confirmed) == len(SETUP_REVIEW_SECTIONS)),
+    }
+    try:
+        result = games_table.update_item(
+            Key={"gameId": item["gameId"]},
+            UpdateExpression="SET #review = :review, updatedAt = :now",
+            ConditionExpression=(
+                "attribute_exists(gameId) AND ownerUserId = :owner AND #review.#revision = :expected"
+                " AND attribute_not_exists(archivedAt) AND attribute_not_exists(deletedAt)"
+                " AND attribute_not_exists(deletionStartedAt)"
+                " AND (attribute_not_exists(isActive) OR isActive = :active)"
+                " AND (attribute_not_exists(lifecycleState) OR lifecycleState = :activeState)"
+                " AND (attribute_not_exists(stackPrizeState) OR (stackPrizeState <> :closing AND stackPrizeState <> :closed))"
+            ),
+            ExpressionAttributeNames={"#review": "setupReview", "#revision": "revision"},
+            ExpressionAttributeValues={
+                ":review": progress, ":now": _iso_now(), ":owner": owner_user_id,
+                ":expected": update["expectedRevision"], ":active": True, ":activeState": "active",
+                ":closing": "closing", ":closed": "closed",
+            },
+            ReturnValues="UPDATED_NEW",
+        )
+    except ClientError as exc:
+        if (exc.response.get("Error") or {}).get("Code") == "ConditionalCheckFailedException":
+            return _resp(409, {"error": "SetupReviewChanged"})
+        log("Setup review update failed", {"gameId": item["gameId"], "error": str(exc)})
+        return _resp(500, {"error": "SetupReviewUpdateFailed"})
+    return _resp(200, {
+        "ok": True, "gameId": item["gameId"], "setupReview": result["Attributes"]["setupReview"],
+    })
 
 def _get_query_params(event):
     return event.get("queryStringParameters") or {}
@@ -88,6 +174,253 @@ def _get_user(user_id: str):
     resp = users_table.get_item(Key={"userId": user_id})
     return resp.get("Item")
 
+
+def _home_canvas_shape(item):
+    canvas = home_canvas.resolved(item, item.get("ownerUserId"))
+    return {
+        "homeCanvas": canvas,
+        "homeRevision": item.get("homeRevision") or home_canvas.revision(canvas),
+        "homeBackgroundUrls": home_canvas.background_urls(
+            canvas, item.get("ownerUserId") or "", USER_MEDIA_BUCKET, prize_s3,
+        ),
+        "readOnly": (
+            game_lifecycle.state(item) != "active"
+            or not item.get("isActive", True)
+            or item.get("stackPrizeState") in {"closing", "closed"}
+            or bool(item.get("archivedAt") or item.get("deletedAt") or item.get("deletionStartedAt"))
+        ),
+        "showRaffleOnHome": item.get("showRaffleOnHome", True) is not False,
+    }
+
+
+def _home_backgrounds_owned(canvas, owner_user_id):
+    allowed_types = {
+        "image/png": (5 * 1024 * 1024, "image"),
+        "image/jpeg": (5 * 1024 * 1024, "image"),
+        "image/webp": (5 * 1024 * 1024, "image"),
+        "image/svg+xml": (5 * 1024 * 1024, "image"),
+        "video/mp4": (100 * 1024 * 1024, "video"),
+        "video/webm": (100 * 1024 * 1024, "video"),
+    }
+    for orientation in ("landscape", "portrait"):
+        background = canvas[orientation]["background"]
+        if not background:
+            continue
+        key = background["key"]
+        if not USER_MEDIA_BUCKET or not key.startswith(f"users/{owner_user_id}/home-backgrounds/"):
+            raise home_canvas.HomeCanvasError("InvalidHomeCanvasBackground")
+        try:
+            metadata = prize_s3.head_object(Bucket=USER_MEDIA_BUCKET, Key=key)
+        except Exception:
+            raise home_canvas.HomeCanvasError("InvalidHomeCanvasBackground") from None
+        content_type = metadata.get("ContentType")
+        max_bytes, media_type = allowed_types.get(content_type, (0, None))
+        size = metadata.get("ContentLength", 0)
+        if (media_type != background["type"] or type(size) is not int or not 0 < size <= max_bytes):
+            raise home_canvas.HomeCanvasError("InvalidHomeCanvasBackground")
+
+
+def _save_home_canvas(item, owner_user_id, body):
+    if set(body) != {"gameId", "homeCanvas", "expectedHomeRevision"}:
+        return _resp(400, {"error": "InvalidHomeCanvasUpdate"})
+    if (game_lifecycle.state(item) != "active" or not item.get("isActive", True)
+            or item.get("stackPrizeState") in {"closing", "closed"}
+            or item.get("archivedAt") or item.get("deletedAt") or item.get("deletionStartedAt")):
+        return _resp(409, {"error": "GameInactive"})
+    current_canvas = home_canvas.resolved(item, owner_user_id)
+    current_revision = item.get("homeRevision") or home_canvas.revision(current_canvas)
+    if not isinstance(body["expectedHomeRevision"], str) or not body["expectedHomeRevision"]:
+        return _resp(400, {"error": "InvalidHomeCanvasRevision"})
+    if body["expectedHomeRevision"] != current_revision:
+        return _resp(409, {"error": "HomeCanvasChanged", "homeRevision": current_revision})
+    try:
+        canvas = home_canvas.validate(body["homeCanvas"], owner_user_id)
+        home_canvas.validate_availability(canvas, item)
+        if not _is_user_pro(_get_user(owner_user_id)):
+            for orientation in ("landscape", "portrait"):
+                old_composition = current_canvas[orientation]
+                new_composition = canvas[orientation]
+                if old_composition["background"] != new_composition["background"]:
+                    return _resp(403, {"error": "PlanUpgradeRequired"})
+                previous_text_colors = {
+                    element["id"]: element.get("color")
+                    for element in old_composition["items"] if element["type"] == "text"
+                }
+                for element in new_composition["items"]:
+                    if element["type"] == "text" and element.get("color") != previous_text_colors.get(element["id"]):
+                        return _resp(403, {"error": "PlanUpgradeRequired"})
+        _home_backgrounds_owned(canvas, owner_user_id)
+    except home_canvas.HomeCanvasError as exc:
+        return _resp(400, {"error": str(exc)})
+
+    next_revision = home_canvas.next_revision(canvas)
+    values = {
+        ":canvas": canvas,
+        ":revision": next_revision,
+        ":now": _iso_now(),
+        ":owner": owner_user_id,
+        ":active": True,
+        ":activeState": "active",
+        ":closing": "closing",
+        ":closed": "closed",
+        ":gameType": item.get("gameType"),
+    }
+    condition = (
+        "attribute_exists(gameId) AND ownerUserId = :owner"
+        " AND attribute_not_exists(archivedAt) AND attribute_not_exists(deletedAt)"
+        " AND attribute_not_exists(deletionStartedAt)"
+        " AND #gameType = :gameType"
+        " AND (attribute_not_exists(isActive) OR isActive = :active)"
+        " AND (attribute_not_exists(lifecycleState) OR lifecycleState = :activeState)"
+        " AND (attribute_not_exists(stackPrizeState) OR (stackPrizeState <> :closing AND stackPrizeState <> :closed))"
+    )
+    if "showRaffleOnHome" in item:
+        condition += " AND showRaffleOnHome = :showRaffle"
+        values[":showRaffle"] = item["showRaffleOnHome"]
+    else:
+        condition += " AND attribute_not_exists(showRaffleOnHome)"
+    names = {
+        "#homeCanvas": "homeCanvas",
+        "#homeRevision": "homeRevision",
+        "#gameType": "gameType",
+    }
+    if item.get("homeRevision"):
+        condition += " AND #homeRevision = :expected"
+        values[":expected"] = current_revision
+    elif "homeCanvas" in item:
+        condition += " AND attribute_not_exists(#homeRevision) AND attribute_exists(#homeCanvas)"
+    else:
+        condition += " AND attribute_not_exists(#homeRevision) AND attribute_not_exists(#homeCanvas)"
+    try:
+        games_table.update_item(
+            Key={"gameId": item["gameId"]},
+            UpdateExpression="SET #homeCanvas = :canvas, #homeRevision = :revision, updatedAt = :now",
+            ConditionExpression=condition,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as exc:
+        if (exc.response.get("Error") or {}).get("Code") == "ConditionalCheckFailedException":
+            return _resp(409, {"error": "HomeCanvasChanged"})
+        log("Home canvas update failed", {"gameId": item["gameId"], "error": str(exc)})
+        return _resp(500, {"error": "HomeCanvasUpdateFailed"})
+
+    updated = {**item, "homeCanvas": canvas, "homeRevision": next_revision}
+    return _resp(200, {
+        "ok": True,
+        "gameId": item["gameId"],
+        "gameType": item["gameType"],
+        **_home_canvas_shape(updated),
+    })
+
+
+def _handle_shared_prize_catalog(event, method):
+    claims = _get_claims(event)
+    owner_id = (claims.get("sub") or "").strip()
+    if not owner_id:
+        return _resp(401, {"error": "Missing sub claim (unauthorized)"})
+    try:
+        if method == "POST":
+            body = _read_json_body(event)
+            if not isinstance(body, dict) or body.get("action") != "upload-url":
+                return _resp(400, {"error": "Unsupported shared prize action."})
+            if not USER_MEDIA_BUCKET:
+                return _resp(500, {"error": "Missing USER_MEDIA_BUCKET env var"})
+            if body.get("contentType") != "image/png":
+                return _resp(400, {"error": "contentType must be image/png."})
+            size = body.get("sizeBytes")
+            if type(size) is not int or size < 1 or size > MAX_PRIZE_IMAGE_BYTES:
+                return _resp(400, {"error": "Prize image must be between 1 byte and 5 MB."})
+            key = f"prizes/{owner_id}/{uuid.uuid4()}.png"
+            url = prize_s3.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": USER_MEDIA_BUCKET, "Key": key, "ContentType": "image/png"},
+                ExpiresIn=3600,
+            )
+            return _resp(200, {"ok": True, "key": key, "uploadUrl": url})
+        if method == "GET":
+            catalog = shared_prizes.migrate(users_table, games_table, owner_id)
+            shared_prizes.synchronize(games_table, owner_id, catalog)
+            user = users_table.get_item(Key={"userId": owner_id}, ConsistentRead=True).get("Item") or {}
+            output = []
+            for prize in catalog:
+                item = dict(prize)
+                key = item.get("imageKey")
+                if key:
+                    if not USER_MEDIA_BUCKET:
+                        raise RuntimeError("Missing USER_MEDIA_BUCKET for configured prize image.")
+                    item["imageUrl"] = prize_s3.generate_presigned_url(
+                        "get_object", Params={"Bucket": USER_MEDIA_BUCKET, "Key": key}, ExpiresIn=3600,
+                    )
+                else:
+                    item["imageUrl"] = None
+                output.append(item)
+            return _resp(200, {
+                "ok": True, "catalog": output,
+                "revision": int(user.get("sharedPrizeCatalogRevision", 1)),
+            })
+        if method != "PUT":
+            return _resp(405, {"error": f"Method {method} not allowed"})
+        body = _read_json_body(event)
+        if not isinstance(body, dict) or set(body) != {"catalog", "expectedRevision"}:
+            return _resp(400, {"error": "Invalid shared prize catalog request."})
+        current = shared_prizes.migrate(users_table, games_table, owner_id)
+        current_user = users_table.get_item(Key={"userId": owner_id}, ConsistentRead=True).get("Item") or {}
+        revision = int(current_user.get("sharedPrizeCatalogRevision", 1))
+        if type(body["expectedRevision"]) is not int or body["expectedRevision"] != revision:
+            return _resp(409, {"error": "SharedPrizeCatalogChanged"})
+        updated = shared_prizes.validate(body["catalog"])
+        current_ids = {prize["id"] for prize in current}
+        removed = current_ids - {prize["id"] for prize in updated}
+        if removed:
+            if prize_inventory.enabled():
+                for pid in removed:
+                    stock = prize_inventory.balance(dynamodb, owner_id, pid)
+                    if stock["initialized"] or stock["assigned"] or stock["historicalAssigned"]:
+                        return _resp(409, {"error": "SharedPrizeInUse"})
+            for game in shared_prizes._read_games(games_table, owner_id):
+                assignments = list((game.get("prizeCatalog") or {}).values())
+                program = game.get("stackPrizeProgram") or {}
+                assignments.extend(program.get("catalog", []) if isinstance(program, dict) else [])
+                if any(isinstance(item, dict) and item.get("sharedPrizeId") in removed for item in assignments):
+                    return _resp(409, {"error": "SharedPrizeInUse"})
+        current_images = {prize["id"]: prize.get("imageKey") for prize in current}
+        for prize in updated:
+            key = prize.get("imageKey")
+            if not key:
+                continue
+            if not (key.startswith(f"prizes/{owner_id}/") or key.startswith(f"games/{owner_id}/")):
+                return _resp(400, {"error": "Invalid shared prize image key."})
+            if current_images.get(prize["id"]) != key:
+                _read_verified_prize_image(key)
+        try:
+            users_table.update_item(
+                Key={"userId": owner_id},
+                UpdateExpression="SET sharedPrizeCatalog = :catalog, sharedPrizeCatalogRevision = :next",
+                ConditionExpression="sharedPrizeCatalogRevision = :expected AND sharedPrizeCatalogState = :ready",
+                ExpressionAttributeValues={
+                    ":catalog": updated, ":next": revision + 1,
+                    ":expected": revision, ":ready": "ready",
+                },
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return _resp(409, {"error": "SharedPrizeCatalogChanged"})
+            raise
+        try:
+            shared_prizes.synchronize(games_table, owner_id, updated)
+        except RuntimeError as exc:
+            log("Shared prize catalog synchronization failed after catalog save", {
+                "error": str(exc), "ownerId": owner_id, "revision": revision + 1,
+            })
+            return _resp(500, {"error": "SharedPrizeCatalogSyncFailed", "catalogUpdated": True})
+        return _resp(200, {"ok": True, "revision": revision + 1})
+    except ValueError as exc:
+        return _resp(400, {"error": str(exc)})
+    except RuntimeError as exc:
+        log("Shared prize catalog operation failed", {"error": str(exc), "ownerId": owner_id})
+        return _resp(500, {"error": "SharedPrizeCatalogFailed"})
+
 def _new_join_code(length: int = JOIN_CODE_LENGTH) -> str:
     return "".join(random.choice(JOIN_CODE_ALPHABET) for _ in range(length))
 
@@ -97,6 +430,8 @@ def _public_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
         "gameId": item.get("gameId"),
         "gameName": item.get("gameName"),
         "gameType": item.get("gameType"),
+        "isActive": bool(item.get("isActive", True)),
+        "lifecycleState": game_lifecycle.state(item),
         "createdAt": item.get("createdAt"),
         "maxPlayers": item.get("maxPlayers"),
         "showRaffleOnHome": item.get("showRaffleOnHome", True),
@@ -113,14 +448,41 @@ def _public_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
     return shape
 
 
+def _operator_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
+    shape = _public_game_shape(item, include_prize_catalog)
+    if "setupReview" in item:
+        shape["setupReview"] = item["setupReview"]
+    return shape
+
+
 def _serialize_prize_catalog(item: dict) -> dict:
-    return serialize_prize_catalog(
-        item.get("prizeCatalog"),
-        item.get("ownerUserId") or "",
-        item.get("gameId") or "",
-        USER_MEDIA_BUCKET,
-        prize_s3.generate_presigned_url,
-    )
+    owner_id = item.get("ownerUserId") or ""
+    shared = {
+        prize["id"]: prize for prize in ((_get_user(owner_id) or {}).get("sharedPrizeCatalog") or [])
+        if isinstance(prize, dict) and isinstance(prize.get("id"), str)
+    }
+    catalog = item.get("prizeCatalog") or {}
+    output = {}
+    for slot, prize in catalog.items():
+        shared_prize = shared.get(prize.get("sharedPrizeId")) if isinstance(prize, dict) else None
+        if not shared_prize:
+            output.update(serialize_prize_catalog(
+                {slot: prize}, owner_id, item.get("gameId") or "", USER_MEDIA_BUCKET,
+                prize_s3.generate_presigned_url,
+            ))
+            continue
+        image_key = shared_prize.get("imageKey")
+        image_url = None
+        if image_key:
+            if not USER_MEDIA_BUCKET:
+                raise RuntimeError("Missing USER_MEDIA_BUCKET for configured prize image.")
+            image_url = prize_s3.generate_presigned_url(
+                "get_object", Params={"Bucket": USER_MEDIA_BUCKET, "Key": image_key}, ExpiresIn=3600,
+            )
+        output[slot] = {
+            **prize, "name": shared_prize["name"], "imageKey": image_key, "imageUrl": image_url,
+        }
+    return output
 
 
 def _stack_prize_settings(payload, item):
@@ -197,10 +559,12 @@ def _handle_prize_upload_url(event):
         return _resp(400, {"error": "Prize image must be between 1 byte and 5 MB."})
 
     item = _get_game(game_id)
-    if not item:
+    if not item or item.get("deletedAt"):
         return _resp(404, {"error": "GameNotFound", "gameId": game_id})
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+    if item.get("archivedAt"):
+        return _resp(409, {"error": "GameArchived"})
     raffle_enabled = _is_user_pro(_get_user(owner_user_id))
     if slot not in allowed_prize_slots(item.get("gameType") or "", raffle_enabled):
         return _resp(400, {"error": f"The {slot} prize is not supported for this game or plan."})
@@ -381,26 +745,57 @@ def _handle_get(event):
     # ---------------- 1) gameId ----------------
     if game_id:
         try:
-            resp = games_table.get_item(Key={"gameId": game_id})
+            resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
             item = resp.get("Item")
         except ClientError as e:
             log("GetItem failed", {"error": str(e)})
             return _resp(500, {"error": "GetItemFailed", "detail": str(e)})
 
-        if not item:
+        if not item or item.get("deletedAt"):
             return _resp(404, {"error": "GameNotFound", "gameId": game_id})
 
         # owner only
         if (item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
-        if not item.get("isActive", True) and not (
+        if item.get("archivedAt") or item.get("deletedAt"):
+            return _resp(404, {"error": "GameNotFound", "gameId": game_id})
+        if params.get("home") == "true":
+            try:
+                return _resp(200, {
+                    "ok": True,
+                    "gameId": item["gameId"],
+                    "gameType": item["gameType"],
+                    **_home_canvas_shape(item),
+                })
+            except home_canvas.HomeCanvasError as exc:
+                return _resp(409, {"error": str(exc)})
+
+        if params.get("form") == "true":
+            try:
+                return _resp(200, _json_sanitize(game_forms.operator_shape(dynamodb, item)))
+            except game_forms.FormError as exc:
+                return _resp(exc.status, {"error": exc.code})
+        if item.get("archivedAt"):
+            return _resp(404, {"error": "GameNotFound", "gameId": game_id})
+        if params.get("configuration") != "true" and not item.get("isActive", True) and not item.get("lifecycleState") and not (
             item.get("gameType") == "STACK" and item.get("stackPrizeState") in ("closing", "closed")
         ):
             return _resp(403, {"error": "GameInactive", "gameId": game_id})
 
-        game_shape = _public_game_shape(item, include_prize_catalog=False)
+        game_shape = _operator_game_shape(item, include_prize_catalog=False)
         payload = {"ok": True, "game": game_shape}
+        try:
+            payload.update(_home_canvas_shape(item))
+        except home_canvas.HomeCanvasError as exc:
+            return _resp(409, {"error": str(exc)})
+        try:
+            payload.update(game_forms.public_config(item))
+        except game_forms.FormError as exc:
+            return _resp(exc.status, {"error": exc.code})
+        if params.get("configuration") == "true":
+            payload["configuration"] = (item.get("type") or {}).get(item.get("gameType"), {})
+            payload["rewardConditionsRevision"] = reward_conditions.revision(item.get("prizeCatalog") or {})
         if "stackPrizeProgram" in item and item.get("gameType") == "STACK":
             payload["prizeCatalog"] = {}
         elif "prizeCatalog" in item:
@@ -440,7 +835,9 @@ def _handle_get(event):
             return _resp(404, {"error": "GameNotFound", "gameName": game_name})
 
         item = items[0]
-        if not item.get("isActive", True) and not (
+        if item.get("archivedAt"):
+            return _resp(404, {"error": "GameNotFound", "gameName": game_name})
+        if not item.get("isActive", True) and not item.get("lifecycleState") and not (
             item.get("gameType") == "STACK" and item.get("stackPrizeState") in ("closing", "closed")
         ):
             return _resp(403, {"error": "GameInactive", "gameName": game_name})
@@ -471,7 +868,7 @@ def _handle_get(event):
 
         payload = {
             "ok": True,
-            "game": _public_game_shape(item, include_prize_catalog=False),
+            "game": _operator_game_shape(item, include_prize_catalog=False),
             "playerCount": player_count,
             "validatedCount": validated_count,
             "raffleWinners": _raffle_winners_from_game(item),
@@ -485,12 +882,18 @@ def _handle_get(event):
         # enrich raffleWinners with prizeDelivered flag per player
         try:
             game_type = (item.get("gameType") or "").upper()
+            native_raffle = {
+                row["playerId"]: row["state"] == "delivered"
+                for row in stack_prizes.records(dynamodb, game_id)
+                if row.get("condition") == "raffle" and row.get("prize", {}).get("source") == "stand"
+            } if item.get("lifecycleState") else {}
             winners_with_flags = []
             for w in payload.get("raffleWinners") or []:
                 pid = w.get("playerId")
                 delivered = False
                 if pid is not None:
                     delivered = _get_player_prize_delivered(game_id, int(pid), game_type)
+                    delivered = native_raffle.get(int(pid), delivered)
                 row = dict(w)
                 row["prizeDelivered"] = delivered
                 winners_with_flags.append(row)
@@ -515,16 +918,28 @@ def _handle_get(event):
             "supportedGameTypes": sorted(SUPPORTED_GAME_TYPES),
         })
 
+    archived = params.get("archived", "false")
+    if archived not in ("true", "false"):
+        return _resp(400, {"error": "archived must be true or false."})
     try:
-        q = games_table.query(
-            IndexName=GSI_OWNER,
-            KeyConditionExpression=Key("ownerUserId").eq(owner_user_id),
-        )
-        items = q.get("Items") or []
+        query = {
+            "IndexName": GSI_OWNER,
+            "KeyConditionExpression": Key("ownerUserId").eq(owner_user_id),
+        }
+        items = []
+        while True:
+            page = games_table.query(**query)
+            items.extend(page.get("Items") or [])
+            last_key = page.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query["ExclusiveStartKey"] = last_key
     except ClientError as e:
         log("Owner query failed", {"error": str(e)})
         return _resp(500, {"error": "OwnerQueryFailed", "detail": str(e)})
 
+    items = [it for it in items if not it.get("deletedAt")
+             and bool(it.get("archivedAt")) == (archived == "true")]
     if game_type:
         items = [it for it in items if (it.get("gameType") or "").upper() == game_type]
 
@@ -535,7 +950,19 @@ def _handle_get(event):
         "ownerUserId": owner_user_id,
         "gameType": game_type,
         "count": len(items),
-        "games": [_public_game_shape(it) for it in items],
+        "games": [
+            {
+                **_operator_game_shape(it),
+                "playerCount": _as_int(it.get("playersCount", 0)),
+                "isActive": bool(it.get("isActive", True)),
+                "lifecycleState": game_lifecycle.state(it),
+                **({"archivedAt": it["archivedAt"]} if it.get("archivedAt") else {}),
+                **({"deletionStartedAt": it["deletionStartedAt"]} if it.get("deletionStartedAt") else {}),
+                **({"stackPrizeState": it.get("stackPrizeState", "open")}
+                   if it.get("gameType") == "STACK" else {}),
+            }
+            for it in items
+        ],
     })
 
 
@@ -616,6 +1043,14 @@ def _handle_delete_player(event):
         return error
     game_id, owner_user_id, game_item = game
 
+    if game_item.get("archivedAt") or game_item.get("lifecycleState") in ("closing", "inactive"):
+        return _resp(409, {"error": "GameInactive"})
+    if game_item.get("lifecycleState") and any(
+        row.get("playerId") == player_id and row.get("id", "").startswith("award_")
+        for row in stack_prizes.records(dynamodb, game_id)
+    ):
+        return _resp(409, {"error": "PlayerHasAwards"})
+
     if game_item.get("gameType") == "STACK" and game_item.get("stackPrizeState") in ("closing", "closed"):
         return _resp(409, {"error": "StackClosing", "detail": "The final ranking cannot be changed."})
 
@@ -672,6 +1107,11 @@ def _handle_delete_player(event):
         ":owner": owner_user_id,
     }
     conditions = ["ownerUserId = :owner", "attribute_exists(gameId)"]
+    if "isActive" in game_item:
+        conditions.append("isActive = :expectedActive")
+        values[":expectedActive"] = game_item["isActive"]
+    else:
+        conditions.append("attribute_not_exists(isActive)")
     if game_item.get("gameType") == "STACK" and "stackPrizeProgram" in game_item:
         revision = game_item.get("stackPrizeRevision", 0)
         update_expression += ", stackPrizeRevision = :nextRevision"
@@ -727,6 +1167,15 @@ def _handle_delete_player(event):
                 "ExpressionAttributeValues": {":removedPlayerId": player_id},
             }
         })
+    try:
+        transaction.extend(client_index.delete_actions(
+            dynamodb, owner_user_id, game_id, player, PLAYER_TOKEN_SECRET,
+        ))
+    except (client_index.ClientIndexError, KeyError, ValueError) as exc:
+        log("PlayerAdminClientIndexCleanupFailed", {
+            "error": str(exc), "gameId": game_id, "playerId": player_id,
+        })
+        return _resp(500, {"error": "PlayerIdentityCleanupUnavailable"})
     try:
         dynamodb.meta.client.transact_write_items(TransactItems=transaction)
     except ClientError as exc:
@@ -872,6 +1321,8 @@ def _handle_post(event):
             "validatedCount": 0,
             "raffleWinners": [],
             "showRaffleOnHome": body.get("showRaffleOnHome", True),
+            "homeCanvas": home_canvas.empty(),
+            "setupReview": _initial_setup_review(),
             "requiresValidation": requires_validation,
             "playMode": access["playMode"],
             "joinChannel": access["joinChannel"],
@@ -927,6 +1378,10 @@ def _handle_put(event):
     - isActive: optional boolean. If provided, updates isActive and updatedAt.
     - settings.empareja2: optional. If provided, merges into type.EMPAREJA2 (numPairs: int >= 1 or None, maxValidations: int >= 0 or None).
     - settings.l3tras: optional. Merges into type.L3TRAS (objectiveWord, always stored uppercase).
+    - setupReview: exclusive update with {section, confirmed, expectedRevision} or
+      {finish: true, expectedRevision}. Returns persisted setupReview; all six
+      sections must be confirmed before finishing. Missing setupReview means
+      a legacy event is exempt. Review completion does not change isActive.
     """
     body = _read_json_body(event)
     if not isinstance(body, dict):
@@ -937,7 +1392,8 @@ def _handle_put(event):
     if not owner_user_id:
         return _resp(401, {"error": "Missing sub claim (unauthorized)"})
 
-    game_id = (body.get("gameId") or "").strip()
+    game_id = body.get("gameId")
+    game_id = game_id.strip() if isinstance(game_id, str) else ""
     if not game_id:
         return _resp(400, {"error": "Missing required field 'gameId'."})
     prize_catalog_supplied = "prizeCatalog" in body
@@ -982,13 +1438,19 @@ def _handle_put(event):
         and play_mode is None
         and "showRaffleOnHome" not in body
         and not prize_catalog_supplied
+        and "archived" not in body
+        and "rewardConditions" not in body
+        and "form" not in body
+        and "homeCanvas" not in body
+        and "expectedHomeRevision" not in body
+        and "setupReview" not in body
     ):
         return _resp(400, {"error": "Provide at least one game update, including 'prizeCatalog'."})
 
     now = _iso_now()
 
     try:
-        resp = games_table.get_item(Key={"gameId": game_id})
+        resp = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True)
         item = resp.get("Item")
     except ClientError as e:
         log("GetItem failed on PUT", {"error": str(e)})
@@ -999,10 +1461,97 @@ def _handle_put(event):
     if (item.get("ownerUserId") or "") != owner_user_id:
         return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
 
+    if "setupReview" in body:
+        return _save_setup_review(item, owner_user_id, body)
+
+    if "archived" in body:
+        if body["archived"] is not False or set(body) != {"gameId", "archived"}:
+            return _resp(400, {"error": "Unarchive requires only gameId and archived=false."})
+        try:
+            updated = game_lifecycle.unarchive(dynamodb, item)
+            return _resp(200, _json_sanitize({"message": "Game unarchived successfully", "game": updated}))
+        except stack_prizes.PrizeError as exc:
+            return _resp(exc.status, {"error": exc.code})
+    if item.get("archivedAt"):
+        return _resp(409, {"error": "GameArchived"})
+    if "homeCanvas" in body or "expectedHomeRevision" in body:
+        try:
+            return _save_home_canvas(item, owner_user_id, body)
+        except home_canvas.HomeCanvasError as exc:
+            return _resp(400, {"error": str(exc)})
+    if isinstance(prize_update, dict) and prize_update.get("delivered") is True and game_forms.moment(item) == "prize":
+        pid = _as_int(prize_update.get("playerId"))
+        recipient = gp_table.get_item(
+            Key={"gameId": game_id, "playerId": pid or 0}, ConsistentRead=True,
+        ).get("Item") or {}
+        if game_forms.pending(item, recipient, "prize"):
+            return _resp(409, {"error": "QuizRequired"})
+    if "isActive" in body:
+        if type(is_active) is not bool or set(body) != {"gameId", "isActive"}:
+            return _resp(400, {"error": "Activity updates require only gameId and boolean isActive."})
+        try:
+            updated = game_lifecycle.change_active(dynamodb, item, is_active)
+            return _resp(200, _json_sanitize({"message": "Game updated successfully", "game": updated}))
+        except stack_prizes.PrizeError as exc:
+            return _resp(exc.status, {"error": exc.code})
+    if isinstance(prize_update, dict) and item.get("lifecycleState"):
+        if set(body) != {"gameId", "settings"} or set(settings) != {"prizeDelivered"}:
+            return _resp(400, {"error": "Prize delivery cannot be combined with configuration changes."})
+        pid = _as_int(prize_update.get("playerId"))
+        if pid is None or pid < 1 or prize_update.get("gameType") != item.get("gameType"):
+            return _resp(400, {"error": "Invalid prize recipient."})
+        award = next((row for row in stack_prizes.records(dynamodb, game_id)
+                      if row.get("playerId") == pid and row.get("condition") == "raffle"
+                      and row.get("id", "").startswith("award_")), None)
+        if award:
+            if prize_update.get("delivered") is not True:
+                return _resp(409, {"error": "AwardDeliveryCannotBeReversed"})
+            try:
+                stack_prizes.redeem(dynamodb, game_id, pid, award["id"])
+                return _resp(200, _json_sanitize({"message": "Game updated successfully", "game": item}))
+            except stack_prizes.PrizeError as exc:
+                return _resp(exc.status, {"error": exc.code})
+    if game_lifecycle.state(item) != "active":
+        return _resp(409, {"error": "GameInactive"})
+    if "form" in body:
+        if set(body) != {"gameId", "form"}:
+            return _resp(400, {"error": "InvalidFormUpdate"})
+        proposed = body["form"]
+        if not isinstance(proposed, dict):
+            return _resp(400, {"error": "InvalidFormUpdate"})
+        if not _is_user_pro(_get_user(owner_user_id)):
+            previous = game_forms.config(item)
+            new = proposed.get("formConfig") or {}
+            if (proposed.get("questions") != game_forms.questions(item)
+                    or any(new.get(k) != previous[k] for k in ("quizMoment", "logoKey", "bannerKey", "appearance"))):
+                return _resp(403, {"error": "PlanUpgradeRequired"})
+        try:
+            return _resp(200, _json_sanitize(game_forms.save(dynamodb, item, proposed)))
+        except game_forms.FormError as exc:
+            return _resp(exc.status, {"error": exc.code})
+    config_condition = "attribute_exists(gameId) AND ownerUserId = :owner AND attribute_not_exists(archivedAt) AND attribute_not_exists(deletedAt)"
+    config_values = {":owner": owner_user_id}
+    if "isActive" in item:
+        config_condition += " AND isActive = :configActive"
+        config_values[":configActive"] = True
+    else:
+        config_condition += " AND attribute_not_exists(isActive)"
+    if "rewardConditions" in body:
+        if set(body) != {"gameId", "rewardConditions"} or not isinstance(body["rewardConditions"], dict):
+            return _resp(400, {"error": "InvalidRewardConditions"})
+        try:
+            updated = reward_conditions.native_update(dynamodb, item, body["rewardConditions"])
+            return _resp(200, {"ok": True, "gameId": game_id, "message": "Reward conditions updated successfully",
+                               "rewardConditionsRevision": reward_conditions.revision(updated)})
+        except stack_prizes.PrizeError as exc:
+            return _resp(exc.status, {"error": exc.code})
+
     prepared_prize_catalog = None
     prepared_prize_response = None
     staged_upload_keys = []
     if prize_catalog_supplied:
+        master_catalog = shared_prizes.migrate(users_table, games_table, owner_user_id)
+        item = _get_game(game_id) or item
         existing_catalog = item.get("prizeCatalog")
         raffle_enabled = (
             _is_user_pro(_get_user(owner_user_id))
@@ -1020,12 +1569,15 @@ def _handle_put(event):
                 owner_user_id,
                 game_id,
                 existing_catalog=existing_catalog,
+                shared_catalog=master_catalog,
             )
             for slot, prize in prepared_prize_catalog.items():
                 image_key = prize["imageKey"]
                 if image_key is None:
                     continue
                 image_data = _read_verified_prize_image(image_key)
+                if prize.get("sharedPrizeId"):
+                    continue
                 if staged_prize_image_key(owner_user_id, game_id, slot, image_key):
                     committed_key = f"games/{owner_user_id}/{game_id}/{slot}/{uuid.uuid4()}.png"
                     prize_s3.put_object(
@@ -1037,13 +1589,9 @@ def _handle_put(event):
                     )
                     staged_upload_keys.append(image_key)
                     prize["imageKey"] = committed_key
-            prepared_prize_response = serialize_prize_catalog(
-                prepared_prize_catalog,
-                owner_user_id,
-                game_id,
-                USER_MEDIA_BUCKET,
-                prize_s3.generate_presigned_url,
-            )
+            prepared_prize_response = _serialize_prize_catalog({
+                **item, "prizeCatalog": prepared_prize_catalog,
+            })
         except ValueError as exc:
             return _resp(400, {"error": str(exc)})
         except RuntimeError as exc:
@@ -1077,17 +1625,13 @@ def _handle_put(event):
             participant_fields = normalize_participant_fields(item.get("gameType") or "", participant_fields, strict=True)
         except ValueError as exc:
             return _resp(400, {"error": str(exc)})
-
-    if (item.get("gameType") == "STACK" and item.get("stackPrizeState") in ("closing", "closed")
-            and isinstance(is_active, bool)):
-        return _resp(409, {"error": "StackClosing"})
-    if item.get("gameType") == "STACK" and is_active is False:
-        return _resp(409, {"error": "StackCloseRequired"})
+        if "formConfig" in item and participant_fields != normalize_participant_fields(item["gameType"], item.get("participantFields")):
+            return _resp(409, {"error": "FormEditorRequired"})
 
     if rulet4_config is not None:
         names = {"#type": "type"}
-        values = {":now": now, ":owner": owner_user_id, ":gameType": "RULET4"}
-        condition = "attribute_exists(gameId) AND ownerUserId = :owner AND gameType = :gameType"
+        values = {":now": now, **config_values, ":gameType": "RULET4"}
+        condition = config_condition +         " AND #gameType = :gameType"
         if "type" in item:
             names["#rulet4"] = "RULET4"
             values[":config"] = rulet4_config
@@ -1109,19 +1653,30 @@ def _handle_put(event):
             return _resp(500, {"error": "UpdateFailed"})
 
     if stack_config is not None:
-        set_game_type_blob(
-            games_table, game_id, "STACK", stack_config, updated_at=now,
-            condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
-            condition_values={":owner": owner_user_id},
-        )
+        try:
+            set_game_type_blob(
+                games_table, game_id, "STACK", stack_config, updated_at=now,
+                condition_expression=config_condition, condition_values=config_values,
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(409, {"error": "Game changed; reload configuration before saving."})
+            raise
 
     if participant_fields is not None:
+        field_values = {":pf": participant_fields, ":u": now, ":owner": owner_user_id}
+        field_condition = "attribute_exists(gameId) AND ownerUserId = :owner"
+        if item.get("formRevision"):
+            field_condition += " AND formRevision = :formRevision"
+            field_values[":formRevision"] = item["formRevision"]
+        else:
+            field_condition += " AND attribute_not_exists(formRevision)"
         try:
             games_table.update_item(
                 Key={"gameId": game_id},
                 UpdateExpression="SET participantFields = :pf, updatedAt = :u",
-                ExpressionAttributeValues={":pf": participant_fields, ":u": now, ":owner": owner_user_id},
-                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+                ExpressionAttributeValues=field_values,
+                ConditionExpression=field_condition,
             )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -1163,24 +1718,6 @@ def _handle_put(event):
             log("Update game access failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
 
-    if isinstance(is_active, bool):
-        try:
-            games_table.update_item(
-                Key={"gameId": game_id},
-                UpdateExpression="SET isActive = :a, updatedAt = :u",
-                ExpressionAttributeValues={
-                    ":a": is_active,
-                    ":u": now,
-                    ":owner": owner_user_id,
-                },
-                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
-            )
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
-            log("Update isActive failed", {"error": str(e)})
-            return _resp(500, {"error": "UpdateFailed", "detail": str(e)})
-
     if empareja2_settings is not None and isinstance(empareja2_settings, dict):
         num_pairs = empareja2_settings.get("numPairs")
         max_validations = empareja2_settings.get("maxValidations")
@@ -1213,8 +1750,8 @@ def _handle_put(event):
                 "EMPAREJA2",
                 merged,
                 updated_at=now,
-                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
-                condition_values={":owner": owner_user_id},
+                condition_expression=config_condition,
+                condition_values=config_values,
             )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -1254,8 +1791,8 @@ def _handle_put(event):
                 "L3TRAS",
                 merged,
                 updated_at=now,
-                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
-                condition_values={":owner": owner_user_id},
+                condition_expression=config_condition,
+                condition_values=config_values,
             )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -1280,8 +1817,8 @@ def _handle_put(event):
                 games_table.update_item(
                     Key={"gameId": game_id},
                     UpdateExpression="SET maxPlayers = :m, updatedAt = :u",
-                    ExpressionAttributeValues={":m": mp, ":u": now, ":owner": owner_user_id},
-                    ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+                    ExpressionAttributeValues={":m": mp, ":u": now, **config_values},
+                    ConditionExpression=config_condition,
                 )
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -1307,8 +1844,8 @@ def _handle_put(event):
                 "IMPOSTOR",
                 merged,
                 updated_at=now,
-                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner",
-                condition_values={":owner": owner_user_id},
+                condition_expression=config_condition,
+                condition_values=config_values,
             )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -1363,6 +1900,14 @@ def _handle_put(event):
             return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
         if (latest_item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+        if game_lifecycle.state(latest_item) != "active" or latest_item.get("archivedAt"):
+            return _resp(409, {"error": "GameInactive"})
+        if (body.get("preserveRewardConditions") is True
+                and latest_item.get("gameType") == "T1MER"
+                and prepared_prize_catalog.get("ranking")
+                and (latest_item.get("prizeCatalog") or {}).get("ranking")):
+            prepared_prize_catalog["ranking"]["topX"] = latest_item["prizeCatalog"]["ranking"]["topX"]
+            prepared_prize_response["ranking"]["topX"] = prepared_prize_catalog["ranking"]["topX"]
 
         expression_values = {
             ":catalog": prepared_prize_catalog,
@@ -1407,7 +1952,13 @@ def _handle_put(event):
                 else:
                     expression_values[":type"] = {"EMPAREJA2": {"maxValidations": validation_limit}}
 
-        condition = "attribute_exists(gameId) AND ownerUserId = :owner AND gameType = :gameType"
+        condition = config_condition + " AND gameType = :gameType"
+        expression_values.update(config_values)
+        if "prizeCatalog" in latest_item:
+            condition += " AND prizeCatalog = :previousCatalog"
+            expression_values[":previousCatalog"] = latest_item["prizeCatalog"]
+        else:
+            condition += " AND attribute_not_exists(prizeCatalog)"
         previous_updated = latest_item.get("updatedAt")
         if previous_updated is None:
             condition += " AND attribute_not_exists(updatedAt)"
@@ -1451,7 +2002,7 @@ def _handle_put(event):
         attrs = item
     if isinstance(attrs, dict):
         attrs = {**attrs, **resolve_game_access(attrs)}
-    payload = {"message": "Game updated successfully", "game": attrs}
+    payload = {"ok": True, "message": "Game updated successfully", "game": attrs}
     if prize_catalog_supplied:
         attrs = {**attrs, "prizeCatalog": prepared_prize_catalog}
         if (
@@ -1480,12 +2031,10 @@ def _handle_put(event):
 
 def _handle_delete(event):
     """
-    Delete game metadata (owner only).
-    body: { "gameId": "XXXXXX" }
-    Note: no per-game tables exist anymore.
+    Archive, or explicitly permanently delete an archived event (owner only).
     """
     body = _read_json_body(event)
-    if body is None:
+    if not isinstance(body, dict):
         return _resp(400, {"error": "Invalid JSON body"})
 
     claims = _get_claims(event)
@@ -1493,23 +2042,34 @@ def _handle_delete(event):
     if not owner_user_id:
         return _resp(401, {"error": "Missing sub claim (unauthorized)"})
 
-    game_id = (body.get("gameId") or "").strip()
+    game_id = body.get("gameId")
+    game_id = game_id.strip() if isinstance(game_id, str) else ""
     if not game_id:
         return _resp(400, {"error": "Missing required field 'gameId'."})
 
     try:
-        games_table.delete_item(
-            Key={"gameId": game_id},
-            ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
-            ExpressionAttributeValues={":owner": owner_user_id},
-        )
+        item = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+        if not item or item.get("ownerUserId") != owner_user_id:
+            return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+        if "permanent" in body:
+            if (body.get("permanent") is not True or set(body) != {"gameId", "permanent", "confirmation"}
+                    or not isinstance(body.get("confirmation"), str) or not body["confirmation"]
+                    or body.get("confirmation") != item.get("gameName")):
+                return _resp(400, {"error": "PermanentDeletionConfirmationRequired"})
+            game_deletion.permanent_delete(dynamodb, item, prize_s3, PLAYER_TOKEN_SECRET)
+            return _resp(200, {"message": "Game permanently deleted successfully", "gameId": game_id})
+        if set(body) != {"gameId"}:
+            return _resp(400, {"error": "Archive requires only gameId."})
+        game_lifecycle.archive(dynamodb, item)
+    except stack_prizes.PrizeError as exc:
+        return _resp(exc.status, {"error": exc.code})
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
             return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
         log("Delete failed", {"error": str(e)})
         return _resp(500, {"error": "DeleteFailed", "detail": str(e)})
 
-    return _resp(200, {"message": "Game deleted successfully", "gameId": game_id})
+    return _resp(200, {"message": "Game archived successfully", "gameId": game_id})
 
 # ---------------- Router ----------------
 
@@ -1524,8 +2084,14 @@ def lambda_handler(event, context):
             return _resp(204, "")
 
         path = _get_path(event).rstrip("/")
+        if path.endswith("/v1/clients") or "/v1/clients/" in path:
+            return clients_api.handle(event, method, dynamodb, games_table, gp_table)
         if path.endswith("/v1/game/kivly/registrations"):
             return kivly_registration_api.handle(event, method, dynamodb)
+        if path.endswith("/v1/prizes/catalog"):
+            return _handle_shared_prize_catalog(event, method)
+        if path.endswith("/v1/prizes/inventory"):
+            return prize_inventory.handle(event, method, dynamodb)
         if path.endswith("/v1/game/stack/prizes"):
             return stack_prize_api.handle(
                 event, method, dynamodb, lambda owner: _is_user_pro(_get_user(owner)),

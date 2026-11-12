@@ -1,4 +1,5 @@
 import os
+from stand_common import game_forms
 import json
 import base64
 from datetime import datetime, timezone
@@ -7,7 +8,9 @@ from decimal import Decimal
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
-from stand_common.utils import log, _json_sanitize, _resp, _iso_now
+from stand_common.utils import log, _json_sanitize, _resp, _iso_now, GAME_MUTABLE_CONDITION
+from stand_common import stack_prizes
+from stand_common import game_lifecycle
 
 # ===== ENV =====
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "")
@@ -130,12 +133,18 @@ def query_players_by_code(game_id: str, code_int: int):
 def set_validated(game_id: str, player_id: int) -> bool:
     now = _iso_now()
     try:
-        gp_table.update_item(
-            Key={"gameId": game_id, "playerId": int(player_id)},
-            UpdateExpression="SET validated = :v, validatedAt = :t",
-            ExpressionAttributeValues={":v": True, ":t": now, ":f": False},
-            ConditionExpression="attribute_not_exists(validated) OR validated = :f",
-        )
+        meta = get_game_meta(game_id)
+        if not meta or not meta.get("isActive", True):
+            raise stack_prizes.PrizeError("GameInactive")
+        stack_prizes.transact(dynamo_r, [
+            stack_prizes.game_update(meta, "", {":active": True}, extra=" AND isActive = :active"),
+            {"Update": {
+                "TableName": GAMEPLAYER_TABLE, "Key": {"gameId": game_id, "playerId": int(player_id)},
+                "UpdateExpression": "SET validated = :v, validatedAt = :t",
+                "ExpressionAttributeValues": {":v": True, ":t": now, ":f": False},
+                "ConditionExpression": "attribute_exists(playerId) AND (attribute_not_exists(validated) OR validated = :f)",
+            }},
+        ])
         return True
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
@@ -151,6 +160,7 @@ def inc_validated_count(game_id: str, n: int):
         Key={"gameId": game_id},
         UpdateExpression="ADD validatedCount :n SET lastValidatedAt = :t, updatedAt = :t",
         ExpressionAttributeValues={":n": int(n), ":t": now},
+        ConditionExpression=GAME_MUTABLE_CONDITION,
     )
     return now
 
@@ -209,6 +219,13 @@ def lambda_handler(event, context):
             return _resp(403, {"valid": False, "error": "GameInactive", "message": "Este juego ya no está activo."})
 
         game_type = (meta.get("gameType") or "UNKNOWN").upper()
+        if game_forms.moment(meta) == "after_registration":
+            for code in codes:
+                number = to_int_code(str(code))
+                if number is not None:
+                    for player in query_players_by_code(game_id, number):
+                        if game_forms.pending(meta, player, "after_registration"):
+                            return _resp(409, {"valid": False, "error": "QuizRequired", "message": "Completa el quiz antes de jugar."})
 
         ctx = {
             "gameId": game_id,
@@ -227,7 +244,8 @@ def lambda_handler(event, context):
             "player_profile_pic_url": player_profile_pic_url,
 
             # feature gating via type.<game>
-            "is_quiz_required": is_quiz_required,
+            "is_quiz_required": (lambda player, gt: game_forms.pending(meta, player, "after_registration"))
+                if "formConfig" in meta else is_quiz_required,
             "is_quiz_completed": is_quiz_completed,
 
             "inc_validated_count": inc_validated_count,
@@ -235,6 +253,24 @@ def lambda_handler(event, context):
 
         validator = VALIDATORS.get(game_type, validate_generic)
         result = validator(ctx)
+        if result.get("valid") and (meta.get("prizeCatalog") or {}).get("validation", {}).get("name"):
+            for validated in result.get("players") or []:
+                player_id = validated.get("playerId")
+                if player_id is None:
+                    continue
+                try:
+                    player = gp_table.get_item(
+                        Key={"gameId": game_id, "playerId": int(player_id)}, ConsistentRead=True,
+                    ).get("Item")
+                    if player:
+                        current_meta = game_lifecycle.current(dynamo_r, game_id)
+                        game_lifecycle.issue_native_award(
+                            dynamo_r, current_meta, player, "validation",
+                        )
+                except (ClientError, stack_prizes.PrizeError) as exc:
+                    log("native_validation_prize_queue_error", {
+                        "gameId": game_id, "playerId": int(player_id), "error": repr(exc),
+                    })
 
         log("validate_result", {
             "gameId": game_id,
@@ -246,6 +282,8 @@ def lambda_handler(event, context):
 
         return _resp(200, result)
 
+    except stack_prizes.PrizeError as exc:
+        return _resp(exc.status, {"valid": False, "error": exc.code})
     except ClientError as e:
         log("validate_dynamo_error", {"error": str(e)})
         return _resp(500, {"valid": False, "error": "DynamoError", "detail": str(e)})

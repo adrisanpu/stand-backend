@@ -1,4 +1,5 @@
 import os
+from stand_common import game_forms
 import random
 
 import boto3
@@ -97,7 +98,8 @@ def _handle_start_round(game_id: str):
     if not game:
         return _resp(404, {"ok": False, "error": "GameNotFound"})
 
-    players = [p for p in _query_players(game_id) if p.get("validated", False)]
+    players = [p for p in _query_players(game_id) if p.get("validated", False)
+               and not game_forms.pending(game, p, "after_registration")]
     if len(players) < 3:
         return _resp(400, {"ok": False, "error": "NeedAtLeast3ValidatedPlayers"})
 
@@ -208,6 +210,8 @@ def lambda_handler(event, context):
                 return _resp(404, {"ok": False, "error": "GameNotFound"})
             if not _ensure_owner(event, game):
                 return _resp(403, {"ok": False, "error": "Forbidden"})
+            if game.get("archivedAt"):
+                return _resp(409, {"ok": False, "error": "GameArchived"})
             payload = _get_state_payload(game_id)
             if not payload:
                 return _resp(404, {"ok": False, "error": "GameNotFound"})

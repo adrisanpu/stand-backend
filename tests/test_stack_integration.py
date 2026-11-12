@@ -129,9 +129,14 @@ def test_put_merges_valid_settings_using_existing_blob_helper():
     assert write["ExpressionAttributeValues"][":payload"] == {
         **DEFAULT_CONFIG, "initialSpeed": Decimal("3"),
     }
-    assert table.update_item.call_args_list[0].kwargs["ConditionExpression"] == (
-        "attribute_exists(gameId) AND ownerUserId = :owner"
-    )
+    for call in table.update_item.call_args_list:
+        assert call.kwargs["ConditionExpression"] == (
+            "attribute_exists(gameId) AND attribute_not_exists(archivedAt) "
+            "AND attribute_not_exists(deletedAt) AND (attribute_exists(gameId) AND ownerUserId = :owner "
+            "AND attribute_not_exists(archivedAt) AND attribute_not_exists(deletedAt) AND isActive = :configActive)"
+        )
+        assert call.kwargs["ExpressionAttributeValues"][":owner"] == "owner"
+        assert call.kwargs["ExpressionAttributeValues"][":configActive"] is True
 
 
 @pytest.mark.parametrize("meta,updates,status", [

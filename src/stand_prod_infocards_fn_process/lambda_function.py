@@ -3,7 +3,8 @@ import json
 import uuid
 import boto3
 from botocore.exceptions import ClientError
-from stand_common.utils import log, _resp, _get_claims, _read_json_body, _iso_now, set_game_type_blob
+from stand_common.utils import log, _resp, _get_claims, _read_json_body, _iso_now, get_game_type_blob, set_game_type_blob
+from stand_common import game_lifecycle
 
 # ========= ENV VARS =========
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
@@ -215,6 +216,10 @@ def lambda_handler(event, context):
 
         if (item.get("ownerUserId") or "") != owner_user_id:
             return _resp(403, {"error": "Forbidden", "detail": "Not owner of this game."})
+        if item.get("archivedAt"):
+            return _resp(409, {"error": "GameArchived"})
+        if game_lifecycle.state(item) != "active":
+            return _resp(409, {"error": "GameInactive"})
 
         # Build content and prompt (cards only)
         content = _build_content(text, file_keys)
@@ -243,16 +248,21 @@ def lambda_handler(event, context):
         cards = _normalize_cards(raw_cards, game_id)
         now = _iso_now()
 
+        active_condition = "isActive = :active" if "isActive" in item else "attribute_not_exists(isActive)"
+        condition_values = {":owner": owner_user_id, **({":active": True} if "isActive" in item else {})}
         try:
             set_game_type_blob(
                 games_table,
                 game_id,
                 "INFOCARDS",
-                {"cards": cards},
+                {**get_game_type_blob(item, "INFOCARDS"), "cards": cards},
                 updated_at=now,
-                condition_expression="attribute_exists(gameId)",
+                condition_expression="attribute_exists(gameId) AND ownerUserId = :owner AND " + active_condition,
+                condition_values=condition_values,
             )
         except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(409, {"error": "GameInactive"})
             log("UpdateItem failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateItemFailed", "detail": str(e)})
 
