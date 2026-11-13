@@ -69,6 +69,19 @@ def _ctx(players, codes):
 # Tests
 # ---------------------------------------------------------------------------
 
+def test_validation_uses_stored_image_keys():
+    first = _player(1, 1111, "P1", 1, "Same")
+    second = _player(2, 2222, "P1", 2, "Same")
+    first["type"]["EMPAREJA2"]["characterImageKey"] = "custom/a.png"
+    second["type"]["EMPAREJA2"]["characterImageKey"] = "custom/b.png"
+    ctx = _ctx([first, second], ["1111", "2222"])
+    ctx["presign_character_png"] = lambda name, key: f"signed:{key}"
+    result = validate_empareja2(ctx)
+    assert [player["characterImageUrl"] for player in result["players"]] == [
+        "signed:custom/a.png", "signed:custom/b.png",
+    ]
+
+
 def test_wrong_code_count():
     ctx = _ctx([], ["1111"])
     result = validate_empareja2(ctx)

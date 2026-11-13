@@ -6,12 +6,14 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 import boto3
+from stand_common import empareja2_contributions
 from stand_common import kivly_settings, stack_prize_api, stack_prizes, kivly_registration_api
 from stand_common import game_lifecycle, game_deletion, reward_conditions
 from stand_common import shared_prizes, prize_inventory
 from stand_common import client_index, clients_api
 from stand_common import game_forms
 from stand_common import home_canvas
+from stand_common import empareja2_catalog
 from stand_common.stack import game_config as stack_game_config, validate_config as validate_stack_config
 from stand_common.rulet4 import game_config as rulet4_game_config, validate_config as validate_rulet4_config
 from botocore.exceptions import ClientError
@@ -610,16 +612,14 @@ def _get_player_prize_delivered(game_id: str, player_id: int, game_type: str) ->
 
 
 EMPAREJA2_CATALOG_ID = "EMPAREJA2#CHARACTERS#v1"
-_empareja2_pair_count_cache = None
-
-
 def _empareja2_catalog_pair_count() -> int:
-    """Count distinct pair groups in empareja2 character catalog. Cached per Lambda invocation."""
-    global _empareja2_pair_count_cache
-    if _empareja2_pair_count_cache is not None:
-        return _empareja2_pair_count_cache
+    """Count distinct pair groups in the current empareja2 character catalog."""
+    return len(empareja2_catalog.group_items(_empareja2_catalog_items()))
+
+
+def _empareja2_catalog_items():
     items = []
-    kwargs = {"KeyConditionExpression": Key("catalogId").eq(EMPAREJA2_CATALOG_ID)}
+    kwargs = {"KeyConditionExpression": Key("catalogId").eq(EMPAREJA2_CATALOG_ID), "ConsistentRead": True}
     while True:
         resp = catalog_table.query(**kwargs)
         items.extend(resp.get("Items") or [])
@@ -627,13 +627,74 @@ def _empareja2_catalog_pair_count() -> int:
         if not lek:
             break
         kwargs["ExclusiveStartKey"] = lek
-    seen = set()
-    for it in items:
-        g = it.get("pairGroupId") or it.get("pairNumericId")
-        if g is not None:
-            seen.add(str(int(g)) if isinstance(g, Decimal) else str(g).strip())
-    _empareja2_pair_count_cache = len(seen) if seen else 0
-    return _empareja2_pair_count_cache
+    return items
+
+
+def _handle_empareja2_catalog(event):
+    owner = (_get_claims(event).get("sub") or "").strip()
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+    game_id = (_get_query_params(event).get("gameId") or "").strip()
+    if not is_valid_join_code(game_id):
+        return _resp(400, {"error": "InvalidGameId"})
+    game = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+    if not game or game.get("ownerUserId") != owner:
+        return _resp(404, {"error": "GameNotFound"})
+    if game.get("gameType") != "EMPAREJA2":
+        return _resp(400, {"error": "InvalidGameType"})
+    bucket = os.environ.get("CHAR_BUCKET")
+    if not bucket:
+        return _resp(503, {"error": "CatalogImagesUnavailable"})
+    pairs = []
+    for group, items in empareja2_catalog.group_items(_empareja2_catalog_items()):
+        characters = []
+        for item in items:
+            name = item.get("characterName") or "Personaje"
+            key = item.get("imageKey") or f"{name}.png"
+            characters.append({
+                "id": empareja2_catalog.character_id(item),
+                "name": name,
+                "imageUrl": prize_s3.generate_presigned_url(
+                    "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=3600,
+                ),
+            })
+        pairs.append({"id": group, "characters": characters})
+    return _resp(200, {"ok": True, "pairs": pairs})
+
+
+def _handle_empareja2_contributions(event, method):
+    owner = (_get_claims(event).get("sub") or "").strip()
+    if not owner:
+        return _resp(401, {"error": "Unauthorized"})
+    body = _read_json_body(event)
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "InvalidBody"})
+    game_id = body.get("gameId")
+    if not isinstance(game_id, str) or not is_valid_join_code(game_id):
+        return _resp(400, {"error": "InvalidGameId"})
+    game = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+    if not game or game.get("ownerUserId") != owner:
+        return _resp(404, {"error": "GameNotFound"})
+    if game.get("gameType") != "EMPAREJA2":
+        return _resp(400, {"error": "InvalidGameType"})
+    if game_lifecycle.state(game) != "active" or game.get("archivedAt") or game.get("deletedAt") or game.get("deletionStartedAt"):
+        return _resp(409, {"error": "GameInactive"})
+    char_bucket = os.environ.get("CHAR_BUCKET")
+    if not USER_MEDIA_BUCKET or not char_bucket:
+        return _resp(503, {"error": "CatalogImagesUnavailable"})
+    try:
+        if method == "POST":
+            result = empareja2_contributions.upload_url(prize_s3, USER_MEDIA_BUCKET, owner, game_id, body)
+        elif method == "PUT":
+            result = empareja2_contributions.publish(
+                dynamodb, games_table, catalog_table, prize_s3, USER_MEDIA_BUCKET, char_bucket,
+                owner, game, body, _empareja2_catalog_items(),
+            )
+        else:
+            return _resp(405, {"error": "Method not allowed"})
+        return _resp(200, result)
+    except empareja2_contributions.CatalogError as exc:
+        return _resp(exc.status, {"error": exc.code})
 
 def _get_path(event):
     return (
@@ -2066,6 +2127,10 @@ def lambda_handler(event, context):
             return _resp(204, "")
 
         path = _get_path(event).rstrip("/")
+        if path.endswith("/v1/game/empareja2/catalog"):
+            if method == "GET":
+                return _handle_empareja2_catalog(event)
+            return _handle_empareja2_contributions(event, method)
         if path.endswith("/v1/clients") or "/v1/clients/" in path:
             return clients_api.handle(event, method, dynamodb, games_table, gp_table)
         if path.endswith("/v1/game/kivly/registrations"):

@@ -29,6 +29,25 @@ remain available to all plans. Persist media keys, not signed URLs.
 Individual items can also store `backgroundColor` as `"transparent"` or a
 six-digit hex color on every plan; omission preserves the existing widget style.
 
+## EMPAREJA2 shared catalog
+
+The authenticated owner of an EMPAREJA2 game can view the shared character
+catalog and contribute up to 10 pairs per configuration save. Each character
+requires a name and a PNG, JPEG or WebP image up to 5 MB; the browser converts
+uploads to PNG (at most 1024 pixels on the longest side) and the server validates
+their contents and dimensions. Uploaded
+staging objects expire after seven days. Publication is immediate and global,
+without moderation; the game difficulty and all new character rows are committed
+together using a retryable operation ID. The selected difficulty is not increased
+automatically, and existing player assignments are never changed.
+
+The catalog endpoints and S3 permissions are defined in `template.yaml`. Deploy
+the SAM stack (including the shared layer) before deploying the frontend. New
+objects use immutable image keys and legacy name-based PNGs remain supported.
+The daily EMPAREJA2 cleanup removes unreferenced contribution images after seven
+days. It checks the committed-operation marker under the same DynamoDB lease
+used by publication, so it cannot delete images during a concurrent publish.
+
 ## Stack
 
 - **Runtime:** Python 3.13

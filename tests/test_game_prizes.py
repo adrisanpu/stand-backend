@@ -3,8 +3,10 @@ import io
 import json
 import struct
 import binascii
+import sys
 import zlib
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +19,9 @@ class FakeClientError(Exception):
 
 
 ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT / "src" / "stand_prod_game_fn_assign"))
+from assigners import empareja2
+
 MODULE_PATH = ROOT / "src" / "stand_prod_game_fn_game" / "lambda_function.py"
 spec = importlib.util.spec_from_file_location("game_prize_lambda", MODULE_PATH)
 mod = importlib.util.module_from_spec(spec)
@@ -79,6 +84,89 @@ def _setup(monkeypatch, game_type="EMPAREJA2", owner="owner", game_id="ABC123", 
     mod.prize_s3.generate_presigned_url.return_value = "https://signed"
     mod._get_user = lambda _user_id: {"plan": "FREE"}
     return table, item
+
+
+def test_put_empareja2_saves_pair_count_without_losing_other_settings(monkeypatch):
+    table, _ = _setup(monkeypatch)
+    response = mod.lambda_handler(_event("PUT", {
+        "gameId": "ABC123", "settings": {"empareja2": {"numPairs": 2}},
+    }), None)
+
+    assert response["statusCode"] == 200
+    update = next(
+        call.kwargs for call in table.update_item.call_args_list
+        if call.kwargs.get("ExpressionAttributeNames", {}).get("#g") == "EMPAREJA2"
+    )
+    assert update["ExpressionAttributeValues"][":payload"] == {"numPairs": 2, "maxValidations": 4}
+
+    persisted = update["ExpressionAttributeValues"][":payload"]
+    game_meta = {"type": {"EMPAREJA2": {**persisted, "numPairs": Decimal(persisted["numPairs"])}}}
+    catalog = [
+        {"characterId": index, "characterName": str(index), "pairGroupId": str((index + 1) // 2)}
+        for index in range(1, 7)
+    ]
+    monkeypatch.setattr(empareja2, "_query_empareja2_catalog", lambda _: catalog)
+    candidates = []
+    def choose(items):
+        candidates.extend(items)
+        return items[0]
+    monkeypatch.setattr(empareja2.random, "choice", choose)
+    empareja2.assign_empareja2({"dynamo_r": object(), "gameMeta": game_meta})
+    assert {item["pairGroupId"] for item in candidates} == {"1", "2"}
+    assert len(candidates) == 4
+
+
+def test_empareja2_catalog_count_reads_current_data(monkeypatch):
+    table = MagicMock()
+    table.query.side_effect = [
+        {"Items": [{"pairGroupId": "1", "characterId": 1}]},
+        {"Items": [{"pairGroupId": "1", "characterId": 1}, {"pairGroupId": "2", "characterId": 2}]},
+    ]
+    monkeypatch.setattr(mod, "catalog_table", table)
+    assert mod._empareja2_catalog_pair_count() == 1
+    assert mod._empareja2_catalog_pair_count() == 2
+    assert all(call.kwargs["ConsistentRead"] is True for call in table.query.call_args_list)
+
+
+def test_empareja2_catalog_listing_requires_owner_and_matches_assignment_order(monkeypatch):
+    table, _ = _setup(monkeypatch)
+    monkeypatch.setenv("CHAR_BUCKET", "characters")
+    catalog = MagicMock()
+    catalog.query.side_effect = [
+        {"Items": [{"characterId": 10, "characterName": "Ten", "pairGroupId": "10"}],
+         "LastEvaluatedKey": {"catalogId": "catalog", "pairId": "next"}},
+        {"Items": [
+            {"characterId": 2, "characterName": "Two", "pairGroupId": "2"},
+            {"characterId": 3, "characterName": "Partner", "pairGroupId": "2", "imageKey": "custom/p.png"},
+        ]},
+    ]
+    monkeypatch.setattr(mod, "catalog_table", catalog)
+    event = _event("GET", path="/v1/game/empareja2/catalog")
+    event["queryStringParameters"] = {"gameId": "ABC123"}
+    response = mod.lambda_handler(event, None)
+    pairs = json.loads(response["body"])["pairs"]
+    assert response["statusCode"] == 200
+    assert [pair["id"] for pair in pairs] == ["2", "10"]
+    assert [character["name"] for character in pairs[0]["characters"]] == ["Two", "Partner"]
+    assert any(call.kwargs["Params"]["Key"] == "custom/p.png"
+               for call in mod.prize_s3.generate_presigned_url.call_args_list)
+    assert catalog.query.call_count == 2
+    table.get_item.return_value["Item"]["ownerUserId"] = "someone-else"
+    assert mod.lambda_handler(event, None)["statusCode"] == 404
+
+
+def test_empareja2_contribution_upload_checks_game_owner(monkeypatch):
+    table, _ = _setup(monkeypatch)
+    monkeypatch.setattr(mod, "USER_MEDIA_BUCKET", "staging")
+    monkeypatch.setenv("CHAR_BUCKET", "characters")
+    mod.prize_s3.generate_presigned_post.return_value = {"url": "https://s3", "fields": {"key": "value"}}
+    event = _event("POST", {"gameId": "ABC123", "uploadId": "a" * 32, "sizeBytes": 10},
+                   path="/v1/game/empareja2/catalog")
+    response = mod.lambda_handler(event, None)
+    assert response["statusCode"] == 200
+    table.get_item.return_value["Item"]["ownerUserId"] = "other"
+    assert mod.lambda_handler(event, None)["statusCode"] == 404
+    assert mod.prize_s3.generate_presigned_post.call_count == 1
 
 
 def test_put_catalog_persists_and_synchronizes_empareja2_limit_atomically(monkeypatch):

@@ -656,13 +656,16 @@ def _empareja2_assignment_from_player(player: dict) -> dict | None:
     bucket = os.environ.get("CHAR_BUCKET", "")
     if bucket:
         s3 = boto3.client("s3")
-        for name in (cname, blob.get("partnerCharacterName")):
-            if not name or name in images:
+        for field, name, key in (
+            ("character", cname, blob.get("characterImageKey")),
+            ("partner", blob.get("partnerCharacterName"), blob.get("partnerCharacterImageKey")),
+        ):
+            if not name:
                 continue
             try:
-                images[name] = s3.generate_presigned_url(
+                images[field] = s3.generate_presigned_url(
                     "get_object",
-                    Params={"Bucket": bucket, "Key": f"{name}.png"},
+                    Params={"Bucket": bucket, "Key": key or f"{name}.png"},
                     ExpiresIn=int(os.environ.get("CHAR_URL_TTL", "120")),
                 )
             except (ClientError, BotoCoreError, ValueError) as exc:
@@ -674,8 +677,8 @@ def _empareja2_assignment_from_player(player: dict) -> dict | None:
         "characterId": blob.get("characterId"),
         "characterName": cname,
         "partnerCharacterName": blob.get("partnerCharacterName"),
-        "characterImageUrl": images.get(cname),
-        "partnerCharacterImageUrl": images.get(blob.get("partnerCharacterName")),
+        "characterImageUrl": images.get("character"),
+        "partnerCharacterImageUrl": images.get("partner"),
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
     }

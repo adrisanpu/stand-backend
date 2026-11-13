@@ -365,6 +365,15 @@ Resources:
                   - secretsmanager:DeleteSecret
                   - secretsmanager:GetSecretValue
                 Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+        - PolicyName: Empareja2ContributionImages
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - !Sub "${UserMediaBucket.Arn}/empareja2/staged/*"
+                  - !Sub "${StandProdEmpareja2CharBucket.Arn}/contributions/*"
 
   StandProdGameRolePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -815,6 +824,10 @@ Resources:
               - Key: staged
                 Value: "true"
             ExpirationInDays: 7
+          - Id: ExpireEmpareja2StagedImages
+            Status: Enabled
+            Prefix: empareja2/staged/
+            ExpirationInDays: 7
       CorsConfiguration:
         CorsRules:
           - AllowedHeaders: ["*"]
@@ -908,6 +921,8 @@ Resources:
       CodeUri: src/stand_prod_game_fn_game/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdGameRole.Arn
+      Timeout: 60
+      MemorySize: 512
       Layers:
         - !Ref StandCommonLayer
       Environment:
@@ -916,7 +931,26 @@ Resources:
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
           INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
           CLIENT_INDEX_TABLE: !Ref StandClientIndexTable
+          CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
       Events:
+        Empareja2CatalogGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/empareja2/catalog
+            Method: GET
+        Empareja2CatalogPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/empareja2/catalog
+            Method: POST
+        Empareja2CatalogPut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GameApi
+            Path: /v1/game/empareja2/catalog
+            Method: PUT
         GameCrudGet:
           Type: HttpApi
           Properties:
@@ -1104,6 +1138,39 @@ Resources:
             ApiId: !Ref GameApi
             Path: /v1/game/assign
             Method: POST
+
+  StandEmpareja2Cleanup:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "stand-${Environment}-empareja2-cleanup"
+      CodeUri: src/stand_empareja2_cleanup/
+      Handler: lambda_function.lambda_handler
+      Timeout: 900
+      Layers:
+        - !Ref StandCommonLayer
+      Environment:
+        Variables:
+          CHAR_BUCKET: !Ref StandProdEmpareja2CharBucket
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt StandProdEmpareja2CharBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix: "contributions/*"
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub "${StandProdEmpareja2CharBucket.Arn}/contributions/*"
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+              Resource: !GetAtt StandProdCatalogTable.Arn
+      Events:
+        DailyCleanup:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
 
   StandProdGameValidate:
     Type: AWS::Serverless::Function

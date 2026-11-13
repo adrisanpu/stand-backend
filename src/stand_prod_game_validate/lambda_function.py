@@ -81,14 +81,14 @@ def to_int_code(code_str: str):
 
 # ===== S3 presign =====
 
-def presign_character_png(character_name: str) -> str | None:
+def presign_character_png(character_name: str, image_key: str | None = None) -> str | None:
     """
     Returns a temporary URL to a PRIVATE S3 object: <characterName>.png
     """
     if not CHAR_BUCKET or not character_name:
         return None
 
-    key = f"{character_name}.png"
+    key = image_key or f"{character_name}.png"
     try:
         return s3.generate_presigned_url(
             ClientMethod="get_object",

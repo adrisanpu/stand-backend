@@ -553,6 +553,24 @@ def test_partner_image_signing_failure_keeps_own_image_and_logs(monkeypatch):
     log.assert_called_once_with("character_image_url_error", {"error": "Cannot sign"})
 
 
+def test_empareja2_assignment_uses_explicit_keys_even_with_duplicate_names(monkeypatch):
+    monkeypatch.setenv("CHAR_BUCKET", "characters")
+    player = {"type": {"EMPAREJA2": {
+        "characterName": "Same", "partnerCharacterName": "Same",
+        "characterImageKey": "custom/a.png", "partnerCharacterImageKey": "custom/b.png",
+    }}}
+    s3 = MagicMock()
+    s3.generate_presigned_url.side_effect = lambda operation, **kwargs: f"signed:{kwargs['Params']['Key']}"
+    with patch.object(public_mod.boto3, "client", return_value=s3):
+        recovered = public_mod._empareja2_assignment_from_player(player)
+    assert recovered["characterImageUrl"] == "signed:custom/a.png"
+    assert recovered["partnerCharacterImageUrl"] == "signed:custom/b.png"
+    with patch("assigners.empareja2._character_image_url", side_effect=lambda name, key: f"signed:{key}"):
+        assigned = assign_mod._empareja2_web_assignment(player)
+    assert assigned["characterImageUrl"] == "signed:custom/a.png"
+    assert assigned["partnerCharacterImageUrl"] == "signed:custom/b.png"
+
+
 def test_player_token_roundtrip():
     token = issue_player_token("ABC123", 7, SECRET, ttl_seconds=3600)
     claims = verify_player_token(token, SECRET)
@@ -690,19 +708,20 @@ def test_web_assign_creates_t1mer_player(mock_meta, mock_assigners, *_mocks):
 @patch.object(assign_mod, "_empareja2_web_assignment", return_value={"characterName": "X", "validationCode": 1234, "validated": False})
 @patch.object(assign_mod, "_find_existing_player_by_email")
 @patch.object(assign_mod, "_get_game_meta")
-def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment, verified_web_assignment):
+def test_web_assign_dedup_email(mock_meta, mock_find, mock_assignment, verified_web_assignment):
     mock_meta.return_value = {
         "gameId": "ABC123",
         "gameType": "EMPAREJA2",
         "ownerUserId": "owner",
         "isActive": True,
         "participantFields": default_participant_fields("EMPAREJA2"),
+        "type": {"EMPAREJA2": {"numPairs": 1}},
     }
     mock_find.return_value = {
         "playerId": 3,
         "validationCode": 1234,
         "validated": False,
-        "type": {"EMPAREJA2": {"characterName": "X", "partnerCharacterName": "Y", "characterId": 1}},
+        "type": {"EMPAREJA2": {"characterName": "X", "partnerCharacterName": "Y", "characterId": 1, "pairGroupId": "3"}},
     }
 
     out = assign_mod._handle_web_assign({
@@ -714,6 +733,28 @@ def test_web_assign_dedup_email(mock_meta, mock_find, _mock_assignment, verified
         })
     assert out["ok"] is True
     assert out["already_joined"] is True
+    assert mock_assignment.call_args.args[0]["type"]["EMPAREJA2"]["pairGroupId"] == "3"
+
+
+def test_web_assign_rolls_back_reserved_slot_if_empareja2_configuration_is_invalid(monkeypatch):
+    monkeypatch.setattr(assign_mod, "_get_game_meta", lambda _: {
+        "gameId": "ABC123", "gameType": "EMPAREJA2", "ownerUserId": "owner",
+        "type": {"EMPAREJA2": {"numPairs": 0}},
+    })
+    monkeypatch.setattr(assign_mod, "registration_values", lambda *_: {})
+    monkeypatch.setattr(assign_mod.kivly_registration, "ensure_membership", lambda *_: None)
+    monkeypatch.setattr(assign_mod, "_ensure_game_counters", lambda *_: None)
+    monkeypatch.setattr(assign_mod, "_reserve_player_slot", lambda *_: True)
+    monkeypatch.setattr(assign_mod, "_get_last_player_id", lambda *_: 0)
+    rollback = MagicMock()
+    monkeypatch.setattr(assign_mod, "_rollback_player_slot", rollback)
+    assigner = MagicMock(side_effect=RuntimeError("EMPAREJA2 numPairs must be a positive integer"))
+    monkeypatch.setitem(assign_mod.ASSIGNERS, "EMPAREJA2", assigner)
+
+    with pytest.raises(RuntimeError, match="EMPAREJA2 numPairs"):
+        assign_mod._handle_web_assign({"game_id": "ABC123"})
+    rollback.assert_called_once()
+    assert rollback.call_args.args[0] == "ABC123"
 
 
 def _redeem_event(prize_token: str) -> dict:

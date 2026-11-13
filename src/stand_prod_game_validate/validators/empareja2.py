@@ -136,7 +136,8 @@ def validate_empareja2(ctx: dict):
                 "username": _username(p1),
                 "characterId": t1.get("characterId"),
                 "characterName": c1_name,
-                "characterImageUrl": presign(c1_name) if presign else None,
+                "characterImageUrl": (presign(c1_name, t1["characterImageKey"])
+                                      if t1.get("characterImageKey") else presign(c1_name)) if presign else None,
                 "profilePicUrl": _profile_pic_url(ctx, p1),
             },
             {
@@ -144,7 +145,8 @@ def validate_empareja2(ctx: dict):
                 "username": _username(p2),
                 "characterId": t2.get("characterId"),
                 "characterName": c2_name,
-                "characterImageUrl": presign(c2_name) if presign else None,
+                "characterImageUrl": (presign(c2_name, t2["characterImageKey"])
+                                      if t2.get("characterImageKey") else presign(c2_name)) if presign else None,
                 "profilePicUrl": _profile_pic_url(ctx, p2),
             },
         ]

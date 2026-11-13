@@ -142,8 +142,10 @@ def _empareja2_web_assignment(player: dict) -> dict:
         "characterId": blob.get("characterId"),
         "characterName": cname,
         "partnerCharacterName": partner,
-        "characterImageUrl": _character_image_url(cname) if cname else None,
-        "partnerCharacterImageUrl": _character_image_url(partner) if partner else None,
+        "characterImageUrl": (_character_image_url(cname, blob["characterImageKey"])
+                              if blob.get("characterImageKey") else _character_image_url(cname)) if cname else None,
+        "partnerCharacterImageUrl": (_character_image_url(partner, blob["partnerCharacterImageKey"])
+                                     if blob.get("partnerCharacterImageKey") else _character_image_url(partner)) if partner else None,
         "validationCode": int(code) if isinstance(code, Decimal) else code,
         "validated": bool(player.get("validated")),
     }
@@ -431,16 +433,24 @@ def _handle_web_assign(event: dict) -> dict:
             base_item["kivly"] = {"membership": membership}
 
         assigner = ASSIGNERS.get(game_type, assign_generic)
-        patch = assigner({
-            "gameId": game_id,
-            "playerId": new_pid,
-            "gameType": game_type,
-            "gameMeta": meta,
-            "now": now,
-            "dynamo_r": dynamo_r,
-            "log_fn": log,
-            "validationCode": base_item["validationCode"],
-        })
+        try:
+            patch = assigner({
+                "gameId": game_id,
+                "playerId": new_pid,
+                "gameType": game_type,
+                "gameMeta": meta,
+                "now": now,
+                "dynamo_r": dynamo_r,
+                "log_fn": log,
+                "validationCode": base_item["validationCode"],
+            })
+        except RuntimeError:
+            if not email:
+                try:
+                    _rollback_player_slot(game_id, now)
+                except Exception as re:
+                    log("assign_playersCount_rollback_failed", {"error": repr(re), "gameId": game_id})
+            raise
         if patch:
             base_item.update(patch)
         t = base_item.get("type") or {}
