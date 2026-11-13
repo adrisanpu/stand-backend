@@ -1566,7 +1566,8 @@ def _handle_put(event):
             previous = game_forms.config(item)
             new = proposed.get("formConfig") or {}
             if (proposed.get("questions") != game_forms.questions(item)
-                    or any(new.get(k) != previous[k] for k in ("quizMoment", "logoKey", "bannerKey", "appearance"))):
+                    or (new.get("quizMoment") != previous["quizMoment"] and new.get("quizMoment") != "disabled")
+                    or any(new.get(k) != previous[k] for k in ("logoKey", "bannerKey", "appearance"))):
                 return _resp(403, {"error": "PlanUpgradeRequired"})
         try:
             return _resp(200, _json_sanitize(game_forms.save(dynamodb, item, proposed)))

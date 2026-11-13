@@ -9,7 +9,7 @@ import qrcode
 
 from stand_common import stack_prize_api, stack_prizes as prizes
 from stand_common.email_verification import RegistrationError, registration_values
-from stand_common.reward_email import build_message
+from stand_common.reward_email import build_message, build_reward_message
 from stand_common.utils import normalize_participant_fields, web_participant_fields
 from tests.email_fake import FakeDynamoError
 from tests.test_stack_prize_rules import (
@@ -183,7 +183,7 @@ def test_email_is_sent_after_earn_once_with_kivly_wallet_link(email_rig):
     assert "verified@example.test" not in json.dumps(public)
 
 
-def test_stand_award_email_includes_wallet_passes_and_redeem_qr(email_rig):
+def test_stand_award_email_omits_wallet_passes_and_keeps_redeem_qr(email_rig):
     worker, rig, _, client, ses = email_rig
     row = prizes.award_units(
         meta(rig), player(rig), PROGRAM["rules"][0], PROGRAM["catalog"][0], 1,
@@ -201,8 +201,9 @@ def test_stand_award_email_includes_wallet_passes_and_redeem_qr(email_rig):
     message = BytesParser(policy=policy.default).parsebytes(sent["RawMessage"]["Data"])
     html = message.get_body(preferencelist=("html",)).get_content()
     text = message.get_body(preferencelist=("plain",)).get_content()
-    assert "Apple Wallet" in html and "Google Wallet" in html
-    assert "/v1/public/wallet/pass?" in text
+    assert "Apple Wallet" not in html and "Google Wallet" not in html
+    assert "/v1/public/wallet/pass?" not in text
+    assert "Show this QR code" in text
     qr_image = next(part for part in message.walk()
                     if part.get_content_type() == "image/png"
                     and str(part["Content-ID"]) == "<reward-qr>")
@@ -234,9 +235,13 @@ def test_native_stand_reward_email_uses_shared_format_for_every_game(email_rig, 
         ses.send_raw_email.call_args.kwargs["RawMessage"]["Data"],
     )
     html = message.get_body(preferencelist=("html",)).get_content()
+    text = message.get_body(preferencelist=("plain",)).get_content()
     assert "Tu premio STAND / Your STAND reward: Coffee" in str(message["Subject"])
     assert "Coffee" in html
     assert "Your reward QR" in html
+    assert "Apple Wallet" not in html and "Google Wallet" not in html
+    assert "/v1/public/wallet/pass" not in text
+    assert "Muestra este QR" in text
 
 
 def test_mail_has_inline_png_text_and_escaped_content():
@@ -285,7 +290,7 @@ def test_spanish_club_mail_contains_wallet_link_and_phone_qr(monkeypatch):
     assert image.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_branded_mail_embeds_logo_and_large_qr_without_remote_images():
+def test_branded_mail_embeds_logo_and_qr_without_remote_images():
     original = BytesParser(policy=policy.default).parsebytes(build_message(
         "sender@example.test", "player@example.test", "Player",
         {"name": "Coffee"}, "+34123456789",
@@ -310,6 +315,43 @@ def test_branded_mail_embeds_logo_and_large_qr_without_remote_images():
     assert all(p.get_content_disposition() == "inline" for p in images)
     embedded_logo = next(p for p in images if str(p["Content-ID"]) == "<club-logo>")
     assert embedded_logo.get_payload(decode=True) == logo_bytes
+
+
+def test_club_and_stand_reward_emails_use_the_same_html_layout():
+    club = BytesParser(policy=policy.default).parsebytes(build_message(
+        "sender@example.test", "player@example.test", "Player",
+        {"name": "Coffee"}, "+34123456789", club_name="Club",
+    ))
+    stand = BytesParser(policy=policy.default).parsebytes(build_reward_message(
+        "sender@example.test", "player@example.test", "Player",
+        {"name": "Coffee"}, qr_value="reward-token",
+    ))
+    club_html = club.get_body(preferencelist=("html",)).get_content()
+    stand_html = stand.get_body(preferencelist=("html",)).get_content()
+    for html in (club_html, stand_html):
+        assert 'data-email-layout="reward-card"' in html
+        assert "max-width:440px" in html
+        assert "Tu premio te espera" in html
+        assert "TU PREMIO" in html
+
+
+def test_stand_reward_email_embeds_logo_prize_photo_and_larger_qr():
+    message = BytesParser(policy=policy.default).parsebytes(build_reward_message(
+        "sender@example.test", "player@example.test", "Player",
+        {"name": "Coffee"}, qr_value="reward-token",
+        logo_png=TEST_LOGO_PNG, prize_image_png=TEST_LOGO_PNG,
+    ))
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert html.index('src="cid:club-logo"') < html.index("TU PREMIO")
+    assert 'src="cid:prize-photo"' in html
+    assert html.index('src="cid:prize-photo"') < html.index(">Coffee</p>")
+    assert 'src="cid:reward-qr" width="280" height="280"' in html
+    images = {str(part["Content-ID"]): part for part in message.walk()
+              if part.get_content_maintype() == "image"}
+    assert set(images) == {"<club-logo>", "<prize-photo>", "<reward-qr>"}
+    assert all(part.get_content_disposition() == "inline" for part in images.values())
+    assert all(part.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
+               for part in images.values())
 
 
 @pytest.mark.parametrize("logo", [b"", b"not PNG", "image.png", b"\x89PNG\r\n\x1a\n"])
@@ -594,3 +636,32 @@ def test_email_branding_uses_selected_logo_and_resolved_wallet_for_owner(rig, mo
         "https://example.kivly.store/add-to-wallet?customer_id=customer&location_id=loc",
         TEST_LOGO_PNG,
     )
+
+
+def test_stand_email_prize_image_is_loaded_only_from_owner_game_asset(rig, monkeypatch):
+    worker = delivery_module(monkeypatch, rig)
+    monkeypatch.setenv("GAMES_TABLE", "games")
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "user-media")
+    game = meta(rig)
+    rig.Table("games").put_item(Item=game)
+    image_key = "games/owner/ABC123/ranking/01234567-89ab-cdef-0123-456789abcdef.png"
+    s3 = MagicMock()
+    s3.get_object.return_value = {
+        "Body": BytesIO(TEST_LOGO_PNG), "ContentType": "image/png",
+        "ContentLength": len(TEST_LOGO_PNG),
+    }
+    monkeypatch.setattr(worker.boto3, "client", lambda service: s3)
+
+    image = worker._stand_prize_image(
+        rig, {"gameId": "ABC123", "ownerUserId": "owner"},
+        {"source": "stand", "name": "Coffee", "imageKey": image_key},
+    )
+
+    assert image == TEST_LOGO_PNG
+    s3.get_object.assert_called_once_with(Bucket="user-media", Key=image_key)
+    with pytest.raises(worker.RewardEmailAssetError):
+        worker._stand_prize_image(
+            rig, {"gameId": "ABC123", "ownerUserId": "owner"},
+            {"source": "stand", "name": "Coffee", "imageKey": "games/other/ABC123/ranking/prize.png"},
+        )
+    assert s3.get_object.call_count == 1

@@ -121,10 +121,12 @@ def _customer_by_confirmed_id(client, conn, row, player):
     return customer
 
 
-def _selected_logo(dynamo, owner):
+def _selected_logo(dynamo, owner, *, required=True):
     users_table = os.environ.get("USERS_TABLE")
     bucket = os.environ.get("USER_MEDIA_BUCKET")
     if not users_table or not bucket:
+        if not required:
+            return None
         raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
     user = dynamo.Table(users_table).get_item(
         Key={"userId": owner}, ConsistentRead=True, ProjectionExpression="media",
@@ -135,9 +137,44 @@ def _selected_logo(dynamo, owner):
     selected_id = logo.get("selectedId") if isinstance(logo, dict) else None
     selected = next((item for item in items if isinstance(item, dict)
                      and item.get("id") == selected_id), None) if isinstance(items, list) else None
+    if selected is None and not required:
+        return None
     key = selected.get("key") if selected else None
     if (not isinstance(owner, str) or not owner or not isinstance(key, str)
             or not key.startswith(f"users/{owner}/logos/") or len(key) > 1024):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+    body = response.get("Body")
+    try:
+        size = response.get("ContentLength")
+        if (response.get("ContentType") != "image/png" or type(size) is not int
+                or not 0 < size <= 5 * 1024 * 1024 or body is None):
+            raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+        data = body.read(5 * 1024 * 1024 + 1)
+    finally:
+        if body is not None:
+            body.close()
+    if (not isinstance(data, bytes) or len(data) != size
+            or not data.startswith(b"\x89PNG\r\n\x1a\n")):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    return data
+
+
+def _stand_prize_image(dynamo, row, prize):
+    key = prize.get("imageKey")
+    if not key:
+        return None
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+        ProjectionExpression="gameId, ownerUserId",
+    ).get("Item")
+    if (not meta or meta.get("gameId") != row["gameId"]
+            or meta.get("ownerUserId") != row["ownerUserId"]):
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    if prizes.image_key(prize, meta) != key:
+        raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
+    bucket = os.environ.get("USER_MEDIA_BUCKET")
+    if not bucket:
         raise RewardEmailAssetError("RewardEmailAssetsUnavailable")
     response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
     body = response.get("Body")
@@ -466,22 +503,17 @@ def notify(row):
                 row["gameId"], row["playerId"], "a", os.environ["PLAYER_TOKEN_SECRET"],
                 ttl_seconds=315360000, award_id=row["id"],
             )
-            base_url = os.environ.get("PUBLIC_API_BASE_URL", "").rstrip("/")
-            if not base_url.startswith("https://"):
-                email_status(key, "failed", "RewardEmailUnavailable")
-                return
-            query = urlencode({"token": token})
-            links.extend([
-                ("Apple Wallet", f"{base_url}/v1/public/wallet/pass?{query}&platform=apple"),
-                ("Google Wallet", f"{base_url}/v1/public/wallet/pass?{query}&platform=google"),
-            ])
             qr_value = token
+            logo_png = _selected_logo(dynamo, row["ownerUserId"], required=False)
+            prize_image_png = _stand_prize_image(dynamo, row, prize)
         else:
             email_status(key, "failed", "RewardSourceUnsupported")
             return
         message = build_reward_message(
             sender, email, player.get("username") or "", prize,
             qr_value=qr_value, wallet_links=links,
+            **({"logo_png": logo_png, "prize_image_png": prize_image_png}
+               if source == "stand" else {}),
         )
     except (registration.RegistrationError, registration.KivlyError) as exc:
         retry = attempts < 3

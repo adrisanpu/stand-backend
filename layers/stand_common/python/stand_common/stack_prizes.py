@@ -357,9 +357,9 @@ def validate_program(raw, meta, conn, rewards, raffles_enabled, shared_catalog=N
     return result
 
 
-def image_url(prize, meta=None):
+def image_key(prize, meta=None):
     if prize.get("source") == "kivly" and "imageKey" not in prize:
-        return reward_image_url(prize.get("imageUrl"))
+        return None
     key = prize.get("imageKey")
     game_key = key and meta and any(
         prize_image_key(meta["ownerUserId"], meta["gameId"], slot, key)
@@ -368,6 +368,13 @@ def image_url(prize, meta=None):
     shared_key = key and meta and prize.get("sharedPrizeId") and key.startswith(f"prizes/{meta['ownerUserId']}/")
     if prize.get("source") not in ("stand", "kivly") or (key and meta and not (game_key or shared_key)):
         return None
+    return key
+
+
+def image_url(prize, meta=None):
+    if prize.get("source") == "kivly" and "imageKey" not in prize:
+        return reward_image_url(prize.get("imageUrl"))
+    key = image_key(prize, meta)
     return boto3.client("s3").generate_presigned_url(
         "get_object", Params={"Bucket": os.environ["USER_MEDIA_BUCKET"], "Key": key}, ExpiresIn=3600,
     ) if key else None

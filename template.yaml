@@ -297,7 +297,10 @@ Resources:
                   ses:FromAddress: !Ref EmailSenderAddress
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub "${UserMediaBucket.Arn}/users/*/logos/*"
+              Resource:
+                - !Sub "${UserMediaBucket.Arn}/users/*/logos/*"
+                - !Sub "${UserMediaBucket.Arn}/games/*"
+                - !Sub "${UserMediaBucket.Arn}/prizes/*"
       Events:
         RecoverOutbox:
           Type: Schedule

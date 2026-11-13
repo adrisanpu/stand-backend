@@ -1,4 +1,4 @@
-"""Reward notice with an inline, locally generated Kivly customer QR."""
+"""Reward notices with inline, locally generated customer and prize QR images."""
 from email.message import EmailMessage
 from email.policy import SMTP
 from html import escape
@@ -33,6 +33,90 @@ def _wallet_link(value):
     return value
 
 
+def _reward_email_html(
+    name, title, *, club_name=None, logo=False, hero_image=None, prize_image=False, instructions=(),
+    wallet_links=(), qr_heading=None, qr_alt="QR personal", qr_note=None,
+    disclosures=(), include_qr=True,
+):
+    logo_alt = escape(club_name or "STAND", quote=True)
+    prize_image_html = (
+        '<img src="cid:prize-photo" width="180" alt=""'
+        ' style="display:block;width:180px;max-width:100%;height:auto;margin:0 auto 14px;">'
+        if prize_image else ""
+    )
+    logo_html = (
+        f'<img src="cid:club-logo" width="180" alt="{logo_alt}"'
+        ' style="display:block;width:180px;max-width:100%;height:auto;margin:0 auto 16px;">'
+        if logo else ""
+    )
+    hero_html = (
+        f'<img src="{escape(hero_image, quote=True)}" alt="" width="180"'
+        ' style="display:block;width:180px;max-width:100%;height:auto;margin:0 auto 16px;">'
+        if hero_image else ""
+    )
+    club_html = (
+        f'<p style="font-size:13px;color:#666666;margin:0;">{escape(club_name)}</p>'
+        if club_name else ""
+    )
+    instructions_html = "".join(
+        f'<p style="font-size:14px;line-height:1.6;margin:18px 0 0;">{escape(text)}</p>'
+        for text in instructions
+    )
+    wallet_html = "".join(
+        '<table role="presentation" cellpadding="0" cellspacing="0" align="center"'
+        ' style="margin:18px auto 0;"><tr><td align="center" bgcolor="#171717"'
+        ' style="border-radius:8px;">'
+        f'<a href="{escape(url, quote=True)}" style="display:inline-block;padding:13px 20px;'
+        f'color:#ffffff;text-decoration:none;font-size:14px;font-weight:bold;">{escape(label)}</a>'
+        '</td></tr></table>'
+        + (
+            f'<p style="font-size:11px;color:#666666;margin:8px 0 0;">{escape(note)}</p>'
+            if note else ""
+        )
+        for label, url, note in wallet_links
+    )
+    qr_html = (
+        f'<p style="font-size:14px;font-weight:bold;margin:24px 0 12px;">{escape(qr_heading)}</p>'
+        '<img src="cid:reward-qr" width="280" height="280" alt="'
+        f'{escape(qr_alt, quote=True)}" style="display:block;width:280px;max-width:100%;'
+        'height:auto;margin:0 auto;">'
+        + (
+            f'<p style="font-size:12px;line-height:1.5;color:#666666;margin:10px 0 0;">'
+            f'{escape(qr_note)}</p>'
+            if qr_note else ""
+        )
+        if include_qr else ""
+    )
+    footer_html = "<br>".join(escape(text) for text in disclosures)
+    return (
+        '<!doctype html><html lang="es"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '</head><body style="margin:0;padding:0;background-color:#f4f1ed;'
+        'font-family:Arial,Helvetica,sans-serif;color:#171717;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"'
+        ' bgcolor="#f4f1ed"><tr><td align="center" style="padding:24px 12px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"'
+        ' data-email-layout="reward-card"'
+        ' style="max-width:440px;background-color:#ffffff;border:1px solid #e8e3dd;'
+        'border-radius:16px;"><tr><td align="center" style="padding:28px 24px;">'
+        f'{logo_html}{hero_html}{club_html}'
+        '<h1 style="font-size:22px;line-height:1.3;margin:18px 0 8px;">'
+        'Tu premio te espera</h1>'
+        f'<p style="font-size:14px;margin:0 0 20px;">Hola, {escape(name)}.</p>'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+        '<tr><td align="center" bgcolor="#f7f3ed" style="padding:22px 14px;'
+        'border-radius:12px;"><p style="font-size:11px;letter-spacing:2px;'
+        'color:#666666;margin:0 0 10px;">TU PREMIO</p>'
+        f'{prize_image_html}'
+        f'<p style="font-size:24px;font-weight:bold;line-height:1.25;margin:0;">'
+        f'{escape(title)}</p></td></tr></table>'
+        f'{instructions_html}{wallet_html}{qr_html}'
+        '</td></tr><tr><td align="center" style="padding:16px 20px;'
+        'border-top:1px solid #eeeae5;font-size:11px;line-height:1.6;color:#777777;">'
+        f'{footer_html}</td></tr></table></td></tr></table></body></html>'
+    )
+
+
 def build_message(
     sender, recipient, name, prize, phone, *,
     club_name=None, wallet_url=None, logo_png=None,
@@ -59,7 +143,7 @@ def build_message(
     from qrcode.image.pure import PyPNGImage
 
     image = BytesIO()
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=4)
     qr.add_data(phone, optimize=0)
     qr.make(fit=True)
     qr.make_image(image_factory=PyPNGImage).save(image)
@@ -80,35 +164,26 @@ def build_message(
         "This email does not reflect later changes or guarantee that the reward is still unredeemed.\n"
     )
     photo = reward_image_url(prize.get("imageUrl"))
-    photo_html = f'<img src="{escape(photo, quote=True)}" alt="" width="280">' if photo else ""
     message.add_alternative(
-        f'<html><body><h1>{escape(title)}</h1><p>{escape(name)}</p>{photo_html}'
-        '<p>Escanea para canjear / Scan to redeem</p>'
-        '<img src="cid:reward-qr" width="280" height="280" alt="QR Kivly">'
-        '<p>Muestra este QR al personal. No necesitas wallet. El personal comprobara y canjeara el premio en Kivly.</p>'
-        '<p>Show this QR to staff. No wallet needed. Staff will check and redeem the reward in Kivly.</p>'
-        '<p>Este correo no refleja canjes posteriores. / This email does not reflect subsequent redemptions.</p>'
-        '</body></html>', subtype="html",
+        _reward_email_html(
+            name, title, hero_image=photo,
+            instructions=(
+                "Muestra este QR al personal. No necesitas wallet. El personal comprobara y canjeara el premio en Kivly.",
+                "Show this QR to staff. No wallet needed. Staff will check and redeem the reward in Kivly.",
+            ),
+            qr_heading="Tu QR personal / Scan to redeem",
+            qr_alt="QR Kivly",
+            disclosures=(
+                "Este correo no refleja canjes posteriores.",
+                "This email does not reflect subsequent redemptions.",
+            ),
+        ),
+        subtype="html",
     )
     if club_name is not None:
         wallet_text = (
             f"A\u00f1ade tu tarjeta a Apple Wallet o Google Wallet:\n{wallet_url}\n\n"
             if wallet_url else ""
-        )
-        wallet_html = (
-            '<table role="presentation" cellpadding="0" cellspacing="0" align="center">'
-            '<tr><td bgcolor="#171717" style="border-radius:12px;">'
-            f'<a href="{escape(wallet_url, quote=True)}" style="display:inline-block;'
-            'padding:16px 24px;color:#ffffff;text-decoration:none;font-size:16px;'
-            'font-weight:bold;">A\u00f1adir tarjeta a mi wallet</a></td></tr></table>'
-            '<p style="font-size:12px;color:#666666;margin:12px 0 0;">'
-            'Apple Wallet o Google Wallet</p>'
-            if wallet_url else ""
-        )
-        logo_html = (
-            f'<img src="cid:club-logo" width="220" alt="{escape(club_name, quote=True)}"'
-            ' style="display:block;width:220px;max-width:100%;height:auto;margin:0 auto 20px;">'
-            if logo_png is not None else ""
         )
         message.replace_header("Subject", f"Tu premio en {club_name}: {title}")
         message.get_payload()[0].set_content(
@@ -121,39 +196,21 @@ def build_message(
             "Este correo no refleja canjes posteriores.\n"
         )
         message.get_payload()[1].set_content(
-            '<!doctype html><html lang="es"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '</head><body style="margin:0;padding:0;background-color:#f4f1ed;'
-            'font-family:Arial,Helvetica,sans-serif;color:#171717;">'
-            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"'
-            ' bgcolor="#f4f1ed"><tr><td align="center" style="padding:28px 12px;">'
-            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"'
-            ' style="max-width:600px;background-color:#ffffff;border:1px solid #e8e3dd;'
-            'border-radius:20px;"><tr><td align="center" style="padding:32px 24px;">'
-            f'{logo_html}<p style="margin:0;font-size:14px;color:#666666;">'
-            f'{escape(club_name)}</p>'
-            '<h1 style="font-size:26px;line-height:1.25;margin:20px 0 12px;">'
-            'Tu premio te espera</h1>'
-            f'<p style="font-size:16px;margin:0 0 24px;">Hola, {escape(name)}.</p>'
-            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
-            '<tr><td align="center" bgcolor="#f7f3ed" style="padding:28px 16px;'
-            'border-radius:16px;"><p style="font-size:12px;letter-spacing:2px;'
-            'color:#666666;margin:0 0 12px;">TU PREMIO</p>'
-            f'<p style="font-size:30px;font-weight:bold;line-height:1.2;margin:0;">'
-            f'{escape(title)}</p></td></tr></table>'
-            '<p style="font-size:16px;line-height:1.6;margin:24px 0;">'
-            'Muestra tu tarjeta de wallet o este QR al personal del local.</p>'
-            f'{wallet_html}'
-            '<p style="font-size:16px;font-weight:bold;margin:28px 0 12px;">Tu QR personal</p>'
-            '<img src="cid:reward-qr" width="280" height="280" alt="QR de tu cuenta Kivly"'
-            ' style="display:block;width:280px;max-width:100%;height:auto;margin:0 auto;">'
-            '<p style="font-size:13px;line-height:1.5;color:#666666;margin:12px 0 0;">'
-            'Identifica tu cuenta de Kivly. No necesitas instalar una wallet.</p>'
-            '</td></tr><tr><td align="center" style="padding:20px 24px;'
-            'border-top:1px solid #eeeae5;font-size:12px;line-height:1.6;color:#777777;">'
-            'El personal verificar\u00e1 la disponibilidad y las condiciones antes del canje.'
-            '<br>Este correo no refleja canjes posteriores.'
-            '</td></tr></table></td></tr></table></body></html>',
+            _reward_email_html(
+                name, title, club_name=club_name, logo=logo_png is not None,
+                instructions=("Muestra tu tarjeta de wallet o este QR al personal del local.",),
+                wallet_links=(
+                    (("A\u00f1adir tarjeta a mi wallet", wallet_url, "Apple Wallet o Google Wallet"),)
+                    if wallet_url else ()
+                ),
+                qr_heading="Tu QR personal",
+                qr_alt="QR de tu cuenta Kivly",
+                qr_note="Identifica tu cuenta de Kivly. No necesitas instalar una wallet.",
+                disclosures=(
+                    "El personal verificar\u00e1 la disponibilidad y las condiciones antes del canje.",
+                    "Este correo no refleja canjes posteriores.",
+                ),
+            ),
             subtype="html",
         )
         if logo_png is not None:
@@ -168,7 +225,10 @@ def build_message(
     return message.as_bytes()
 
 
-def build_reward_message(sender, recipient, name, prize, *, qr_value=None, wallet_links=()):
+def build_reward_message(
+    sender, recipient, name, prize, *, qr_value=None, wallet_links=(),
+    logo_png=None, prize_image_png=None,
+):
     if not is_valid_email(recipient):
         raise ValueError("InvalidRewardEmailContact")
     title = prize.get("name")
@@ -190,50 +250,95 @@ def build_reward_message(sender, recipient, name, prize, *, qr_value=None, walle
         or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in qr_value)
     ):
         raise ValueError("InvalidRewardQRCode")
+    for image in (logo_png, prize_image_png):
+        if image is not None and (
+            not isinstance(image, bytes) or len(image) < 33 or len(image) > 5 * 1024 * 1024
+            or not image.startswith(b"\x89PNG\r\n\x1a\n") or image[12:16] != b"IHDR"
+        ):
+            raise ValueError("InvalidRewardEmailImage")
+    if sum(len(image) for image in (logo_png, prize_image_png) if image is not None) > 6 * 1024 * 1024:
+        raise ValueError("InvalidRewardEmailImage")
 
     message = EmailMessage(policy=SMTP)
     message["From"] = sender
     message["To"] = recipient
     message["Subject"] = f"Tu premio STAND / Your STAND reward: {title}"
+    if qr_value and links:
+        instructions = (
+            "Muestra el QR o usa el enlace Wallet para recoger tu premio.\n"
+            "Show the QR or use the Wallet link to collect your reward."
+        )
+    elif qr_value:
+        instructions = (
+            "Muestra este QR al personal del evento para recoger tu premio.\n"
+            "Show this QR code to event staff to collect your reward."
+        )
+    elif links:
+        instructions = (
+            "Usa el enlace Wallet para acceder a tu premio.\n"
+            "Use the Wallet link to access your reward."
+        )
+    else:
+        instructions = ""
     message.set_content(
         f"Hola, {name}:\n\nTu premio STAND: {title}.\n\n"
-        "Muestra el QR o la tarjeta Wallet al personal del evento para recogerlo.\n"
-        "Show the QR code or Wallet pass to event staff to collect your reward.\n\n"
+        f"{instructions}\n\n"
         + "".join(f"{label}: {url}\n" for label, url in links)
     )
-    link_html = "".join(
-        f'<p><a href="{escape(url, quote=True)}">{escape(label)}</a></p>' for label, url in links
-    )
-    qr_html = ""
     qr_image = None
     if qr_value:
         import qrcode
         from qrcode.image.pure import PyPNGImage
 
         image = BytesIO()
-        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=4)
         qr.add_data(qr_value, optimize=0)
         qr.make(fit=True)
         qr.make_image(image_factory=PyPNGImage).save(image)
         qr_image = image.getvalue()
-        qr_html = (
-            '<p style="font-size:16px;font-weight:bold;">Tu QR personal / Your reward QR</p>'
-            '<img src="cid:reward-qr" width="240" height="240" alt="QR del premio">'
-        )
     message.add_alternative(
-        '<!doctype html><html lang="es"><body style="font-family:Arial,Helvetica,sans-serif;'
-        'color:#171717;max-width:600px;margin:24px auto;padding:24px;">'
-        f'<p>Hola, {escape(name)}.</p><h1>{escape(title)}</h1>'
-        '<p>Muestra tu tarjeta Wallet o este QR al personal del evento.</p>'
-        '<p>Show your Wallet pass or QR code to event staff.</p>'
-        f'{link_html}{qr_html}'
-        '<p style="font-size:12px;color:#666;">El email no refleja cambios posteriores en el estado del premio.'
-        ' / This email does not reflect later reward status changes.</p></body></html>',
+        _reward_email_html(
+            name, title, logo=logo_png is not None, prize_image=prize_image_png is not None,
+            instructions=tuple(
+                line for line in (
+                    "Muestra este QR al personal del evento para recoger tu premio."
+                    if qr_value and not links else
+                    "Muestra el QR o usa el enlace Wallet para recoger tu premio."
+                    if qr_value and links else
+                    "Usa el enlace Wallet para acceder a tu premio."
+                    if links else None,
+                    "Show this QR code to event staff to collect your reward."
+                    if qr_value and not links else
+                    "Show the QR or use the Wallet link to collect your reward."
+                    if qr_value and links else
+                    "Use the Wallet link to access your reward."
+                    if links else None,
+                ) if line
+            ),
+            wallet_links=tuple((label, url, None) for label, url in links),
+            qr_heading="Tu QR personal / Your reward QR",
+            qr_alt="QR del premio",
+            disclosures=(
+                "El email no refleja cambios posteriores en el estado del premio.",
+                "This email does not reflect later reward status changes.",
+            ),
+            include_qr=qr_image is not None,
+        ),
         subtype="html",
     )
     if qr_image is not None:
         message.get_payload()[1].add_related(
             qr_image, maintype="image", subtype="png", cid="<reward-qr>",
             filename="stand-reward-qr.png", disposition="inline",
+        )
+    if logo_png is not None:
+        message.get_payload()[1].add_related(
+            logo_png, maintype="image", subtype="png", cid="<club-logo>",
+            filename="stand-logo.png", disposition="inline",
+        )
+    if prize_image_png is not None:
+        message.get_payload()[1].add_related(
+            prize_image_png, maintype="image", subtype="png", cid="<prize-photo>",
+            filename="stand-prize.png", disposition="inline",
         )
     return message.as_bytes()

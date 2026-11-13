@@ -1258,6 +1258,8 @@ def _handle_get_player(event):
 
 
 def _handle_wallet_pass(event):
+    if os.environ.get("STAND_WALLET_PASSES_ENABLED", "false").lower() != "true":
+        return _resp(503, {"ok": False, "error": "WalletPassUnavailable"})
     params = event.get("queryStringParameters") or {}
     token = params.get("token", "")
     platform = params.get("platform", "")

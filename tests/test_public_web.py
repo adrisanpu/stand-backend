@@ -45,6 +45,18 @@ SECRET = "test-secret"
 public_mod.PLAYER_TOKEN_SECRET = SECRET
 
 
+def test_stand_wallet_pass_endpoint_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("STAND_WALLET_PASSES_ENABLED", raising=False)
+    client = MagicMock()
+    monkeypatch.setattr(public_mod.boto3, "client", client)
+
+    response = public_mod._handle_wallet_pass({"queryStringParameters": {}})
+
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"]) == {"ok": False, "error": "WalletPassUnavailable"}
+    client.assert_not_called()
+
+
 @pytest.mark.parametrize("game_type", ["L3TRAS", "SEMAFORO", "CUPIDO", "INFOCARDS"])
 def test_mobile_games_cannot_reach_legacy_validator_or_expose_private_records(game_type, monkeypatch):
     game_id = "ABC123"

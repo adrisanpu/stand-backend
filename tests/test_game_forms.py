@@ -106,6 +106,46 @@ def test_structure_edit_has_atomic_first_response_guard(db, meta):
     assert "formRevision = :previous" in condition
 
 
+@pytest.mark.parametrize("at", ["after_registration", "after_game", "prize", "raffle"])
+def test_locked_quiz_can_be_disabled_and_restored_without_changing_questions(db, meta, at):
+    meta["quizLockedAt"] = "now"
+    meta["formConfig"]["quizMoment"] = at
+    request = draft(meta)
+    request["formConfig"]["quizMoment"] = "disabled"
+    updated = {**meta, "formConfig": request["formConfig"], "quizPreviousMoment": at}
+    db.Table.return_value.update_item.return_value = {"Attributes": updated}
+    result = forms.save(db, meta, request)
+    call = db.Table.return_value.update_item.call_args.kwargs
+    assert result["quizPreviousMoment"] == at
+    assert result["questions"] == forms.questions(meta)
+    assert call["ExpressionAttributeValues"][":quizPreviousMoment"] == at
+    assert "attribute_not_exists(quizLockedAt)" not in call["ConditionExpression"]
+    assert "formRevision = :previous" in call["ConditionExpression"]
+
+    restore = draft(updated)
+    restore["formConfig"]["quizMoment"] = at
+    db.Table.return_value.update_item.return_value = {"Attributes": {**updated, "formConfig": restore["formConfig"]}}
+    assert forms.save(db, updated, restore)["formConfig"]["quizMoment"] == at
+    assert "attribute_not_exists(quizLockedAt)" not in db.Table.return_value.update_item.call_args.kwargs["ConditionExpression"]
+
+
+def test_disable_cannot_modify_locked_questions_or_restore_a_different_moment(db, meta):
+    meta["quizLockedAt"] = "now"
+    request = draft(meta)
+    request["formConfig"]["quizMoment"] = "disabled"
+    request["questions"][0]["text"] = "Changed?"
+    with pytest.raises(forms.FormError, match="QuizLocked"):
+        forms.save(db, meta, request)
+
+    meta["formConfig"]["quizMoment"] = "disabled"
+    meta["quizPreviousMoment"] = "after_registration"
+    request = draft(meta)
+    request["formConfig"]["quizMoment"] = "prize"
+    with pytest.raises(forms.FormError, match="QuizLocked"):
+        forms.save(db, meta, request)
+    db.Table.return_value.update_item.assert_not_called()
+
+
 def test_stale_config_rejected_without_writing(db, meta):
     request = draft(meta)
     request["expectedRevision"] = "stale"
@@ -273,3 +313,26 @@ def test_operator_form_route_rejects_quiz_change_without_plan(db, meta, monkeypa
     result = game._handle_put(operator_event({"gameId": "ABC123", "form": request}))
     assert result["statusCode"] == 403
     table.update_item.assert_not_called()
+
+
+def test_operator_without_plan_can_disable_questionnaire(db, meta, monkeypatch):
+    from tests.test_participant_fields import game, operator_event
+    meta["quizLockedAt"] = "now"
+    table = db.Table.return_value
+    table.get_item.return_value = {"Item": meta}
+    request = draft(meta)
+    request["formConfig"]["quizMoment"] = "disabled"
+    table.update_item.return_value = {"Attributes": {
+        **meta, "formConfig": request["formConfig"], "quizPreviousMoment": "after_registration",
+    }}
+    monkeypatch.setattr(game, "dynamodb", db)
+    monkeypatch.setattr(game, "games_table", table)
+    monkeypatch.setattr(game, "_is_user_pro", lambda _: False)
+    result = game._handle_put(operator_event({"gameId": "ABC123", "form": request}))
+    assert result["statusCode"] == 200
+    assert table.update_item.call_args.kwargs["ExpressionAttributeValues"][":quizPreviousMoment"] == "after_registration"
+    disabled = table.update_item.return_value["Attributes"]
+    table.get_item.return_value = {"Item": disabled}
+    request = draft(disabled)
+    request["formConfig"]["quizMoment"] = "after_registration"
+    assert game._handle_put(operator_event({"gameId": "ABC123", "form": request}))["statusCode"] == 403

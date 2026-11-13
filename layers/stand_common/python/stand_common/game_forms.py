@@ -118,6 +118,7 @@ def operator_shape(dynamo, meta):
         "bannerUrl": image_url(value["bannerKey"]),
         "participantFields": normalize_participant_fields(meta["gameType"], meta.get("participantFields")),
         "questions": questions(meta), "locked": locked(dynamo, meta), "revision": revision(meta),
+        "quizPreviousMoment": meta.get("quizPreviousMoment") if meta.get("quizPreviousMoment") in MOMENTS - {"disabled"} else None,
         "joinUrl": "/play/" + meta["gameId"],
         **({"loyalty": {key: loyalty[key] for key in ("clubName", "privacyUrl", "termsUrl", "consentVersion")}}
            if loyalty["enabled"] else {}),
@@ -198,8 +199,15 @@ def save(dynamo, meta, body):
     resolved = kivly_registration.apply_account_settings(dynamo, meta)
     if kivly_registration.game_settings(resolved)["enabled"] and not fields["phone"].get("enabled", fields["phone"]["required"]):
         raise FormError("KivlyPhoneRequired", 400)
-    structural = qs != questions(meta) or value["quizMoment"] != moment(meta)
-    if structural and locked(dynamo, meta):
+    previous_moment = moment(meta)
+    next_moment = value["quizMoment"]
+    questions_changed = qs != questions(meta)
+    timing_changed = next_moment != previous_moment
+    disabling = timing_changed and next_moment == "disabled"
+    restoring = (previous_moment == "disabled" and next_moment != "disabled"
+                 and next_moment == meta.get("quizPreviousMoment"))
+    protected_change = questions_changed or (timing_changed and not (disabling or restoring))
+    if protected_change and locked(dynamo, meta):
         raise FormError("QuizLocked")
     names = {"#form": "formConfig"}
     values = {":form": value, ":fields": fields, ":order": [q["id"] for q in qs],
@@ -220,12 +228,16 @@ def save(dynamo, meta, body):
                 values[placeholder] = meta[attribute]
             else:
                 condition += f" AND attribute_not_exists({attribute})"
-    if structural:
+    if protected_change:
         condition += " AND attribute_not_exists(quizLockedAt)"
+    update = "SET #form = :form, participantFields = :fields, quizOrder = :order, quizQuestions = :questions, formRevision = :revision, updatedAt = :now"
+    if disabling:
+        update += ", quizPreviousMoment = :quizPreviousMoment"
+        values[":quizPreviousMoment"] = previous_moment
     try:
         updated = dynamo.Table(os.environ["GAMES_TABLE"]).update_item(
             Key={"gameId": meta["gameId"]},
-            UpdateExpression="SET #form = :form, participantFields = :fields, quizOrder = :order, quizQuestions = :questions, formRevision = :revision, updatedAt = :now",
+            UpdateExpression=update,
             ConditionExpression=condition, ExpressionAttributeNames=names, ExpressionAttributeValues=values,
             ReturnValues="ALL_NEW",
         )["Attributes"]
