@@ -78,6 +78,8 @@ def registration_values(meta, body):
             continue
         if len(value) > (300 if name == "address" else 160) or re.search(r"[\x00-\x1f\x7f-\x9f]", value):
             raise RegistrationError(f"invalid_{name}")
+        if name == "sex" and value not in ("male", "female"):
+            raise RegistrationError("invalid_sex")
         if name == "birthDate":
             try:
                 date = datetime.strptime(value, "%Y-%m-%d").date()

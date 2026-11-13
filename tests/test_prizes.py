@@ -123,6 +123,34 @@ def test_ranking_top_x_and_owner_bound_image_key():
         )
 
 
+def test_serializes_shared_prize_from_owner_catalog():
+    shared_key = "prizes/owner/shared-gift.png"
+    catalog = {
+        "validation": {
+            "name": "Legacy name",
+            "limit": 2,
+            "sharedPrizeId": "gift",
+            "imageKey": "games/owner/OTHER1/ranking/01234567-89ab-cdef-0123-456789abcdef.png",
+        },
+    }
+
+    result = serialize_prize_catalog(
+        catalog,
+        "owner",
+        "ABC123",
+        "bucket",
+        lambda operation, **kwargs: "signed:" + kwargs["Params"]["Key"],
+        shared_catalog=[{"id": "gift", "name": "Shared gift", "imageKey": shared_key}],
+    )
+
+    assert result["validation"] == {
+        **catalog["validation"],
+        "name": "Shared gift",
+        "imageKey": shared_key,
+        "imageUrl": "signed:" + shared_key,
+    }
+
+
 def test_prize_name_is_persisted_as_the_supplied_string():
     catalog = validate_prize_catalog(
         {"validation": {"name": "", "limit": None}},

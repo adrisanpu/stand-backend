@@ -1518,12 +1518,6 @@ Resources:
                 Action:
                   - bedrock:InvokeModel
                 Resource: !Sub "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0"
-              - Sid: LambdaInvokeQuizGenerate
-                Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-quiz-fn-generate"
-
   StandProdInfocardsFnGet:
     Type: AWS::Serverless::Function
     Properties:
@@ -1577,7 +1571,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "stand-${Environment}-infocards-fn-process"
-      Description: Processes uploaded content with Bedrock AI to generate info cards (and optionally a quiz).
+      Description: Processes uploaded content with Bedrock AI to generate info cards.
       CodeUri: src/stand_prod_infocards_fn_process/
       Handler: lambda_function.lambda_handler
       Role: !GetAtt StandProdInfocardsRole.Arn
@@ -1590,36 +1584,12 @@ Resources:
           INFOCARDS_BUCKET: !Ref InfocardsUploadsBucket
           BEDROCK_REGION: us-east-1
           BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
-          QUIZ_GENERATE_FUNCTION_NAME: !Sub "stand-${Environment}-quiz-fn-generate"
       Events:
         InfocardsProcessPost:
           Type: HttpApi
           Properties:
             ApiId: !Ref GameApi
             Path: /v1/game/infocards/process
-            Method: POST
-
-  StandProdQuizFnGenerate:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub "stand-${Environment}-quiz-fn-generate"
-      Description: Generates quiz questions from a text prompt using Bedrock AI and saves them.
-      CodeUri: src/stand_prod_quiz_fn_generate/
-      Handler: lambda_function.lambda_handler
-      Role: !GetAtt StandProdInfocardsRole.Arn
-      Layers:
-        - !Ref StandCommonLayer
-      Timeout: 60
-      Environment:
-        Variables:
-          BEDROCK_REGION: us-east-1
-          BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
-      Events:
-        QuizGeneratePost:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref GameApi
-            Path: /v1/game/quiz/generate
             Method: POST
 
 # =========================

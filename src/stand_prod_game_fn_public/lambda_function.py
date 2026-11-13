@@ -117,12 +117,23 @@ def _get_game(game_id: str) -> dict | None:
 def _public_prize_catalog(meta: dict):
     if "prizeCatalog" not in meta:
         return None
+    catalog = meta["prizeCatalog"]
+    shared_catalog = []
+    if isinstance(catalog, dict) and meta.get("ownerUserId") and any(
+        isinstance(prize, dict) and prize.get("sharedPrizeId")
+        for prize in catalog.values()
+    ):
+        user = dynamo_r.Table(os.environ["USERS_TABLE"]).get_item(
+            Key={"userId": meta["ownerUserId"]}, ProjectionExpression="sharedPrizeCatalog",
+        ).get("Item") or {}
+        shared_catalog = user.get("sharedPrizeCatalog") or []
     return serialize_prize_catalog(
-        meta["prizeCatalog"],
+        catalog,
         meta.get("ownerUserId") or "",
         meta.get("gameId") or "",
         os.environ.get("USER_MEDIA_BUCKET", ""),
         boto3.client("s3").generate_presigned_url,
+        shared_catalog=shared_catalog,
     )
 
 

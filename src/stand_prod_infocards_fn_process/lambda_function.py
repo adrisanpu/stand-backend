@@ -11,14 +11,12 @@ GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 INFOCARDS_BUCKET = os.environ.get("INFOCARDS_BUCKET", "")
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
-QUIZ_GENERATE_FUNCTION_NAME = os.environ.get("QUIZ_GENERATE_FUNCTION_NAME", "stand-prod-quiz-fn-generate")
 
 # ========= AWS =========
 dynamodb = boto3.resource("dynamodb")
 games_table = dynamodb.Table(GAMES_TABLE)
 s3 = boto3.client("s3")
 bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-lambda_client = boto3.client("lambda")
 
 # ========= PROMPTS =========
 
@@ -103,47 +101,6 @@ def _normalize_cards(raw_cards: list, game_id: str) -> list:
     return normalized
 
 
-def _invoke_quiz_generate(
-    game_id: str,
-    content: str,
-    owner_user_id: str,
-    *,
-    num_questions: int = 3,
-    num_options: int = 3,
-    use_emojis: bool = False,
-) -> bool:
-    """Invoke the quiz-generate Lambda with the same content. Returns True if quiz was generated successfully."""
-    payload = json.dumps({
-        "source": "infocards_process",
-        "gameId": game_id,
-        "text": content,
-        "ownerUserId": owner_user_id,
-        "numQuestions": num_questions,
-        "numOptions": num_options,
-        "useEmojis": use_emojis,
-    })
-    try:
-        response = lambda_client.invoke(
-            FunctionName=QUIZ_GENERATE_FUNCTION_NAME,
-            InvocationType="RequestResponse",
-            Payload=payload,
-        )
-        payload_out = response.get("Payload")
-        if payload_out is None:
-            log("Quiz invoke: no payload in response", {"gameId": game_id})
-            return False
-        result = json.loads(payload_out.read().decode("utf-8"))
-        status = result.get("statusCode", 0)
-        if status != 200:
-            body = result.get("body", "")
-            log("Quiz invoke returned error", {"gameId": game_id, "statusCode": status, "body": body[:500]})
-            return False
-        return True
-    except Exception as e:
-        log("Quiz invoke failed", {"gameId": game_id, "error": str(e)})
-        return False
-
-
 def lambda_handler(event, context):
     method = (
         event.get("httpMethod")
@@ -169,7 +126,6 @@ def lambda_handler(event, context):
         game_id = (body.get("gameId") or "").strip()
         text = (body.get("text") or "").strip()
         file_keys = body.get("fileKeys") or []
-        generate_quiz = bool(body.get("generateQuiz", False))
 
         num_cards = 6
         if "numCards" in body:
@@ -178,24 +134,6 @@ def lambda_handler(event, context):
                 num_cards = max(3, min(10, n))
             except (TypeError, ValueError):
                 pass
-
-        num_questions = 3
-        if "numQuestions" in body:
-            try:
-                n = int(body["numQuestions"])
-                num_questions = max(1, min(5, n))
-            except (TypeError, ValueError):
-                pass
-
-        num_options = 3
-        if "numOptions" in body:
-            try:
-                n = int(body["numOptions"])
-                num_options = max(2, min(4, n))
-            except (TypeError, ValueError):
-                pass
-
-        use_emojis = bool(body.get("useEmojis", False))
 
         if not game_id:
             return _resp(400, {"error": "Missing required field 'gameId'."})
@@ -226,7 +164,7 @@ def lambda_handler(event, context):
         prompt = PROMPT_CARDS_ONLY.format(content=content, num_cards=num_cards)
 
         # Call Bedrock
-        log("Calling Bedrock", {"gameId": game_id, "numCards": num_cards, "generateQuiz": generate_quiz, "modelId": BEDROCK_MODEL_ID})
+        log("Calling Bedrock", {"gameId": game_id, "numCards": num_cards, "modelId": BEDROCK_MODEL_ID})
         try:
             raw_text = _call_bedrock(prompt)
         except Exception as e:
@@ -266,20 +204,10 @@ def lambda_handler(event, context):
             log("UpdateItem failed", {"error": str(e)})
             return _resp(500, {"error": "UpdateItemFailed", "detail": str(e)})
 
-        quiz_generated = False
-        if generate_quiz:
-            quiz_generated = _invoke_quiz_generate(
-                game_id, content, owner_user_id,
-                num_questions=num_questions,
-                num_options=num_options,
-                use_emojis=use_emojis,
-            )
-
         return _resp(200, {
             "ok": True,
             "gameId": game_id,
             "cards": cards,
-            "quizGenerated": quiz_generated,
         })
 
     except Exception as e:

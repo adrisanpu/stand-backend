@@ -59,8 +59,8 @@ The general form policy is independent of Kivly: full name (`username`) and
 mandatory verified email and phone in every game (both STACK channels included).
 Legacy disabled/optional contact settings resolve to mandatory contacts; writes
 cannot disable them. Registration starts with email, then missing identity/details
-and consent, before verification. Optional address, company, job title and birth
-date are game-configured profile fields, not Kivly customer attributes.
+and consent, before verification. Optional address, company, sex, birth date and
+legacy job title are game-configured profile fields, not Kivly customer attributes.
 The existing public join support remains EMPAREJA2, T1MER, STACK and RULET4;
 this feature does not introduce new game-specific join implementations.
 
@@ -222,7 +222,7 @@ Missing connection, missing club details, demo-disabled settings and all
 non-STACK games omit `loyalty`; do not show club consent in those cases.
 Public field metadata always resolves email to `{"required":true}` and phone to
 `{"required":true,"enabled":true}` for every game, including legacy configuration.
-The optional `address`, `company`, `jobTitle` and `birthDate` entries each expose
+The optional `address`, `company`, `sex`, legacy `jobTitle` and `birthDate` entries each expose
 only `{"enabled":true|false}`. Profile values are never public metadata.
 There is no public customer ID, location ID or credential in `loyalty`.
 
@@ -250,7 +250,10 @@ Settings cannot disable phone or make it optional. Existing valid sessions are n
 solely because they predate required phone.
 Enabled optional fields are trimmed and bound into the email challenge before
 being persisted on the participant: address up to 300 characters, company and
-job title up to 160, birth date a valid non-future `YYYY-MM-DD`. Disabled fields
+legacy job title up to 160, sex either `male` or `female` (otherwise HTTP 400
+`invalid_sex`), birth date a valid non-future `YYYY-MM-DD`. Sex is optional;
+empty values are omitted. It replaces job title in the configurator, not in
+historical data; no job titles are converted to sex. Disabled fields
 are ignored. Missing optional fields alone do not force returning participants
 to repeat details; existing profile values and gameplay progress are preserved.
 These fields are available only in authenticated administrative responses/exports,

@@ -240,6 +240,43 @@ def test_public_game_adds_signed_prize_catalog_at_top_level(monkeypatch):
     )
 
 
+def test_public_game_resolves_shared_prize_catalog_image(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
+    monkeypatch.setenv("USERS_TABLE", "users")
+    shared_key = "prizes/owner/shared-gift.png"
+    meta = {
+        "gameId": "ABC123",
+        "gameType": "EMPAREJA2",
+        "ownerUserId": "owner",
+        "prizeCatalog": {"validation": {
+            "name": "Legacy name",
+            "limit": 2,
+            "sharedPrizeId": "gift",
+            "imageKey": "games/owner/OTHER1/ranking/01234567-89ab-cdef-0123-456789abcdef.png",
+        }},
+    }
+    users = MagicMock()
+    users.get_item.return_value = {"Item": {
+        "sharedPrizeCatalog": [{"id": "gift", "name": "Shared gift", "imageKey": shared_key}],
+        "media": {},
+    }}
+    s3 = MagicMock()
+    s3.generate_presigned_url.return_value = "signed:shared-gift"
+    with patch.object(public_mod, "_get_game", return_value=meta), \
+         patch.object(public_mod.dynamo_r, "Table", return_value=users), \
+         patch.object(public_mod.boto3, "client", return_value=s3):
+        response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABC123"}})
+
+    assert response["statusCode"] == 200
+    prize = json.loads(response["body"])["prizeCatalog"]["validation"]
+    assert prize["name"] == "Shared gift"
+    assert prize["imageKey"] == shared_key
+    assert prize["imageUrl"] == "signed:shared-gift"
+    s3.generate_presigned_url.assert_called_once_with(
+        "get_object", Params={"Bucket": "media", "Key": shared_key}, ExpiresIn=3600,
+    )
+
+
 def test_player_response_adds_catalog_and_keeps_won_raffle_prize(monkeypatch):
     monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     game_id = "ABC123"

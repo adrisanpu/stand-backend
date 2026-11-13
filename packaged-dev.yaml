@@ -1470,12 +1470,6 @@ Resources:
             - bedrock:InvokeModel
             Resource:
               Fn::Sub: arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0
-          - Sid: LambdaInvokeQuizGenerate
-            Effect: Allow
-            Action:
-            - lambda:InvokeFunction
-            Resource:
-              Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-quiz-fn-generate
     Metadata:
       SamResourceId: StandProdInfocardsRole
   StandProdInfocardsFnGet:
@@ -1548,8 +1542,7 @@ Resources:
     Properties:
       FunctionName:
         Fn::Sub: stand-${Environment}-infocards-fn-process
-      Description: Processes uploaded content with Bedrock AI to generate info cards
-        (and optionally a quiz).
+      Description: Processes uploaded content with Bedrock AI to generate info cards.
       CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/61b8af6ea252cefe1c5a4cf4ecb22d12
       Handler: lambda_function.lambda_handler
       Role:
@@ -1566,8 +1559,6 @@ Resources:
             Ref: InfocardsUploadsBucket
           BEDROCK_REGION: us-east-1
           BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
-          QUIZ_GENERATE_FUNCTION_NAME:
-            Fn::Sub: stand-${Environment}-quiz-fn-generate
       Events:
         InfocardsProcessPost:
           Type: HttpApi
@@ -1578,36 +1569,6 @@ Resources:
             Method: POST
     Metadata:
       SamResourceId: StandProdInfocardsFnProcess
-  StandProdQuizFnGenerate:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName:
-        Fn::Sub: stand-${Environment}-quiz-fn-generate
-      Description: Generates quiz questions from a text prompt using Bedrock AI and
-        saves them.
-      CodeUri: s3://aws-sam-cli-managed-default-samclisourcebucket-ikdosstmajg3/stand-backend-dev/d5021628be10d133a3ef6b7062012fea
-      Handler: lambda_function.lambda_handler
-      Role:
-        Fn::GetAtt:
-        - StandProdInfocardsRole
-        - Arn
-      Layers:
-      - Ref: StandCommonLayer
-      Timeout: 60
-      Environment:
-        Variables:
-          BEDROCK_REGION: us-east-1
-          BEDROCK_MODEL_ID: amazon.nova-lite-v1:0
-      Events:
-        QuizGeneratePost:
-          Type: HttpApi
-          Properties:
-            ApiId:
-              Ref: GameApi
-            Path: /v1/game/quiz/generate
-            Method: POST
-    Metadata:
-      SamResourceId: StandProdQuizFnGenerate
 Outputs:
   Environment:
     Value:

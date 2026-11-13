@@ -188,8 +188,9 @@ the questionnaire on the game and writes `quizAnswers`, `quizCompleted` and
 Question/moment changes are rejected after any answers exist; presentation
 changes do not reset answers. Identical retries are idempotent.
 The normal player response includes the questionnaire and completion state.
-Draft-only AI generation uses `POST /v1/game/quiz/generate` with `draftOnly: true`;
-legacy writers cannot replace questionnaires managed through the new editor.
+Questionnaires are created and edited manually in the operator editor; AI question
+generation is not available. Legacy writers cannot replace questionnaires managed
+through the new editor.
 
 Prize surveys preserve earned awards and inventory reservations but withhold
 usable claim tokens, wallet passes, STAND collection, Kivly assignment and reward
@@ -231,7 +232,7 @@ and SAM route/environment changes together.
 The game table (`stand-prod-game-table` in prod, `stand-dev-game-table` in dev) uses a generic **`type`** attribute (DynamoDB Map) for game-type-specific configuration, mirroring the pattern used in **stand-prod-gameplayer-table**. This avoids adding a new top-level column for each new game type.
 
 - **Structure:** `type.<GAME_TYPE>` where `GAME_TYPE` is the same value as `gameType` in uppercase (e.g. `INFOCARDS`, `EMPAREJA2`).
-- **Example:** For an INFOCARDS game, cards are stored under `type.INFOCARDS.cards`; the blob can include other keys (e.g. `sourceUploadKey`, `generatedQuizGameId`) as needed.
+- **Example:** For an INFOCARDS game, cards are stored under `type.INFOCARDS.cards`; the blob can include other keys (e.g. `sourceUploadKey`) as needed.
 - **Usage:** Use the helpers from `stand_common.utils`: `get_game_type_blob(game_item, "INFOCARDS")` to read and `set_game_type_blob(games_table, game_id, "INFOCARDS", {"cards": [...]}, updated_at=...)` to write. New game types that need type-specific blobs should follow the same pattern and reuse the `type` column instead of defining new top-level attributes.
 
 ## Owner game listing
@@ -288,11 +289,11 @@ INFOCARDS persists optional `cardLayouts` (`top/left/right/bottom`, keyed by car
 ID) alongside cards in `type.INFOCARDS`, instead of leaving these edits only in
 one browser. Regeneration preserves other blob settings. Editing, media upload
 requests and AI generation reject inactive events, with active write guards on
-card/quiz commits. Reads remain available for the administration's read-only
+card writes. Reads remain available for the administration's read-only
 view. Registration, catalogs and integrations are not part of mechanic saves.
 No tables, dependencies, services or automatic deployment are added. Deploy the
-game handler/shared layer and affected INFOCARDS/quiz functions together with
-the compatible frontend.
+game handler/shared layer and affected INFOCARDS functions together with the
+compatible frontend.
 
 ## Prize delivery and Wallet (delivery 1C)
 
@@ -554,8 +555,8 @@ handler deletes event-specific verification/registration records, email identity
 mappings, players, awards/jobs and media under this event's exact photo/prize/staging
 prefixes and `infocards/{gameId}/` in the INFOCARDS upload bucket. Shared content
 is untouched. Metadata/configuration writers reject archived/deleted events
-at write time, including delayed quiz/INFOCARDS generation and both steps of
-the type-blob helper, so stale requests cannot restore deleted event content.
+at write time, including delayed INFOCARDS generation and both steps of the
+type-blob helper, so stale requests cannot restore deleted event content.
 Auxiliary tables have no event index; this infrequent owner action
 uses paginated filtered scans, with no new index or service. Cleanup is bounded
 to 18 seconds/500 steps per request. A partial failure or `GameDeletionInProgress`
@@ -637,6 +638,7 @@ T1MER, STACK and RULET4 resolves it to this policy:
   "phone": { "required": true, "enabled": true },
   "address": { "enabled": false },
   "company": { "enabled": false },
+  "sex": { "enabled": false },
   "jobTitle": { "enabled": false },
   "birthDate": { "enabled": false }
 }
@@ -644,9 +646,14 @@ T1MER, STACK and RULET4 resolves it to this policy:
 
 Email is always required and verified, including legacy games stored with
 `email.required: false`. Phone is always enabled and mandatory, including legacy
-disabled/optional configurations. Writes cannot disable email or phone. The four
+disabled/optional configurations. Writes cannot disable email or phone. The
 optional profile fields are collected only when enabled and supplied, validated
 and bound to the verification challenge; they do not modify Kivly customers.
+`sex` accepts only `male` or `female` when supplied; empty values are omitted and
+other values return `invalid_sex` (HTTP 400). The configurator offers sex instead
+of job title, retaining address, company and birth date. `jobTitle` remains a
+legacy-compatible field; historical values are preserved in authenticated
+responses/exports and are never converted into `sex`.
 Registration starts with email, then missing identity/details and consent, then
 verification. Complete returning participants are not asked to fill optional fields.
 Public metadata exposes field configuration, never profile values; authenticated

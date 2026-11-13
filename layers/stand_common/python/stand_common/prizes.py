@@ -309,14 +309,34 @@ def validate_png(data: bytes) -> None:
 
 
 def serialize_prize_catalog(catalog, owner_id: str, game_id: str, bucket: str,
-                            presign_get) -> dict:
+                            presign_get, shared_catalog: list | None = None) -> dict:
     """Return the durable catalog plus fresh signed GET URLs; absent legacy catalogs stay absent."""
     if not isinstance(catalog, dict):
         raise ValueError("Stored prizeCatalog must be an object.")
+    shared = {
+        prize["id"]: prize for prize in shared_catalog or []
+        if isinstance(prize, dict) and isinstance(prize.get("id"), str)
+    }
     output = {}
     for slot, prize in catalog.items():
         if slot not in PRIZE_SLOTS or not isinstance(prize, dict):
             raise ValueError("Stored prizeCatalog contains an invalid slot.")
+        shared_prize = shared.get(prize.get("sharedPrizeId"))
+        if shared_prize:
+            image_key = shared_prize.get("imageKey")
+            image_url = None
+            if image_key:
+                if not bucket:
+                    raise RuntimeError("Missing USER_MEDIA_BUCKET for configured prize image.")
+                image_url = presign_get(
+                    "get_object",
+                    Params={"Bucket": bucket, "Key": image_key},
+                    ExpiresIn=PRIZE_IMAGE_URL_TTL,
+                )
+            output[slot] = {
+                **prize, "name": shared_prize["name"], "imageKey": image_key, "imageUrl": image_url,
+            }
+            continue
         image_key = prize.get("imageKey")
         image_url = None
         if image_key is not None:

@@ -228,7 +228,7 @@ def mask_email(email: str) -> str:
     return f"{show}@{domain}"
 
 
-OPTIONAL_PARTICIPANT_FIELDS = ("address", "company", "jobTitle", "birthDate")
+OPTIONAL_PARTICIPANT_FIELDS = ("address", "company", "sex", "jobTitle", "birthDate")
 
 
 def default_participant_fields(game_type: str) -> dict:

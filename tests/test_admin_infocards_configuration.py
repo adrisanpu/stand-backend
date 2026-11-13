@@ -8,7 +8,6 @@ from tests.email_fake import FakeDynamoError
 cards_api = load("admin_infocards_get", ROOT / "src" / "stand_prod_infocards_fn_get" / "lambda_function.py")
 process_api = load("admin_infocards_process", ROOT / "src" / "stand_prod_infocards_fn_process" / "lambda_function.py")
 upload_api = load("admin_infocards_upload", ROOT / "src" / "stand_prod_infocards_fn_upload_url" / "lambda_function.py")
-quiz_api = load("admin_infocards_quiz", ROOT / "src" / "stand_prod_quiz_fn_generate" / "lambda_function.py")
 META = {"gameId": "ABC123", "gameType": "INFOCARDS", "ownerUserId": "owner", "isActive": True,
         "type": {"INFOCARDS": {"cardLayouts": {"one": "left"}, "quizCompletedMessage": "Done"}}}
 
@@ -27,16 +26,6 @@ def test_inactive_infocards_reject_all_config_writes(module, body, monkeypatch):
     result = module.lambda_handler(event, None)
     assert result["statusCode"] == 409, result
     table.update_item.assert_not_called()
-
-
-def test_inactive_infocards_reject_delayed_quiz_generation(monkeypatch):
-    table = MagicMock()
-    table.get_item.return_value = {"Item": {**META, "isActive": False}}
-    monkeypatch.setattr(quiz_api, "games_table", table)
-    result = quiz_api._handle_infocards_invoke({"gameId": "ABC123", "ownerUserId": "owner", "text": "Product"})
-    assert result["statusCode"] == 409
-    table.update_item.assert_not_called()
-
 
 @pytest.mark.parametrize("layout", ["top", "left", "right", "bottom"])
 def test_layouts_persist_with_cards_and_owner_active_write_guards(monkeypatch, layout):
@@ -83,6 +72,7 @@ def test_regeneration_preserves_layouts_and_completion_configuration(monkeypatch
     monkeypatch.setattr(process_api, "_call_bedrock", lambda _: json.dumps({"cards": [{"title": "Title", "body": "Body"}]}))
     result = process_api.lambda_handler(operator_event({"gameId": "ABC123", "text": "Product"}), None)
     assert result["statusCode"] == 200, result
+    assert "quizGenerated" not in json.loads(result["body"])
     payload = table.update_item.call_args.kwargs["ExpressionAttributeValues"][":payload"]
     assert payload["cardLayouts"] == META["type"]["INFOCARDS"]["cardLayouts"]
     assert payload["quizCompletedMessage"] == "Done"

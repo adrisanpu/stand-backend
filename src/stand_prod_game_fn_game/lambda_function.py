@@ -460,32 +460,11 @@ def _operator_game_shape(item: dict, include_prize_catalog: bool = True) -> dict
 
 def _serialize_prize_catalog(item: dict) -> dict:
     owner_id = item.get("ownerUserId") or ""
-    shared = {
-        prize["id"]: prize for prize in ((_get_user(owner_id) or {}).get("sharedPrizeCatalog") or [])
-        if isinstance(prize, dict) and isinstance(prize.get("id"), str)
-    }
-    catalog = item.get("prizeCatalog") or {}
-    output = {}
-    for slot, prize in catalog.items():
-        shared_prize = shared.get(prize.get("sharedPrizeId")) if isinstance(prize, dict) else None
-        if not shared_prize:
-            output.update(serialize_prize_catalog(
-                {slot: prize}, owner_id, item.get("gameId") or "", USER_MEDIA_BUCKET,
-                prize_s3.generate_presigned_url,
-            ))
-            continue
-        image_key = shared_prize.get("imageKey")
-        image_url = None
-        if image_key:
-            if not USER_MEDIA_BUCKET:
-                raise RuntimeError("Missing USER_MEDIA_BUCKET for configured prize image.")
-            image_url = prize_s3.generate_presigned_url(
-                "get_object", Params={"Bucket": USER_MEDIA_BUCKET, "Key": image_key}, ExpiresIn=3600,
-            )
-        output[slot] = {
-            **prize, "name": shared_prize["name"], "imageKey": image_key, "imageUrl": image_url,
-        }
-    return output
+    shared_catalog = (_get_user(owner_id) or {}).get("sharedPrizeCatalog") or []
+    return serialize_prize_catalog(
+        item.get("prizeCatalog") or {}, owner_id, item.get("gameId") or "", USER_MEDIA_BUCKET,
+        prize_s3.generate_presigned_url, shared_catalog=shared_catalog,
+    )
 
 
 def _stack_prize_settings(payload, item):
