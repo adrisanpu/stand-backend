@@ -49,17 +49,35 @@ def test_only_selected_moment_is_required(meta, player, at):
 def test_legacy_config_does_not_activate_new_gates(meta, player):
     meta.pop("formConfig")
     assert forms.moment(meta) == "disabled"
+    assert forms.public_config(meta)["formConfig"]["defaultLanguage"] == "es"
     forms.require(meta, player, "prize")
 
 
 @pytest.mark.parametrize("changes", [
     {"quizMoment": []}, {"quizMoment": "unknown"}, {"registrationTitle": 12},
+    {"defaultLanguage": "fr"}, {"defaultLanguage": None},
     {"logoKey": "users/another/logos/file.png"}, {"bannerKey": "https://example.test/x"},
     {"appearance": {"colors": {"primary": "red", "accent": "#ffffff"}, "themeMode": "light"}},
 ])
 def test_rejects_invalid_presentation(changes):
     with pytest.raises(forms.FormError):
         forms.validate_config({**forms.DEFAULT, **changes}, "owner")
+
+
+@pytest.mark.parametrize("omit_language", [False, True])
+def test_saves_and_exposes_default_language(db, meta, omit_language):
+    if omit_language:
+        meta["formConfig"]["defaultLanguage"] = "en"
+    request = draft(meta)
+    if omit_language:
+        request["formConfig"].pop("defaultLanguage")
+    else:
+        request["formConfig"]["defaultLanguage"] = "en"
+    updated = {**meta, "formConfig": {**request["formConfig"], "defaultLanguage": "en"}}
+    db.Table.return_value.update_item.return_value = {"Attributes": updated}
+    assert forms.save(db, meta, request)["formConfig"]["defaultLanguage"] == "en"
+    assert db.Table.return_value.update_item.call_args.kwargs["ExpressionAttributeValues"][":form"]["defaultLanguage"] == "en"
+    assert forms.public_config(updated)["formConfig"]["defaultLanguage"] == "en"
 
 
 def test_question_limits(meta):

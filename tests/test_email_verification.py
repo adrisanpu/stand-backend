@@ -2,6 +2,8 @@ import io
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from email.header import decode_header, make_header
+from email.utils import parseaddr
 from unittest.mock import MagicMock
 
 import pytest
@@ -60,6 +62,7 @@ def rig(monkeypatch):
     monkeypatch.setenv("EMAIL_VERIFICATION_TABLE", "verification")
     monkeypatch.setenv("CLIENT_INDEX_TABLE", "clients")
     monkeypatch.setenv("EMAIL_SENDER_ADDRESS", "no-reply@playstand.app")
+    monkeypatch.delenv("EMAIL_SENDER_NAME", raising=False)
     monkeypatch.setenv("PLAYER_TOKEN_SECRET", SECRET)
     monkeypatch.setenv("EMAIL_MAX_PER_HOUR", "5")
     monkeypatch.setenv("EMAIL_IP_MAX_PER_HOUR", "3000")
@@ -144,7 +147,7 @@ def test_resume_unknown_email_requests_details_without_email_or_personal_data(ri
     assert response["statusCode"] == 200
     body = response_body(response)
     assert body == {
-        "ok": True, "detailsRequired": True, "existingPlayer": False,
+        "ok": True, "detailsRequired": True, "existingPlayer": False, "knownClient": False,
         "fields": {"username": True, "phone": True, "consent": True, "loyaltyConsent": False},
     }
     assert rig["ses"].sent == []
@@ -169,6 +172,53 @@ def test_resume_existing_player_issues_code_and_restores_same_progress(rig):
     assert stored["profilePicUrl"] == player["profilePicUrl"]
     assert stored["type"] == player["type"]
     assert len(rig["dynamo"].rows("players")) == 1
+
+
+def seed_client_profile(rig, owner="owner", **overrides):
+    from stand_common import client_index
+    rig["dynamo"].seed("clients", {
+        "clientId": client_index.client_id(SECRET, owner, EMAIL), "recordKey": client_index.PROFILE_KEY,
+        "ownerUserId": owner, "email": EMAIL, "name": "Known", "phone": "+34612345678",
+        "participationCount": 1, **overrides,
+    })
+
+
+def test_resume_known_client_of_same_owner_gets_code_without_details(rig):
+    seed_client_profile(rig)
+    body = response_body(resume_request())
+    assert set(body) == {"ok", "challengeId", "emailMasked", "expiresAt", "resendAvailableAt"}
+    assert "Known" not in json.dumps(body)
+    joined = join(rig, body["challengeId"], sent_code(rig))
+    assert joined["statusCode"] == 200
+    assert response_body(joined)["alreadyJoined"] is False
+    player = rig["dynamo"].rows("players")[0]
+    assert (player["username"], player["phone"], player["email"]) == ("Known", "+34612345678", EMAIL)
+    assert player["verificationMethod"] == "email-code"
+
+
+def test_resume_known_client_only_asks_missing_required_fields(rig):
+    seed_client_profile(rig, phone=None)
+    game = rig["dynamo"].rows("games")[0]
+    game["gameType"] = "STACK"
+    rig["dynamo"].seed("games", game)
+    body = response_body(resume_request())
+    assert body["knownClient"] is True and body["existingPlayer"] is False
+    assert body["fields"]["username"] is False and body["fields"]["consent"] is False
+    assert body["fields"]["phone"] is True
+    assert resume_request(username="Other")["statusCode"] == 400
+    assert rig["ses"].sent == []
+    response = resume_request(phone="+34 612345678")
+    assert response["statusCode"] == 200
+    join(rig, response_body(response)["challengeId"], sent_code(rig))
+    assert rig["dynamo"].rows("players")[0]["username"] == "Known"
+
+
+def test_resume_ignores_client_profile_from_another_owner(rig):
+    seed_client_profile(rig, owner="someone-else")
+    body = response_body(resume_request())
+    assert body["knownClient"] is False
+    assert body["fields"]["username"] is True and body["fields"]["consent"] is True
+    assert rig["ses"].sent == []
 
 
 def test_resume_does_not_reuse_another_games_registration(rig):
@@ -290,6 +340,26 @@ def test_resume_delivery_failure_returns_error_not_details_or_access(rig):
 
 def join(rig, challenge_id, code, game_id=GAME_ID):
     return api_call("join", {"gameId": game_id, "challengeId": challenge_id, "code": code})
+
+
+def test_verification_sender_uses_configured_display_name(rig, monkeypatch):
+    monkeypatch.setenv("EMAIL_SENDER_NAME", "Premios España")
+    response = request_code()
+    assert response["statusCode"] == 200
+    sent = rig["ses"].sent[0]
+    name, address = parseaddr(sent["Source"])
+    assert str(make_header(decode_header(name))) == "Premios España"
+    assert address == "no-reply@playstand.app"
+    assert sent["Destination"]["ToAddresses"] == [EMAIL]
+
+
+def test_verification_rejects_invalid_sender_before_creating_challenge(rig, monkeypatch):
+    monkeypatch.setenv("EMAIL_SENDER_NAME", "STAND\nBcc: other@example.test")
+    response = request_code()
+    assert response["statusCode"] == 503
+    assert response_body(response)["error"] == "VerificationUnavailable"
+    assert rig["ses"].sent == []
+    assert rig["dynamo"].rows("verification") == []
 
 
 @pytest.mark.parametrize("sender", ["contact@playstand.app", "no-reply@playstand.app"])

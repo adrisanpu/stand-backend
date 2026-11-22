@@ -40,6 +40,22 @@ Create secrets (Stripe **test mode** keys recommended for dev):
 
 Same JSON shape as the prod secrets under `stand/prod/*`.
 
+The default Stripe store remains Secrets Manager. To use Parameter Store, first
+provision `/stand/dev/stripe` as a standard `SecureString` containing the same
+JSON, without exposing its value in commands or logs. Then deploy with
+`StripeCredentialsStore=parameter`. Both billing Lambdas must be redeployed;
+test checkout and webhooks before scheduling the original secret for deletion.
+Revert the setting to `secretsmanager` while the original secret remains
+available if rollback is needed. The equivalent production parameter is
+`/stand/prod/stripe`. Parameter values must fit within 4 KiB; KMS and Parameter
+Store permissions and charges also apply.
+
+`scripts/migrate_stripe_parameter.py --environment dev` checks the source
+without changing AWS. Add `--apply` only when authorized to create the
+parameter; it refuses to overwrite an existing parameter or delete the source.
+Run it with the configured AWS profile and region, and verify that the source
+has not changed between copying and switching stores.
+
 ### Participant signing
 
 The SAM `PlayerTokenSecret` parameter is required and has no default. Supply a

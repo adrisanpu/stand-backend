@@ -61,19 +61,27 @@ account connection and consent; no browser-supplied customer ID grants membershi
 
 ## Credentials and isolation
 
-Each connection/reconnection creates a new immutable secret:
-`stand/{env}/kivly/{sha256(organizer-id)}/{random-version}`. The user record stores
-only its private ARN, authorized location/owner, version and shared club settings.
+By default, each connection/reconnection creates a new immutable Secrets Manager
+secret: `stand/{env}/kivly/{sha256(organizer-id)}/{random-version}`. With the SAM
+parameter `KivlyCredentialsStore=parameter`, new connections instead create an
+SSM `SecureString` standard parameter under the same path prefixed with `/`.
+Existing Secrets Manager connections remain readable until reconnected. The user
+record stores only its private credential reference, authorized location/owner,
+version and shared club settings.
 Conditional version checks prevent concurrent updates from silently overwriting
-one another. Replaced/disconnected secrets are scheduled for deletion with seven
-days' recovery; cleanup failure is explicitly reported.
+one another. Replaced/disconnected Secrets Manager secrets are normally scheduled
+for deletion with seven days' recovery. When a connection moves from Secrets
+Manager to Parameter Store, the old secret is retained and a cleanup warning is
+returned; verify it is no longer needed before separately scheduling deletion.
+Replaced/disconnected Parameter Store parameters are deleted immediately and
+cannot be recovered. Cleanup failure is explicitly reported.
 
 An uncertain account write keeps its new secret for reconciliation rather than
 deleting a secret that a successful-but-unacknowledged write might reference.
 Investigate `KivlyConnectionReconciliationRequired`; do not silently discard it.
 
 The account-management role can create/read/delete only this environment's
-Kivly secrets. The assignment and public roles can read those secrets and
+Kivly secrets or parameters. The assignment and public roles can read them and
 get/put/update the registration table for their respective registration and
 completion-reward flows. Non-STACK public flows skip integration lookup entirely.
 The STACK delivery worker reads the same scoped connection and secrets, consumes

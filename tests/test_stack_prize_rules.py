@@ -22,7 +22,7 @@ LEGACY_PROGRAM = {"version": 1, "storefrontUrl": "https://example.kivly.store", 
 ]}
 PROGRAM = prizes.upgrade_program(LEGACY_PROGRAM)
 META = {"gameId": "ABC123", "ownerUserId": "owner", "gameType": "STACK", "isActive": True,
-        "stackPrizeProgram": PROGRAM}
+        "stackPrizeProgram": PROGRAM, "prizeNotification": {"play": True, "email": True}}
 PLAYER = {"gameId": "ABC123", "playerId": 1, "username": "Player",
           "kivly": {"membership": {"locationId": "loc", "customerId": "customer"}},
           "type": {"STACK": {}}}
@@ -412,18 +412,19 @@ def test_retried_finish_does_not_change_score_or_grant_again(rig):
 
 def test_finish_enqueues_only_after_committing_outbox(rig, monkeypatch):
     queue = MagicMock()
-    monkeypatch.setenv("STACK_PRIZES_QUEUE", "queue-url")
+    monkeypatch.setenv("STACK_PRIZES_FUNCTION", "delivery-fn")
     monkeypatch.setattr(prizes.boto3, "client", lambda service: queue)
     def sent(**message):
-        key = json.loads(message["MessageBody"])
+        key = json.loads(message["Payload"])
         row = rig.Table("prizes").get_item(Key=key)["Item"]
         assert row["kind"] == "grant" and row["work"] == "pending"
         assert player(rig)["type"]["STACK"]["attempt"]["status"] == "finished"
-    queue.send_message.side_effect = sent
+    queue.invoke.side_effect = sent
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
     finish(rig)
-    queue.send_message.assert_called_once()
-    assert queue.send_message.call_args.kwargs["QueueUrl"] == "queue-url"
+    queue.invoke.assert_called_once()
+    assert queue.invoke.call_args.kwargs["FunctionName"] == "delivery-fn"
+    assert queue.invoke.call_args.kwargs["InvocationType"] == "Event"
 
 
 def test_failed_finish_transaction_never_enqueues(rig, monkeypatch):
@@ -440,8 +441,8 @@ def test_failed_finish_transaction_never_enqueues(rig, monkeypatch):
 
 def test_enqueue_failure_keeps_successful_finish_and_recoverable_job(rig, monkeypatch):
     queue, logger = MagicMock(), MagicMock()
-    queue.send_message.side_effect = FakeDynamoError("ServiceUnavailable")
-    monkeypatch.setenv("STACK_PRIZES_QUEUE", "queue-url")
+    queue.invoke.side_effect = FakeDynamoError("ServiceUnavailable")
+    monkeypatch.setenv("STACK_PRIZES_FUNCTION", "delivery-fn")
     monkeypatch.setattr(prizes.boto3, "client", lambda service: queue)
     monkeypatch.setattr(prizes, "log", logger)
     prizes.start(rig, meta(rig), player(rig), ATTEMPT)
@@ -450,9 +451,9 @@ def test_enqueue_failure_keeps_successful_finish_and_recoverable_job(rig, monkey
     assert task["work"] == "pending" and task["dueAt"] == 0
     logger.assert_called_once()
     worker = delivery_module(monkeypatch, rig)
-    queue.send_message.side_effect = None
+    queue.invoke.side_effect = None
     worker.dispatch()
-    assert queue.send_message.call_count == 2
+    assert queue.invoke.call_count == 2
     assert rig.Table("prizes").get_item(Key={"gameId": task["gameId"], "id": task["id"]})["Item"]["dueAt"] > 0
 
 
@@ -472,24 +473,20 @@ def test_allocation_immediately_enqueues_committed_delivery_and_email_awards(rig
     assert len(sent) == 2
 
 
-def test_enqueue_preserves_customer_fifo_and_stable_deduplication(monkeypatch):
-    queue = MagicMock()
-    monkeypatch.setenv("STACK_PRIZES_QUEUE", "queue-url")
-    monkeypatch.setattr(prizes.boto3, "client", lambda service: queue)
-    monkeypatch.setattr(prizes.time, "time", lambda: 120)
+def test_enqueue_async_invokes_delivery_with_row_key_only(monkeypatch):
+    queue, services = MagicMock(), []
+    monkeypatch.setenv("STACK_PRIZES_FUNCTION", "delivery-fn")
+    monkeypatch.setattr(prizes.boto3, "client", lambda service: services.append(service) or queue)
     row = {"gameId": "ABC123", "id": "award_1", "customerId": "customer"}
     assert prizes.enqueue(row)
-    assert prizes.enqueue(row)
-    first, second = [call.kwargs for call in queue.send_message.call_args_list]
-    assert first == second
-    assert prizes.enqueue({**row, "id": "award_2"})
-    third = queue.send_message.call_args.kwargs
-    assert first["MessageGroupId"] == third["MessageGroupId"]
-    assert first["MessageDeduplicationId"] != third["MessageDeduplicationId"]
+    assert services == ["lambda"]
+    call = queue.invoke.call_args.kwargs
+    assert call["FunctionName"] == "delivery-fn" and call["InvocationType"] == "Event"
+    assert json.loads(call["Payload"]) == {"gameId": "ABC123", "id": "award_1"}
 
 
 def test_missing_queue_configuration_is_logged(monkeypatch):
-    monkeypatch.delenv("STACK_PRIZES_QUEUE", raising=False)
+    monkeypatch.delenv("STACK_PRIZES_FUNCTION", raising=False)
     logger = MagicMock()
     monkeypatch.setattr(prizes, "log", logger)
     assert not prizes.enqueue({"gameId": "ABC123", "id": "job_1"})
@@ -511,10 +508,10 @@ def test_finish_without_completion_rules_does_not_enqueue(rig, monkeypatch):
 def test_finish_to_delivery_runs_from_queue_without_scheduler(rig, monkeypatch):
     worker = delivery_module(monkeypatch, rig)
     queue, client = MagicMock(), MagicMock()
-    monkeypatch.setenv("STACK_PRIZES_QUEUE", "queue-url")
+    monkeypatch.setenv("STACK_PRIZES_FUNCTION", "delivery-fn")
     monkeypatch.setattr(prizes.boto3, "client", lambda service: queue)
     messages = []
-    queue.send_message.side_effect = lambda **message: messages.append(message["MessageBody"])
+    queue.invoke.side_effect = lambda **message: messages.append(message["Payload"])
     redemptions = []
     client.customer_rewards.side_effect = lambda *_: deepcopy(redemptions)
     def earn(*_):
@@ -664,6 +661,50 @@ def process_grants(rig, monkeypatch):
     for row in prizes.records(rig, "ABC123"):
         if row.get("kind") == "grant":
             worker.grant(row)
+
+
+def test_prize_notification_defaults_to_play_only_and_skips_email(rig):
+    assert prizes.notification_channels({}) == {"play": True, "email": False}
+    assert prizes.notification_channels({"prizeNotification": {"play": False, "email": False}}) == {
+        "play": True, "email": False}
+    assert prizes.notification_channels({"prizeNotification": {"play": False, "email": True}}) == {
+        "play": False, "email": True}
+    assert prizes.validate_notification({"play": True, "email": True}) == {"play": True, "email": True}
+    for bad in ({"play": False, "email": False}, {"play": "yes", "email": True}, {"play": True}, [], None,
+                {"play": True, "email": False, "sms": True}):
+        with pytest.raises(prizes.PrizeError):
+            prizes.validate_notification(bad)
+    game = {k: v for k, v in meta(rig).items() if k != "prizeNotification"}
+    stand = next(p for p in PROGRAM["catalog"] if p["source"] == "stand")
+    row = prizes.award_units(game, player(rig), {"id": "rule", "condition": "completed"}, stand, 1)[0]
+    assert row["state"] == "available"
+    assert "emailState" not in row and "work" not in row
+
+
+def test_disabled_email_channel_clears_pending_email_without_sending(rig, monkeypatch):
+    worker = delivery_module(monkeypatch, rig)
+    game = meta(rig)
+    game["prizeNotification"] = {"play": True, "email": False}
+    rig.Table("games").put_item(Item=game)
+    stand = next(p for p in PROGRAM["catalog"] if p["source"] == "stand")
+    row = prizes.award_units({**game, "prizeNotification": {"play": True, "email": True}}, player(rig),
+                             {"id": "rule", "condition": "completed"}, stand, 1)[0]
+    rig.Table("prizes").put_item(Item=row)
+    monkeypatch.setattr(worker, "build_reward_message", lambda *_, **__: pytest.fail("email must not be built"))
+    worker.notify(row)
+    saved = rig.Table("prizes").get_item(Key={"gameId": "ABC123", "id": row["id"]})["Item"]
+    assert "emailState" not in saved and "work" not in saved and saved["state"] == "available"
+
+
+def test_public_awards_report_pending_until_grant_job_is_processed(rig, monkeypatch):
+    monkeypatch.setattr(prizes.registration, "connection", lambda *_: None)
+    monkeypatch.setattr(prizes, "enqueue", lambda *_: True)
+    prizes.start(rig, meta(rig), player(rig), ATTEMPT)
+    finish(rig)
+    assert prizes.public_awards(rig, meta(rig), player(rig), lambda _: "t")["pending"] is True
+    process_grants(rig, monkeypatch)
+    result = prizes.public_awards(rig, meta(rig), player(rig), lambda _: "t")
+    assert result["pending"] is any(a["state"] == "queued" for a in result["awards"])
 
 
 def test_worker_earns_once_without_browser_and_handles_multiple_identical_rewards(rig, monkeypatch):

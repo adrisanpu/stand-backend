@@ -15,7 +15,7 @@ from boto3.dynamodb.conditions import Key
 from botocore.exceptions import BotoCoreError, ClientError
 
 from stand_common import kivly_registration as registration
-from stand_common import prize_inventory
+from stand_common import prize_inventory, stack_auto_close
 from stand_common.kivly import reward_image_url
 from stand_common.prizes import prize_image_key
 from stand_common.stack import get_ranking
@@ -37,19 +37,35 @@ def table(dynamo):
     return dynamo.Table(os.environ["STACK_PRIZES_TABLE"])
 
 
+def notification_channels(meta):
+    """Effective prize notification channels; /play only unless the operator opted into email."""
+    raw = (meta or {}).get("prizeNotification")
+    raw = raw if isinstance(raw, dict) else {}
+    play = raw.get("play", True) is not False
+    email = raw.get("email") is True
+    return {"play": play or not email, "email": email}
+
+
+def validate_notification(value):
+    if (not isinstance(value, dict) or set(value) - {"play", "email"}
+            or type(value.get("play")) is not bool or type(value.get("email")) is not bool):
+        raise PrizeError("InvalidPrizeNotification", 400)
+    if not value["play"] and not value["email"]:
+        raise PrizeError("PrizeNotificationChannelRequired", 400)
+    return {"play": value["play"], "email": value["email"]}
+
+
 def enqueue(row):
-    queue_url = os.environ.get("STACK_PRIZES_QUEUE")
-    if not queue_url:
+    """Hand a committed outbox row to the delivery worker via async Lambda invoke (no SQS polling cost)."""
+    function_name = os.environ.get("STACK_PRIZES_FUNCTION")
+    if not function_name:
         log("stack_prize_enqueue_failed", {"gameId": row["gameId"], "code": "MissingQueueConfiguration"})
         return False
-    group = row.get("customerId") or row["gameId"]
     try:
-        boto3.client("sqs").send_message(
-            QueueUrl=queue_url,
-            MessageBody=json.dumps({"gameId": row["gameId"], "id": row["id"]}),
-            MessageGroupId=hashlib.sha256(group.encode()).hexdigest(),
-            MessageDeduplicationId=hashlib.sha256(
-                f"{row['gameId']}:{row['id']}:{int(time.time()) // 60}".encode()).hexdigest(),
+        boto3.client("lambda").invoke(
+            FunctionName=function_name,
+            InvocationType="Event",
+            Payload=json.dumps({"gameId": row["gameId"], "id": row["id"]}).encode(),
         )
     except (BotoCoreError, ClientError) as exc:
         # The committed outbox remains pending for scheduled recovery.
@@ -543,7 +559,7 @@ def award_units(meta, player, rule, prize, quantity, job_id=None):
                 row["customerId"] = membership["customerId"]
                 row["work"] = "pending"
                 row["dueAt"] = 0
-        elif prize["source"] == "stand" and row["state"] == "available":
+        elif prize["source"] == "stand" and row["state"] == "available" and notification_channels(meta)["email"]:
             row["emailState"] = "pending"
             row["work"] = "pending"
             row["dueAt"] = 0
@@ -721,7 +737,7 @@ def allocate_rule(dynamo, meta, player, program, rule, job_id, rank=None, existi
 
 
 def start(dynamo, meta, player, attempt):
-    if meta.get("stackPrizeState", "open") != "open":
+    if meta.get("stackPrizeState", "open") != "open" or stack_auto_close.starts_closed(meta):
         raise PrizeError("StackClosing")
     if "stackPrizeProgram" in meta:
         attempt = {**attempt, "prizeProgram": upgrade_program(meta["stackPrizeProgram"])}
@@ -745,7 +761,8 @@ def finish(dynamo, meta, player, final_attempt, score):
     ranking = sorted([r for r in ranking if r["playerId"] != candidate["playerId"]] + [candidate],
                      key=lambda r: (-r["score"], r["finishedAt"], r["playerId"]))
     rank = next(i for i, row in enumerate(ranking, 1) if row["playerId"] == candidate["playerId"])
-    program = upgrade_program(final_attempt.get("prizeProgram", meta.get("stackPrizeProgram") or legacy_program(meta)))
+    snapshot = final_attempt.get("prizeProgram")
+    program = upgrade_program(snapshot) if snapshot is not None else None
     values = {":attempt": final_attempt, ":score": score, ":rank": rank,
               ":now": final_attempt["finishedAt"], ":started": "started",
               ":id": final_attempt["attemptId"]}
@@ -757,13 +774,16 @@ def finish(dynamo, meta, player, final_attempt, score):
         "ExpressionAttributeValues": values}}
     operations = [game_update(meta, ""), op]
     task = None
-    if any(rule["condition"] in {"completed", "top_finish", "score"} for rule in program["rules"]):
+    if program and any(rule["condition"] in {"completed", "top_finish", "score"} for rule in program["rules"]):
         task = job(meta, "finish", [{"playerId": int(player["playerId"]), "rank": rank, "score": score}])
         task["id"] = "job_" + hashlib.sha256(json.dumps([
             meta["gameId"], int(player["playerId"]), final_attempt["attemptId"],
         ]).encode()).hexdigest()
         task["program"] = program
         operations.append(put(task))
+    deadline = stack_auto_close.finish_deadline(meta)
+    if deadline is not None and time.time() >= deadline:
+        raise PrizeError("StackClosed")
     transact(dynamo, operations)
     if task:
         enqueue(task)
@@ -776,16 +796,19 @@ def job(meta, condition, winner_ids):
             "winners": winner_ids, "ownerUserId": meta["ownerUserId"], "work": "pending", "dueAt": 0}
 
 
-def close(dynamo, meta, excluded):
+def close(dynamo, meta, excluded, *, expire_pending=False):
     if meta.get("stackPrizeState") == "closed":
         return
     if meta.get("stackPrizeState", "open") == "open":
         from stand_common import game_lifecycle
         game_lifecycle.change_active(dynamo, meta, False)
         raise PrizeError("StackClosingStarted")
+    cycle = meta.get("closeCycle")
     all_players = players(dynamo, meta["gameId"])
     pending = [p for p in all_players if get_game_type_blob(p, "STACK").get("attempt", {}).get("status") == "started"]
     pending_ids = {int(p["playerId"]) for p in pending}
+    if expire_pending:
+        excluded = pending_ids
     if set(excluded) - pending_ids:
         raise PrizeError("StackPendingChanged")
     for player in pending:
@@ -800,10 +823,11 @@ def close(dynamo, meta, excluded):
         transact(dynamo, [game_update(meta, ""), op])
         meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
             Key={"gameId": meta["gameId"]}, ConsistentRead=True)["Item"]
+        if meta.get("stackPrizeState") != "closing" or meta.get("closeCycle") != cycle:
+            return
     if pending_ids - set(excluded):
         return
     ranking = get_ranking(meta["gameId"], dynamo.Table(os.environ["GAMEPLAYER_TABLE"]), None)["results"]
-    cycle = meta.get("closeCycle")
     chunks = [ranking[index:index + 100] for index in range(0, len(ranking), 100)] or [[]]
     for index, chunk in enumerate(chunks):
         task = job(meta, "top_final", [{"playerId": r["playerId"], "rank": r["rank"], "score": r["score"]}
@@ -876,8 +900,14 @@ def public_awards(dynamo, meta, player, issue_token):
     channel = "wallet"
     closing = meta.get("lifecycleState") == "closing"
     program = meta.get("stackPrizeProgram") or legacy_program(meta)
+    player_id = int(player["playerId"])
+    pending = any(
+        row.get("kind") == "grant" and row.get("work") == "pending" and not row.get("closure")
+        and any(int(w.get("playerId", -1)) == player_id for w in row.get("winners") or [])
+        for row in rows
+    ) or any(a["state"] == "queued" for a in awards)
     return {"awards": awards, "walletUrl": wallet_link(dynamo, meta, player), "deliveryChannel": channel,
-            "inventoryReasons": reasons,
+            "inventoryReasons": reasons, "pending": pending,
             "walletExpected": bool((player.get("kivly") or {}).get("membership")) or any(
                 p["source"] == "kivly" for p in program["catalog"]),
             "state": "closing" if closing else meta.get("stackPrizeState", "open"),
@@ -956,3 +986,105 @@ def redeem(dynamo, game_id, player_id, award_id):
             raise PrizeError("AlreadyDelivered") from None
         raise
     return {"name": row["prize"]["name"], "limit": None, "imageUrl": image_url(row["prize"])}
+
+RELEASABLE_STATES = {"stand": {"available"}, "kivly": {"connection_required"}}
+
+
+def releasable(row):
+    """Unredeemed awards that never reached the player or an external wallet."""
+    return row.get("state") in RELEASABLE_STATES.get((row.get("prize") or {}).get("source"), set())
+
+
+def release_player(dynamo, meta, player_id, rows=None):
+    """Plan the writes that void a removed player's unredeemed awards and return their stock.
+
+    Game-table changes are returned as SET clauses so the caller can merge them into
+    the single game update of its transaction (DynamoDB forbids two writes per item).
+    """
+    rows = records(dynamo, meta["gameId"]) if rows is None else rows
+    awards = [r for r in rows if r.get("id", "").startswith("award_") and r.get("playerId") == player_id]
+    voided = [r for r in awards if releasable(r)]
+    kept_rules = {r.get("ruleId") for r in awards if not releasable(r)}
+    operations = [{"Delete": {
+        "TableName": os.environ["STACK_PRIZES_TABLE"], "Key": {"gameId": meta["gameId"], "id": r["id"]},
+        "ConditionExpression": "#s = :releasedState",
+        "ExpressionAttributeNames": {"#s": "state"},
+        "ExpressionAttributeValues": {":releasedState": r["state"]},
+    }} for r in voided]
+    operations.extend({"Delete": {
+        "TableName": os.environ["STACK_PRIZES_TABLE"], "Key": {"gameId": meta["gameId"], "id": r["id"]},
+    }} for r in rows if r.get("kind") == "allocation" and r.get("playerId") == player_id
+        and r.get("ruleId") not in kept_rules)
+    sets, values, names, conditions = [], {}, {}, []
+    counts = {}
+    for row in voided:
+        counts[row["prize"]["id"]] = counts.get(row["prize"]["id"], 0) + 1
+    stock = meta.get("stackPrizeStock")
+    if isinstance(stock, dict) and any(pid in stock for pid in counts):
+        released = deepcopy(stock)
+        for pid, count in counts.items():
+            entry = released.get(pid)
+            if entry and entry.get("total") is not None:
+                entry["remaining"] = min(entry["total"], entry["remaining"] + count)
+        sets.append("stackPrizeStock = :releasedStock")
+        values[":releasedStock"] = released
+    native = [r for r in voided if str(r.get("ruleId", "")).startswith("native_")]
+    for index, pid in enumerate(sorted({r["prize"]["id"] for r in native})):
+        attribute = "nativePrizeClaim_" + pid
+        if attribute not in meta:
+            continue
+        names[f"#releasedClaim{index}"] = attribute
+        values[f":releasedClaim{index}"] = max(0, int(meta[attribute]) - counts[pid])
+        values[f":previousClaim{index}"] = meta[attribute]
+        sets.append(f"#releasedClaim{index} = :releasedClaim{index}")
+        conditions.append(f"#releasedClaim{index} = :previousClaim{index}")
+    if prize_inventory.enabled():
+        operations.extend(_release_inventory(dynamo, meta, [r for r in voided if r.get("inventoryMovementKey")]))
+    return {"operations": operations, "sets": sets, "values": values, "names": names,
+            "conditions": conditions, "voided": voided}
+
+
+def _release_inventory(dynamo, meta, rows):
+    operations, balances, movements = [], {}, {}
+    for row in rows:
+        movements.setdefault(row["inventoryMovementKey"], []).append(row)
+        field = "historicalAssigned" if row.get("inventoryEra") == "historical" else "assigned"
+        balances.setdefault(row["inventoryPrizeId"], {}).setdefault(field, 0)
+        balances[row["inventoryPrizeId"]][field] += 1
+    for pid, released in balances.items():
+        old = prize_inventory.balance(dynamo, meta["ownerUserId"], pid)
+        operations.append(prize_inventory.snapshot_put(
+            {**old, **{field: max(0, old[field] - count) for field, count in released.items()}}, old))
+    for key, units in movements.items():
+        names = {"#state": "state", **{f"#unit{i}": row["id"] for i, row in enumerate(units)}}
+        operations.append({"Update": {
+            "TableName": os.environ["PRIZE_INVENTORY_TABLE"],
+            "Key": {"ownerId": meta["ownerUserId"], "key": key},
+            "UpdateExpression": "SET " + ", ".join(f"units.#unit{i}.#state = :voided" for i in range(len(units))),
+            "ConditionExpression": " AND ".join(f"attribute_exists(units.#unit{i})" for i in range(len(units))),
+            "ExpressionAttributeNames": names, "ExpressionAttributeValues": {":voided": "voided"},
+        }})
+    return operations
+
+
+def reassign_ranking(dynamo, meta):
+    """After a removal, give live top_finish prizes to players who moved into the top."""
+    if meta.get("gameType") != "STACK" or meta.get("stackPrizeState", "open") != "open":
+        return None
+    program = upgrade_program(meta.get("stackPrizeProgram") or legacy_program(meta))
+    rules = [r for r in program["rules"] if r["condition"] == "top_finish"]
+    if not rules:
+        return None
+    ranking = get_ranking(meta["gameId"], dynamo.Table(os.environ["GAMEPLAYER_TABLE"]), None)["results"]
+    awarded = {(int(r["playerId"]), r.get("ruleId")) for r in records(dynamo, meta["gameId"])
+               if r.get("id", "").startswith("award_")}
+    winners = [{"playerId": row["playerId"], "rank": row["rank"], "score": row["score"]}
+               for row in ranking
+               if any(row["rank"] <= rule["topX"] and (row["playerId"], rule["id"]) not in awarded
+                      for rule in rules)]
+    if not winners:
+        return None
+    task = {**job(meta, "top_finish", winners), "program": program}
+    table(dynamo).put_item(Item=task, ConditionExpression="attribute_not_exists(id)")
+    enqueue(task)
+    return task

@@ -74,6 +74,7 @@ def email_rig(rig, monkeypatch):
     worker = delivery_module(monkeypatch, rig)
     monkeypatch.setenv("STACK_REWARD_EMAIL_ENABLED", "true")
     monkeypatch.setenv("EMAIL_SENDER_ADDRESS", "no-reply@example.test")
+    monkeypatch.delenv("EMAIL_SENDER_NAME", raising=False)
     monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://api.example.test/prod")
     monkeypatch.setenv("PLAYER_TOKEN_SECRET", "test-token-secret")
     monkeypatch.setattr(worker, "BotoCoreError", OSError)
@@ -150,8 +151,9 @@ def test_survey_holds_stand_email_without_losing_award(email_rig):
         prizes.redeem(rig, game["gameId"], 1, row["id"])
 
 
-def test_email_is_sent_after_earn_once_with_kivly_wallet_link(email_rig):
+def test_email_is_sent_after_earn_once_with_kivly_wallet_link(email_rig, monkeypatch):
     worker, rig, row, client, ses = email_rig
+    monkeypatch.setenv("EMAIL_SENDER_NAME", "Premios España")
     process(worker, row)
     ses.send_raw_email.assert_not_called()
     assert stored(rig, row)["state"] == "confirmed"
@@ -168,7 +170,10 @@ def test_email_is_sent_after_earn_once_with_kivly_wallet_link(email_rig):
     client.find_customer.assert_not_called()
     sent = ses.send_raw_email.call_args.kwargs
     assert sent["Destinations"] == ["verified@example.test"]
+    assert sent["Source"] == "no-reply@example.test"
     message = BytesParser(policy=policy.default).parsebytes(sent["RawMessage"]["Data"])
+    assert message["From"].addresses[0].display_name == "Premios España"
+    assert message["From"].addresses[0].addr_spec == "no-reply@example.test"
     html = message.get_body(preferencelist=("html",)).get_content()
     assert "Kivly Wallet" in html
     assert "add-to-wallet?customer_id=customer&amp;location_id=loc" in html
@@ -183,8 +188,9 @@ def test_email_is_sent_after_earn_once_with_kivly_wallet_link(email_rig):
     assert "verified@example.test" not in json.dumps(public)
 
 
-def test_stand_award_email_omits_wallet_passes_and_keeps_redeem_qr(email_rig):
+def test_stand_award_email_omits_wallet_passes_and_keeps_redeem_qr(email_rig, monkeypatch):
     worker, rig, _, client, ses = email_rig
+    monkeypatch.setenv("EMAIL_SENDER_NAME", "STAND, Premios")
     row = prizes.award_units(
         meta(rig), player(rig), PROGRAM["rules"][0], PROGRAM["catalog"][0], 1,
     )[0]
@@ -198,7 +204,10 @@ def test_stand_award_email_omits_wallet_passes_and_keeps_redeem_qr(email_rig):
     client.earn_reward.assert_not_called()
     ses.send_raw_email.assert_called_once()
     sent = ses.send_raw_email.call_args.kwargs
+    assert sent["Source"] == "no-reply@example.test"
     message = BytesParser(policy=policy.default).parsebytes(sent["RawMessage"]["Data"])
+    assert message["From"].addresses[0].display_name == "STAND, Premios"
+    assert message["From"].addresses[0].addr_spec == "no-reply@example.test"
     html = message.get_body(preferencelist=("html",)).get_content()
     text = message.get_body(preferencelist=("plain",)).get_content()
     assert "Apple Wallet" not in html and "Google Wallet" not in html
@@ -208,6 +217,21 @@ def test_stand_award_email_omits_wallet_passes_and_keeps_redeem_qr(email_rig):
                     if part.get_content_type() == "image/png"
                     and str(part["Content-ID"]) == "<reward-qr>")
     assert qr_image.get_payload(decode=True).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_reward_email_rejects_invalid_sender_name(email_rig, monkeypatch):
+    worker, rig, _, _, ses = email_rig
+    monkeypatch.setenv("EMAIL_SENDER_NAME", "STAND\nBcc: other@example.test")
+    row = prizes.award_units(
+        meta(rig), player(rig), PROGRAM["rules"][0], PROGRAM["catalog"][0], 1,
+    )[0]
+    rig.Table("prizes").put_item(Item=row)
+
+    process(worker, row)
+
+    ses.send_raw_email.assert_not_called()
+    assert stored(rig, row)["emailState"] == "failed"
+    assert stored(rig, row)["emailError"] == "RewardEmailUnavailable"
 
 
 @pytest.mark.parametrize("game_type", [
@@ -234,6 +258,8 @@ def test_native_stand_reward_email_uses_shared_format_for_every_game(email_rig, 
     message = BytesParser(policy=policy.default).parsebytes(
         ses.send_raw_email.call_args.kwargs["RawMessage"]["Data"],
     )
+    assert message["From"].addresses[0].display_name == ""
+    assert message["From"].addresses[0].addr_spec == "no-reply@example.test"
     html = message.get_body(preferencelist=("html",)).get_content()
     text = message.get_body(preferencelist=("plain",)).get_content()
     assert "Tu premio STAND / Your STAND reward: Coffee" in str(message["Subject"])

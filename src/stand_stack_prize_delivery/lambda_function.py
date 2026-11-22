@@ -12,6 +12,7 @@ from stand_common import kivly_registration as registration
 from stand_common import stack_prizes as prizes
 from stand_common import game_lifecycle
 from stand_common import game_forms
+from stand_common.email_sender import format_sender
 from stand_common.reward_email import build_reward_message
 from stand_common.utils import _iso_now, is_valid_email, issue_prize_token, log
 
@@ -55,6 +56,26 @@ def _award_player(dynamo, row):
     return dynamo.Table(os.environ["GAMEPLAYER_TABLE"]).get_item(
         Key={"gameId": row["gameId"], "playerId": row["playerId"]}, ConsistentRead=True,
     ).get("Item") or {}
+
+
+def _email_disabled(row):
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item") or {}
+    if not meta or prizes.notification_channels(meta)["email"]:
+        return False
+    try:
+        prizes.table(dynamo).update_item(
+            Key={"gameId": row["gameId"], "id": row["id"]},
+            UpdateExpression="REMOVE emailState, emailError, #w, dueAt",
+            ConditionExpression="emailState = :pending",
+            ExpressionAttributeNames={"#w": "work"},
+            ExpressionAttributeValues={":pending": "pending"},
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+    return True
 
 
 def _pause_for_quiz(row):
@@ -237,7 +258,7 @@ def dispatch():
         Limit=100,
     )
     for row in page.get("Items", []):
-        if _pause_if_archived(row):
+        if row.get("kind") != "auto_close" and _pause_if_archived(row):
             continue
         if not prizes.enqueue(row):
             continue
@@ -246,7 +267,10 @@ def dispatch():
                 Key={"gameId": row["gameId"], "id": row["id"]},
                 UpdateExpression="SET dueAt = :later",
                 ConditionExpression="#w = :pending", ExpressionAttributeNames={"#w": "work"},
-                ExpressionAttributeValues={":later": int(time.time()) + 300, ":pending": "pending"},
+                ExpressionAttributeValues={
+                    ":later": int(time.time()) + (55 if row.get("kind") == "auto_close" or row.get("finishDeadline") else 300),
+                    ":pending": "pending",
+                },
             )
         except ClientError as exc:
             if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
@@ -255,6 +279,11 @@ def dispatch():
 
 def grant(row):
     meta = {"gameId": row["gameId"], "ownerUserId": row["ownerUserId"]}
+    game = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item") or {}
+    if "prizeNotification" in game:
+        meta["prizeNotification"] = game["prizeNotification"]
     program = prizes.upgrade_program(row["program"])
     conditions = {"completed", "top_finish", "score"} if row["condition"] == "finish" else {row["condition"]}
     if row.get("closure"):
@@ -265,7 +294,9 @@ def grant(row):
             Key={"gameId": row["gameId"], "playerId": winner["playerId"]}, ConsistentRead=True,
         ).get("Item")
         if not player:
-            raise prizes.PrizeError("AwardPlayerMissing")
+            # Removed players release their prizes; ranking slots are re-granted separately.
+            log("stack_prize_grant_player_missing", {"gameId": row["gameId"], "playerId": winner["playerId"]})
+            continue
         if (player.get("type") or {}).get("STACK", {}).get("attempt", {}).get("status") == "excluded":
             continue
         if ("top_final" in conditions and not row.get("closure")
@@ -454,6 +485,8 @@ def notify(row):
         return
     if row.get("emailState") != "pending":
         return
+    if _email_disabled(row):
+        return
     if _pause_for_quiz(row):
         return
     if os.environ.get("REWARD_EMAIL_ENABLED", os.environ.get(
@@ -472,6 +505,12 @@ def notify(row):
         return
     sender = os.environ.get("EMAIL_SENDER_ADDRESS")
     if not sender:
+        email_status(key, "failed", "RewardEmailUnavailable")
+        return
+    try:
+        from_header = format_sender(sender, os.environ.get("EMAIL_SENDER_NAME", ""))
+    except ValueError as exc:
+        log("email_sender_configuration_invalid", {"error": str(exc)})
         email_status(key, "failed", "RewardEmailUnavailable")
         return
     try:
@@ -510,7 +549,7 @@ def notify(row):
             email_status(key, "failed", "RewardSourceUnsupported")
             return
         message = build_reward_message(
-            sender, email, player.get("username") or "", prize,
+            from_header, email, player.get("username") or "", prize,
             qr_value=qr_value, wallet_links=links,
             **({"logo_png": logo_png, "prize_image_png": prize_image_png}
                if source == "stand" else {}),
@@ -579,54 +618,77 @@ def notify(row):
     email_status(key, "accepted", message_id=result["MessageId"])
 
 
+class _Deferred(Exception):
+    """Row failed but was rescheduled; do not stop the rest of the batch."""
+
+
+def _process(key):
+    row = None
+    try:
+        row = prizes.table(dynamo).get_item(Key=key, ConsistentRead=True).get("Item")
+        if row and row.get("work") == "pending":
+            if row.get("kind") == "auto_close":
+                game_lifecycle.auto_close(dynamo, row)
+            elif _pause_if_archived(row):
+                return
+            elif row.get("kind") == "lifecycle":
+                game_lifecycle.finish(dynamo, row)
+            elif row.get("kind") == "close":
+                finish_close(row)
+            elif row.get("kind") == "grant":
+                grant(row)
+            elif row.get("emailState") in ("pending", "sending"):
+                notify(row)
+            elif row.get("state") == "confirmed" and row.get("deliveryChannel") == "email":
+                notify(row)
+            else:
+                deliver(row)
+    except (ClientError, registration.KivlyError, registration.RegistrationError, prizes.PrizeError, DeliveryFailure) as exc:
+        stage = getattr(exc, "stage", None)
+        http_status = getattr(exc, "http_status", None)
+        log("stack_prize_delivery_failed", {
+            "code": getattr(exc, "code", str(exc)), "stage": stage, "httpStatus": http_status,
+        })
+        if row and row.get("state") == "queued":
+            current = prizes.table(dynamo).get_item(
+                Key={"gameId": row["gameId"], "id": row["id"]}, ConsistentRead=True,
+            ).get("Item")
+            if current and current.get("state") == "queued":
+                prizes.table(dynamo).update_item(
+                    Key={"gameId": row["gameId"], "id": row["id"]},
+                    UpdateExpression="SET dueAt = :later, lastError = :error, lastErrorStage = :stage, lastErrorHttpStatus = :http",
+                    ExpressionAttributeValues={
+                        ":later": int(time.time()) + max(60, getattr(exc, "retry_after", None) or 300),
+                        ":error": getattr(exc, "code", "DeliveryUnavailable"),
+                        ":stage": stage or "delivery",
+                        ":http": http_status,
+                    },
+                )
+                raise _Deferred() from exc
+        raise
+
+
 def lambda_handler(event, context):
+    if "gameId" in event and "id" in event:
+        # Async invoke from prizes.enqueue; failed rows stay pending for the scheduled dispatcher.
+        try:
+            _process({"gameId": event["gameId"], "id": event["id"]})
+        except _Deferred:
+            pass
+        except (ClientError, registration.KivlyError, registration.RegistrationError, prizes.PrizeError, DeliveryFailure):
+            return {"ok": False}
+        return {"ok": True}
     if "Records" not in event:
         dispatch()
         return {"ok": True}
     failed = []
-    # FIFO stops a customer group at its first failure.
+    # Legacy SQS deliveries still in flight during migration.
     for index, record in enumerate(event["Records"]):
-        row = None
         try:
-            key = json.loads(record["body"])
-            row = prizes.table(dynamo).get_item(Key=key, ConsistentRead=True).get("Item")
-            if row and row.get("work") == "pending":
-                if _pause_if_archived(row):
-                    continue
-                elif row.get("kind") == "lifecycle":
-                    game_lifecycle.finish(dynamo, row)
-                elif row.get("kind") == "close":
-                    finish_close(row)
-                elif row.get("kind") == "grant":
-                    grant(row)
-                elif row.get("emailState") in ("pending", "sending"):
-                    notify(row)
-                elif row.get("state") == "confirmed" and row.get("deliveryChannel") == "email":
-                    notify(row)
-                else:
-                    deliver(row)
-        except (ClientError, registration.KivlyError, registration.RegistrationError, prizes.PrizeError, DeliveryFailure) as exc:
-            stage = getattr(exc, "stage", None)
-            http_status = getattr(exc, "http_status", None)
-            log("stack_prize_delivery_failed", {
-                "code": getattr(exc, "code", str(exc)), "stage": stage, "httpStatus": http_status,
-            })
-            if row and row.get("state") == "queued":
-                current = prizes.table(dynamo).get_item(
-                    Key={"gameId": row["gameId"], "id": row["id"]}, ConsistentRead=True,
-                ).get("Item")
-                if current and current.get("state") == "queued":
-                    prizes.table(dynamo).update_item(
-                        Key={"gameId": row["gameId"], "id": row["id"]},
-                        UpdateExpression="SET dueAt = :later, lastError = :error, lastErrorStage = :stage, lastErrorHttpStatus = :http",
-                        ExpressionAttributeValues={
-                            ":later": int(time.time()) + max(60, getattr(exc, "retry_after", None) or 300),
-                            ":error": getattr(exc, "code", "DeliveryUnavailable"),
-                            ":stage": stage or "delivery",
-                            ":http": http_status,
-                        },
-                    )
-                    continue
+            _process(json.loads(record["body"]))
+        except _Deferred:
+            continue
+        except (ClientError, registration.KivlyError, registration.RegistrationError, prizes.PrizeError, DeliveryFailure):
             failed = [{"itemIdentifier": r["messageId"]} for r in event["Records"][index:]]
             break
     return {"batchItemFailures": failed}

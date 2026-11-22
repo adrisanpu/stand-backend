@@ -37,6 +37,22 @@ Parameters:
     NoEcho: true
     Description: Required private HMAC secret (at least 32 characters) for participant sessions
 
+  StripeCredentialsStore:
+    Type: String
+    Default: secretsmanager
+    AllowedValues:
+      - secretsmanager
+      - parameter
+    Description: Credential store used by Stripe billing functions
+
+  KivlyCredentialsStore:
+    Type: String
+    Default: secretsmanager
+    AllowedValues:
+      - secretsmanager
+      - parameter
+    Description: Credential store used for new Kivly connections
+
   KivlyExternalWritesEnabled:
     Type: String
     Default: "true"
@@ -49,6 +65,13 @@ Parameters:
     Type: String
     Default: no-reply@playstand.app
     Description: Verified SES From address for participant verification and reward emails
+
+  EmailSenderName:
+    Type: String
+    Default: ""
+    MaxLength: 100
+    AllowedPattern: '[^\x00-\x1f\x7f-\x9f]*'
+    Description: Optional display name for participant verification and reward emails
 
   StackRewardEmailEnabled:
     Type: String
@@ -79,12 +102,15 @@ Globals:
         GAMEPLAYER_TABLE: !Ref StandProdGameplayerTable
         CATALOG_TABLE: !Ref StandProdCatalogTable
         STRIPE_SECRET_NAME: !Sub "stand/${Environment}/stripe"
+        STRIPE_PARAMETER_NAME: !Sub "/stand/${Environment}/stripe"
+        STRIPE_CREDENTIALS_STORE: !Ref StripeCredentialsStore
+        KIVLY_CREDENTIALS_STORE: !Ref KivlyCredentialsStore
         PLAYER_TOKEN_SECRET: !Ref PlayerTokenSecret
         STACK_PRIZES_TABLE: !Ref StandStackPrizesTable
         PRIZE_INVENTORY_TABLE: !Ref StandPrizeInventoryTable
         KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
-        KIVLY_REGISTRATION_QUEUE: !Ref StandKivlyRegistrationQueue
-        STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
+        KIVLY_REGISTRATION_FUNCTION: !Sub "stand-${Environment}-kivly-registration"
+        STACK_PRIZES_FUNCTION: !Sub "stand-${Environment}-stack-prize-delivery"
         KIVLY_EXTERNAL_WRITES_ENABLED: !Ref KivlyExternalWritesEnabled
         STACK_REWARD_EMAIL_ENABLED: !Ref StackRewardEmailEnabled
 
@@ -111,21 +137,8 @@ Resources:
         - AttributeName: key
           KeyType: RANGE
 
-  StandKivlyRegistrationDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
-
-  StandKivlyRegistrationQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      VisibilityTimeout: 360
-      SqsManagedSseEnabled: true
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt StandKivlyRegistrationDeadLetterQueue.Arn
-        maxReceiveCount: 5
-
+  # Workers are triggered by async Lambda invoke (no SQS pollers -> no idle SQS requests).
+  # Failed invocations are not retried by Lambda: the durable outbox is swept every minute.
   StandKivlyRegistrationWorker:
     Type: AWS::Serverless::Function
     Properties:
@@ -136,6 +149,8 @@ Resources:
       MemorySize: 256
       Layers:
         - !Ref StandCommonLayer
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref StandKivlyRegistrationTable
@@ -143,22 +158,17 @@ Resources:
             TableName: !Ref StandProdGameTable
         - DynamoDBReadPolicy:
             TableName: !Ref StandProdUserTable
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt StandKivlyRegistrationQueue.QueueName
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/kivly/*"
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-kivly-registration"
       Events:
-        Resolve:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt StandKivlyRegistrationQueue.Arn
-            BatchSize: 1
-            ScalingConfig:
-              MaximumConcurrency: 2
-            FunctionResponseTypes:
-              - ReportBatchItemFailures
         Recover:
           Type: Schedule
           Properties:
@@ -228,23 +238,6 @@ Resources:
           Projection:
             ProjectionType: ALL
 
-  StandStackPrizeDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      FifoQueue: true
-      MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
-
-  StandStackPrizeQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      FifoQueue: true
-      VisibilityTimeout: 360
-      SqsManagedSseEnabled: true
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt StandStackPrizeDeadLetterQueue.Arn
-        maxReceiveCount: 5
-
   StandStackPrizeDelivery:
     Type: AWS::Serverless::Function
     Properties:
@@ -255,10 +248,12 @@ Resources:
       MemorySize: 256
       Layers:
         - !Ref StandCommonLayer
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
       Environment:
         Variables:
-          STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
           EMAIL_SENDER_ADDRESS: !Ref EmailSenderAddress
+          EMAIL_SENDER_NAME: !Ref EmailSenderName
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
           PUBLIC_API_BASE_URL: !Sub "https://${GameApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
       Policies:
@@ -272,9 +267,10 @@ Resources:
             TableName: !Ref StandProdGameplayerTable
         - DynamoDBReadPolicy:
             TableName: !Ref StandProdUserTable
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt StandStackPrizeQueue.QueueName
         - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:stand-${Environment}-stack-prize-delivery"
             - Effect: Allow
               Action:
                 - dynamodb:UpdateItem
@@ -289,6 +285,9 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/kivly/*"
             - Effect: Allow
               Action: ses:SendRawEmail
               Resource: !Sub "arn:${AWS::Partition}:ses:us-east-1:${AWS::AccountId}:identity/${EmailIdentityName}"
@@ -306,13 +305,6 @@ Resources:
           Type: Schedule
           Properties:
             Schedule: rate(1 minute)
-        Deliver:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt StandStackPrizeQueue.Arn
-            BatchSize: 1
-            FunctionResponseTypes:
-              - ReportBatchItemFailures
 
 # =========================
 # IAM ROLE (Lambda execution)
@@ -368,6 +360,12 @@ Resources:
                   - secretsmanager:DeleteSecret
                   - secretsmanager:GetSecretValue
                 Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/kivly/*"
         - PolicyName: Empareja2ContributionImages
           PolicyDocument:
             Version: "2012-10-17"
@@ -434,14 +432,6 @@ Resources:
               - !GetAtt StandClientIndexTable.Arn
               - !Sub "${StandClientIndexTable.Arn}/index/owner-clients"
               - !Sub "${StandStackPrizesTable.Arn}/index/pending-work"
-          - Sid: StackPrizeEnqueue
-            Effect: Allow
-            Action: sqs:SendMessage
-            Resource: !GetAtt StandStackPrizeQueue.Arn
-          - Sid: KivlyRegistrationEnqueue
-            Effect: Allow
-            Action: sqs:SendMessage
-            Resource: !GetAtt StandKivlyRegistrationQueue.Arn
           - Sid: LambdaInvoke
             Effect: Allow
             Action: lambda:InvokeFunction
@@ -516,6 +506,9 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/kivly/*"
         - PolicyName: EmailVerification
           PolicyDocument:
             Version: "2012-10-17"
@@ -587,6 +580,9 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/kivly/*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/kivly/*"
         - PolicyName: EmailVerification
           PolicyDocument:
             Version: "2012-10-17"
@@ -641,6 +637,10 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:stand/${Environment}/stripe*"
+              - Sid: StripeParameter
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/stand/${Environment}/stripe"
               - Sid: S3UserMedia
                 Effect: Allow
                 Action:
@@ -1218,11 +1218,13 @@ Resources:
           CHAR_URL_TTL: "120"
           EMAIL_VERIFICATION_TABLE: !Ref StandEmailVerificationTable
           EMAIL_SENDER_ADDRESS: !Ref EmailSenderAddress
+          EMAIL_SENDER_NAME: !Ref EmailSenderName
           EMAIL_IDENTITY_NAME: !Ref EmailIdentityName
           EMAIL_MAX_PER_HOUR: "5"
           EMAIL_IP_MAX_PER_HOUR: "3000"
           EMAIL_GLOBAL_MAX_PER_HOUR: "20000"
           KIVLY_REGISTRATION_TABLE: !Ref StandKivlyRegistrationTable
+          CLIENT_INDEX_TABLE: !Ref StandClientIndexTable
           WALLET_CREDENTIALS_SECRET_NAME: !Sub "stand/${Environment}/wallet"
       Events:
         PublicGameGet:
@@ -1347,7 +1349,6 @@ Resources:
       Environment:
         Variables:
           USER_MEDIA_BUCKET: !Ref UserMediaBucket
-          STACK_PRIZES_QUEUE: !Ref StandStackPrizeQueue
       Events:
         ScoreGet:
           Type: HttpApi

@@ -702,3 +702,21 @@ def test_owner_api_requires_authentication(db, monkeypatch):
     from stand_common import utils
     monkeypatch.setattr(utils, "_get_claims", lambda _: {})
     assert inventory.handle({}, "GET", db)["statusCode"] == 401
+
+
+def test_removed_player_award_is_voided_and_returns_event_reservation(db):
+    reserve(db, "owner", "gift", adjustment(1))
+    activate(db)
+    row = award()
+    concede(db, row)
+    meta = db.Table("games").get_item(Key={"gameId": "ABC123"})["Item"]
+    assert inventory.capacity(db, "owner", [{"id": "gift", "sharedPrizeId": "gift"}], meta)["gift"]["remaining"] == 0
+    plan = prizes.release_player(db, meta, 1)
+    db.meta.client.transact_write_items(TransactItems=plan["operations"])
+    assert [r["id"] for r in plan["voided"]] == [row["id"]]
+    assert db.Table("awards").get_item(Key={"gameId": "ABC123", "id": row["id"]}) == {}
+    assert inventory.balance(db, "owner", "gift")["assigned"] == 0
+    assert inventory.event_usage(db, "owner", "gift")["ABC123"]["assigned"] == 0
+    assert inventory.capacity(db, "owner", [{"id": "gift", "sharedPrizeId": "gift"}], meta)["gift"]["remaining"] == 1
+    movement = next(r for r in inventory.page(db, "owner", "MOVE#gift#")["items"] if r["kind"] == "assignment")
+    assert movement["units"][row["id"]]["state"] == "voided"

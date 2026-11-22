@@ -52,13 +52,22 @@ def request_id(meta, conn, settings, values):
     ])
 
 
+MAX_INLINE_DELAY_SECONDS = 15
+
+
 def enqueue(identifier, delay=0, **extra):
-    queue = os.environ.get("KIVLY_REGISTRATION_QUEUE_URL") or os.environ.get("KIVLY_REGISTRATION_QUEUE")
-    if not queue:
+    """Async-invoke the resolver worker. Long delays are left to the scheduled recovery sweep."""
+    function_name = os.environ.get("KIVLY_REGISTRATION_FUNCTION")
+    if not function_name:
         raise registration.RegistrationError("KivlyConfigurationInvalid")
-    boto3.client("sqs").send_message(
-        QueueUrl=queue, MessageBody=json.dumps({"requestId": identifier, **extra}),
-        DelaySeconds=min(900, max(0, math.ceil(delay))),
+    delay = max(0, math.ceil(delay))
+    if delay > MAX_INLINE_DELAY_SECONDS:
+        return
+    payload = {"requestId": identifier, **extra}
+    if delay:
+        payload["delaySeconds"] = delay
+    boto3.client("lambda").invoke(
+        FunctionName=function_name, InvocationType="Event", Payload=json.dumps(payload).encode(),
     )
 
 

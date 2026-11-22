@@ -2,10 +2,11 @@
 import hashlib
 import json
 import os
+import time
 import uuid
 
 from stand_common import stack_prizes as prizes
-from stand_common import prize_inventory
+from stand_common import prize_inventory, stack_auto_close
 from stand_common.utils import _iso_now, get_game_type_blob, log
 
 
@@ -39,6 +40,8 @@ def change_active(dynamo, meta, active):
         if meta.get("gameType") == "STACK":
             expression += ", stackPrizeState = :open"
             values[":open"] = "open"
+            if "stackFinishDeadline" in meta:
+                expression += " REMOVE stackFinishDeadline"
         prizes.transact(dynamo, [prizes.game_update(meta, expression, values)])
     elif meta.get("lifecycleState") == "inactive":
         return meta
@@ -50,6 +53,7 @@ def change_active(dynamo, meta, active):
         expression = (", isActive = :active, lifecycleState = :state, closeCycle = :cycle, "
                       "updatedAt = :now, closingStartedAt = :now")
         values = {":active": False, ":state": "closing", ":cycle": cycle, ":now": _iso_now()}
+        cleanup = []
         if meta.get("gameType") == "STACK":
             expression += ", stackPrizeState = :closing"
             values[":closing"] = "closing"
@@ -58,9 +62,31 @@ def change_active(dynamo, meta, active):
                 expression += ", stackPrizeProgram = :program, stackPrizeStock = :stock"
                 values.update({":program": program, ":stock": prizes.initial_stock(
                     program, prizes.records(dynamo, meta["gameId"]))})
-        prizes.transact(dynamo, [prizes.game_update(meta, expression, values), prizes.put(task)])
+            schedule = meta.get("stackAutoClose")
+            if schedule:
+                if stack_auto_close.starts_closed(meta):
+                    deadline = stack_auto_close.finish_deadline(meta)
+                    expression += ", stackFinishDeadline = :deadline"
+                    values[":deadline"] = deadline
+                    task["finishDeadline"] = deadline
+                expression += " REMOVE stackAutoClose"
+                cleanup.append(stack_auto_close.delete_task(meta["gameId"], schedule))
+        prizes.transact(dynamo, [prizes.game_update(meta, expression, values), prizes.put(task), *cleanup])
         prizes.enqueue(task)
     return current(dynamo, meta["gameId"])
+
+
+def auto_close(dynamo, row):
+    meta = dynamo.Table(os.environ["GAMES_TABLE"]).get_item(
+        Key={"gameId": row["gameId"]}, ConsistentRead=True,
+    ).get("Item") or {}
+    schedule = meta.get("stackAutoClose") or {}
+    if (schedule.get("id") != row["id"] or meta.get("gameType") != "STACK"
+            or state(meta) != "active" or not meta.get("isActive", True)
+            or any(meta.get(key) for key in ("archivedAt", "deletionStartedAt", "deletedAt"))):
+        prizes.table(dynamo).delete_item(Key={"gameId": row["gameId"], "id": row["id"]})
+    elif stack_auto_close.starts_closed(meta):
+        change_active(dynamo, meta, False)
 
 
 def pending_calculations(dynamo, game_id):
@@ -116,7 +142,8 @@ def finish(dynamo, row):
         complete(dynamo, row)
         return
     if meta.get("gameType") == "STACK":
-        prizes.close(dynamo, meta, [])
+        deadline = row.get("finishDeadline")
+        prizes.close(dynamo, meta, [], expire_pending=deadline is not None and time.time() >= deadline)
         meta = current(dynamo, row["gameId"])
         if meta.get("stackPrizeState") != "closed":
             return
@@ -209,7 +236,7 @@ def issue_native_award(dynamo, meta, player, slot, _attempt=0):
         "prize": {**prize, "id": identity, "source": "stand"},
         "state": "delivered" if blob.get(delivered_attr) else "available",
     }
-    if award["state"] == "available":
+    if award["state"] == "available" and prizes.notification_channels(meta)["email"]:
         award.update(emailState="pending", work="pending", dueAt=0)
 
     claim_attribute = "nativePrizeClaim_" + identity
@@ -234,7 +261,7 @@ def issue_native_award(dynamo, meta, player, slot, _attempt=0):
         if _attempt < 2 and exc.code in ("StackPrizeConflict", "InventoryChanged", "EventLimitReached"):
             return issue_native_award(dynamo, current(dynamo, meta["gameId"]), player, slot, _attempt + 1)
         raise
-    if award["state"] == "available":
+    if award.get("work") == "pending":
         prizes.enqueue(award)
     return award
 
@@ -301,7 +328,7 @@ def settle_native(dynamo, meta):
                 "prize": {**prize, "id": identity, "source": "stand"},
                 "state": "delivered" if blob.get(delivered_attr) else "available",
             }
-            if award["state"] == "available":
+            if award["state"] == "available" and prizes.notification_channels(meta)["email"]:
                 award.update(emailState="pending", work="pending", dueAt=0)
             meta = current(dynamo, meta["gameId"])
             if (meta.get("archivedAt") or meta.get("deletionStartedAt") or meta.get("deletedAt")

@@ -87,7 +87,23 @@ def test_infocards_participant_read_requires_a_valid_player_token(monkeypatch):
 
 @pytest.fixture
 def photo_game(monkeypatch):
+    monkeypatch.setattr(public_mod, "_get_game", lambda _: {
+        "gameType": "STACK", "participantFields": {"profilePhoto": {"enabled": True}},
+    })
+
+
+def test_photo_upload_is_rejected_when_the_game_does_not_request_photos(monkeypatch):
+    monkeypatch.setenv("USER_MEDIA_BUCKET", "media")
     monkeypatch.setattr(public_mod, "_get_game", lambda _: {"gameType": "STACK"})
+    token = issue_player_token("ABC123", 7, SECRET)
+    with patch.object(public_mod, "_get_player", return_value={"playerId": 7}), \
+         patch.object(public_mod.boto3, "client") as client:
+        response = public_mod._handle_player_photo({"body": json.dumps({
+            "action": "upload-url", "playerToken": token, "contentType": "image/png", "sizeBytes": 10,
+        })})
+    assert response["statusCode"] == 400
+    assert json.loads(response["body"])["error"] == "ProfilePhotoDisabled"
+    client.assert_not_called()
 
 
 @pytest.mark.parametrize("marker", ["deletedAt", "deletionStartedAt"])
@@ -193,7 +209,7 @@ def test_public_game_hides_legacy_instagram_registration_field():
     assert json.loads(response["body"])["participantFields"] == {
         "email": {"required": True},
         "phone": {"required": True, "enabled": True},
-        **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
+        "profilePhoto": {"enabled": False}, **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
 
 

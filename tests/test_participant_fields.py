@@ -65,7 +65,7 @@ def assign_body(values):
 def test_defaults_and_legacy_partial_config(gt):
     defaults = {"email": {"required": True}, "instagram": {"required": False},
                 "phone": {"required": True, "enabled": True},
-                **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS}}
+                "profilePhoto": {"enabled": False}, **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS}}
     assert default_participant_fields(gt) == defaults
     assert normalize_participant_fields(gt, {}) == defaults
     assert normalize_participant_fields(gt, {"instagram": {"required": True}}) == {
@@ -178,7 +178,7 @@ def test_public_metadata_and_join_ignore_legacy_instagram_config(web, config, mo
     response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABCDEF"}})
     assert json.loads(response["body"])["participantFields"] == {
         "email": {"required": True}, "phone": {"required": True, "enabled": True},
-        **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
+        "profilePhoto": {"enabled": False}, **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
 
     invoked_payloads = []
@@ -215,7 +215,7 @@ def test_public_metadata_fills_missing_phone_and_legacy_defaults(monkeypatch):
     response = public_mod._handle_get_game({"queryStringParameters": {"gameId": "ABCDEF"}})
     assert json.loads(response["body"])["participantFields"] == {
         "email": {"required": True}, "phone": {"required": True, "enabled": True},
-        **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
+        "profilePhoto": {"enabled": False}, **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS},
     }
 
 

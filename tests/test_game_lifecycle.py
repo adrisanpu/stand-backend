@@ -185,7 +185,7 @@ def test_native_confirmed_award_is_durable_and_obeys_configured_limit(rig, monke
     from unittest.mock import MagicMock
 
     saved = meta(rig)
-    saved.update(gameType=game_type, prizeCatalog={
+    saved.update(gameType=game_type, prizeNotification={"play": True, "email": True}, prizeCatalog={
         "validation": {"name": "Pair", "limit": 1},
     })
     participant = player(rig)
@@ -412,3 +412,72 @@ def test_legacy_qr_cannot_bypass_native_stock_after_closure(rig, monkeypatch):
     result = public_mod._handle_redeem(_redeem_event(issue_prize_token("ABC123", 1, "v", SECRET)))
     assert result["statusCode"] == 409
     assert awards(rig) == []
+
+
+RANKING_PROGRAM = {"version": 3, "storefrontUrl": "", "deliveryChannel": "wallet", "catalog": [
+    {"id": "pizza", "source": "stand", "name": "Pizza", "imageKey": None, "limit": None, "stockTotal": 1},
+], "rules": [{"id": "top", "condition": "top_finish", "topX": 1,
+              "groups": [{"allocations": [{"prizeId": "pizza", "quantity": 1}]}]}]}
+
+
+def _finished(player_id, score, finished_at):
+    return {"gameId": "ABC123", "playerId": player_id, "username": f"P{player_id}", "type": {"STACK": {
+        "score": score, "attempt": {"attemptId": f"a{player_id}", "status": "finished", "finishedAt": finished_at}}}}
+
+
+def _delete_player(rig, player_id):
+    with patch.object(game, "games_table", rig.Table("games")), patch.object(game, "gp_table", rig.Table("players")), \
+            patch.object(game, "dynamodb", rig), patch.object(game.client_index, "delete_actions", return_value=[]), \
+            patch.object(game, "GAMES_TABLE", "games"), patch.object(game, "GAMEPLAYER_TABLE", "players"):
+        return game.lambda_handler(event("DELETE", "/v1/game/players", {"gameId": "ABC123", "playerId": player_id}), None)
+
+
+def test_removed_ranking_winner_releases_stock_and_next_player_gets_the_prize(rig, monkeypatch):
+    from tests.test_stack_prize_rules import delivery_module
+    worker = delivery_module(monkeypatch, rig)
+    queued = []
+    monkeypatch.setattr(prizes, "enqueue", queued.append)
+    saved = meta(rig)
+    saved.update(stackPrizeProgram=RANKING_PROGRAM, stackPrizeStock={"pizza": {"total": 1, "remaining": 1}},
+                 lifecycleState="active", playersCount=2)
+    rig.Table("games").put_item(Item=saved)
+    rig.Table("players").put_item(Item=_finished(1, 10, "2026-10-26T12:01:00Z"))
+    rig.Table("players").put_item(Item=_finished(2, 5, "2026-10-26T12:02:00Z"))
+    worker.grant(prizes.job(meta(rig), "top_finish", [{"playerId": 1, "rank": 1, "score": 10},
+                                                      {"playerId": 2, "rank": 2, "score": 5}]))
+    assert [a["playerId"] for a in awards(rig)] == [1]
+    assert meta(rig)["stackPrizeStock"]["pizza"]["remaining"] == 0
+
+    response = _delete_player(rig, 1)
+
+    assert response["statusCode"] == 200
+    assert response_body(response)["releasedAwards"] == 1
+    assert awards(rig) == []
+    assert not [r for r in prizes.records(rig, "ABC123") if r.get("kind") == "allocation" and r["playerId"] == 1]
+    assert meta(rig)["stackPrizeStock"]["pizza"]["remaining"] == 1
+    assert meta(rig)["playersCount"] == 1
+    job = next(row for row in queued if row.get("kind") == "grant")
+    assert job["winners"] == [{"playerId": 2, "rank": 1, "score": 5}]
+    worker.grant(job)
+    assert [(a["playerId"], a["state"]) for a in awards(rig)] == [(2, "available")]
+    assert meta(rig)["stackPrizeStock"]["pizza"]["remaining"] == 0
+
+
+def test_removed_player_keeps_redeemed_prizes_and_frees_native_claims(rig):
+    saved = meta(rig)
+    saved.pop("stackPrizeProgram")
+    saved.update(gameType="T1MER", lifecycleState="active", playersCount=1, nativePrizeClaim_pair=2,
+                 prizeCatalog={"validation": {"name": "Pair", "limit": 2}})
+    rig.Table("games").put_item(Item=saved)
+    rig.Table("players").put_item(Item={"gameId": "ABC123", "playerId": 1, "type": {"T1MER": {}}})
+    base = {"gameId": "ABC123", "playerId": 1, "ownerUserId": "owner", "ruleId": "native_validation",
+            "condition": "validation", "prize": {"id": "pair", "name": "Pair", "source": "stand"}}
+    rig.Table("prizes").put_item(Item={**base, "id": "award_open", "state": "available"})
+    rig.Table("prizes").put_item(Item={**base, "id": "award_done", "state": "delivered"})
+
+    response = _delete_player(rig, 1)
+
+    assert response["statusCode"] == 200
+    assert response_body(response)["releasedAwards"] == 1
+    assert [a["id"] for a in awards(rig)] == ["award_done"]
+    assert meta(rig)["nativePrizeClaim_pair"] == 1

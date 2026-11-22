@@ -440,6 +440,7 @@ def _public_game_shape(item: dict, include_prize_catalog: bool = True) -> dict:
         "createdAt": item.get("createdAt"),
         "maxPlayers": item.get("maxPlayers"),
         "showRaffleOnHome": item.get("showRaffleOnHome", True),
+        "prizeNotification": stack_prizes.notification_channels(item),
         "participantFields": normalize_participant_fields(item.get("gameType") or "", item.get("participantFields")),
     }
     shape = {k: v for k, v in shape.items() if v is not None}
@@ -1088,12 +1089,6 @@ def _handle_delete_player(event):
 
     if game_item.get("archivedAt") or game_item.get("lifecycleState") in ("closing", "inactive"):
         return _resp(409, {"error": "GameInactive"})
-    if game_item.get("lifecycleState") and any(
-        row.get("playerId") == player_id and row.get("id", "").startswith("award_")
-        for row in stack_prizes.records(dynamodb, game_id)
-    ):
-        return _resp(409, {"error": "PlayerHasAwards"})
-
     if game_item.get("gameType") == "STACK" and game_item.get("stackPrizeState") in ("closing", "closed"):
         return _resp(409, {"error": "StackClosing", "detail": "The final ranking cannot be changed."})
 
@@ -1174,6 +1169,21 @@ def _handle_delete_player(event):
         values[":expectedWinners"] = game_item["raffleWinners"]
     else:
         conditions.append("attribute_not_exists(raffleWinners)")
+    release = None
+    if game_item.get("lifecycleState") or "stackPrizeProgram" in game_item:
+        try:
+            release = stack_prizes.release_player(dynamodb, game_item, player_id)
+        except (stack_prizes.PrizeError, prize_inventory.InventoryError) as exc:
+            log("PlayerAdminPrizeReleaseFailed", {"error": exc.code, "gameId": game_id, "playerId": player_id})
+            return _resp(exc.status, {"error": exc.code})
+        if release["sets"]:
+            update_expression += ", " + ", ".join(release["sets"])
+            values.update(release["values"])
+            conditions.extend(release["conditions"])
+            if ("stackPrizeStock = :releasedStock" in release["sets"]
+                    and not any("stackPrizeRevision" in condition for condition in conditions)):
+                conditions.append("stackPrizeStock = :previousStock")
+                values[":previousStock"] = game_item["stackPrizeStock"]
     if player.get("validated"):
         update_expression += ", validatedCount = :validatedCount"
         values[":validatedCount"] = max(0, validated_count - 1)
@@ -1191,6 +1201,7 @@ def _handle_delete_player(event):
                 "UpdateExpression": update_expression,
                 "ConditionExpression": " AND ".join(conditions),
                 "ExpressionAttributeValues": values,
+                **({"ExpressionAttributeNames": release["names"]} if release and release["names"] else {}),
             }
         },
         {
@@ -1219,6 +1230,10 @@ def _handle_delete_player(event):
             "error": str(exc), "gameId": game_id, "playerId": player_id,
         })
         return _resp(500, {"error": "PlayerIdentityCleanupUnavailable"})
+    if release:
+        transaction.extend(release["operations"])
+    if len(transaction) > 100:
+        return _resp(409, {"error": "PlayerHasTooManyAwards"})
     try:
         dynamodb.meta.client.transact_write_items(TransactItems=transaction)
     except ClientError as exc:
@@ -1232,6 +1247,14 @@ def _handle_delete_player(event):
         log("PlayerAdminDeleteFailed", {"error": str(exc), "gameId": game_id, "playerId": player_id})
         return _resp(500, {"error": "PlayerDeleteFailed"})
 
+    if release:
+        try:
+            current = games_table.get_item(Key={"gameId": game_id}, ConsistentRead=True).get("Item")
+            if current:
+                stack_prizes.reassign_ranking(dynamodb, current)
+        except Exception as exc:  # The removal is committed; ranking prizes can be re-granted later.
+            log("PlayerAdminRankingReassignFailed", {"error": str(exc), "gameId": game_id, "playerId": player_id})
+        return _resp(200, {"ok": True, "playerId": player_id, "releasedAwards": len(release["voided"])})
     return _resp(200, {"ok": True, "playerId": player_id})
 
 
@@ -1461,6 +1484,11 @@ def _handle_put(event):
     play_mode = body.get("playMode")
     if "showRaffleOnHome" in body and type(body["showRaffleOnHome"]) is not bool:
         return _resp(400, {"error": "showRaffleOnHome must be a boolean."})
+    if "prizeNotification" in body:
+        try:
+            prize_notification = stack_prizes.validate_notification(body["prizeNotification"])
+        except stack_prizes.PrizeError as exc:
+            return _resp(400, {"error": exc.code})
 
     if ("playMode" in body and play_mode is None) or (
         "joinChannel" in body and join_channel is None
@@ -1480,6 +1508,7 @@ def _handle_put(event):
         and join_channel is None
         and play_mode is None
         and "showRaffleOnHome" not in body
+        and "prizeNotification" not in body
         and not prize_catalog_supplied
         and "archived" not in body
         and "rewardConditions" not in body
@@ -1742,6 +1771,22 @@ def _handle_put(event):
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
             log("Update home raffle visibility failed", {"error": str(exc)})
+            return _resp(500, {"error": "UpdateFailed"})
+
+    if "prizeNotification" in body:
+        try:
+            games_table.update_item(
+                Key={"gameId": game_id},
+                UpdateExpression="SET prizeNotification = :notification, updatedAt = :u",
+                ExpressionAttributeValues={
+                    ":notification": prize_notification, ":u": now, ":owner": owner_user_id,
+                },
+                ConditionExpression="attribute_exists(gameId) AND ownerUserId = :owner",
+            )
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return _resp(404, {"error": "Game not found (or not owner)", "gameId": game_id})
+            log("Update prize notification failed", {"error": str(exc)})
             return _resp(500, {"error": "UpdateFailed"})
 
     if access is not None:

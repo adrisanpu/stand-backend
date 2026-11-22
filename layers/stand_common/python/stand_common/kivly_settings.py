@@ -1,4 +1,4 @@
-"""Authenticated owner connection endpoints; credentials are stored only in Secrets Manager."""
+"""Authenticated owner connection endpoints with private credential storage."""
 import hashlib
 import json
 import os
@@ -14,9 +14,12 @@ from stand_common import stack_prizes
 from stand_common.utils import _get_claims, _read_json_body, _resp, log
 
 
-def _cleanup(secrets, arn):
+def _cleanup(reference):
     try:
-        secrets.delete_secret(SecretId=arn, RecoveryWindowInDays=7)
+        if reference.startswith("/"):
+            boto3.client("ssm").delete_parameter(Name=reference)
+        else:
+            boto3.client("secretsmanager").delete_secret(SecretId=reference, RecoveryWindowInDays=7)
         return {}
     except registration.ERRORS:
         log("kivly_secret_cleanup_required", {"code": "KivlySecretCleanupRequired"})
@@ -34,7 +37,6 @@ def _change_connection(owner, method, body, dynamo, conn):
             raise registration.RegistrationError("KivlyCredentialsInvalid", 400)
         client = KivlyClient(client_id, client_secret)
     users = dynamo.Table(os.environ["USERS_TABLE"])
-    secrets = boto3.client("secretsmanager")
     names = {"#c": "kivlyConnection"}
     values = {}
     condition = "attribute_not_exists(#c)"
@@ -48,7 +50,7 @@ def _change_connection(owner, method, body, dynamo, conn):
             ConditionExpression=condition, ExpressionAttributeNames=names,
             ExpressionAttributeValues=values,
         )
-        return _resp(200, {"ok": True, **_cleanup(secrets, conn["secretArn"])})
+        return _resp(200, {"ok": True, **_cleanup(conn["secretArn"])})
 
     context = client.get_context()
     # Verify read access without changing any Kivly customer.
@@ -57,10 +59,21 @@ def _change_connection(owner, method, body, dynamo, conn):
     name = "stand/{}/kivly/{}/{}".format(
         os.environ["STAGE"], hashlib.sha256(owner.encode()).hexdigest(), version,
     )
-    secret = secrets.create_secret(
-        Name=name, SecretString=json.dumps({"client_id": client_id, "client_secret": client_secret}),
-    )
-    new = {"secretArn": secret["ARN"], "locationId": context.location_id,
+    credentials = json.dumps({"client_id": client_id, "client_secret": client_secret})
+    store = os.environ.get("KIVLY_CREDENTIALS_STORE", "secretsmanager")
+    if store == "parameter":
+        if len(credentials.encode("utf-8")) > 4096:
+            raise registration.RegistrationError("KivlyCredentialsInvalid", 400)
+        reference = "/" + name
+        boto3.client("ssm").put_parameter(
+            Name=reference, Value=credentials, Type="SecureString", Tier="Standard", Overwrite=False,
+        )
+    elif store == "secretsmanager":
+        secret = boto3.client("secretsmanager").create_secret(Name=name, SecretString=credentials)
+        reference = secret["ARN"]
+    else:
+        raise registration.RegistrationError("KivlyConfigurationInvalid")
+    new = {"secretArn": reference, "locationId": context.location_id,
            "ownerId": context.owner_id, "version": version,
            "clubSettings": {
                "clubName": context.location_name[:200],
@@ -78,11 +91,15 @@ def _change_connection(owner, method, body, dynamo, conn):
         )
     except registration.ERRORS as exc:
         if isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            _cleanup(secrets, new["secretArn"])
+            _cleanup(new["secretArn"])
             raise registration.RegistrationError("KivlyConnectionChanged", 409) from None
         # A failed write may still have committed; keep the secret for reconciliation.
         raise registration.RegistrationError("KivlyConnectionReconciliationRequired") from None
-    warning = _cleanup(secrets, conn["secretArn"]) if conn else {}
+    if conn and store == "parameter" and not conn["secretArn"].startswith("/"):
+        log("kivly_secret_cleanup_required", {"code": "KivlySecretCleanupRequired"})
+        warning = {"warning": "KivlySecretCleanupRequired"}
+    else:
+        warning = _cleanup(conn["secretArn"]) if conn else {}
     return _resp(200, {"ok": True, **warning})
 
 

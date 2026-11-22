@@ -77,7 +77,7 @@ def _finish(game_id, player_id, player, gp_table, payload, meta=None):
     final_attempt = {
         **attempt, "status": "finished", "finishedAt": now, "evidenceHash": evidence_hash,
     }
-    if "prizeProgram" in attempt:
+    if "prizeProgram" in attempt or (meta and os.environ.get("STACK_PRIZES_TABLE")):
         try:
             rank = stack_prizes.finish(boto3.resource("dynamodb"), meta, player, final_attempt, score)
         except stack_prizes.PrizeError as exc:

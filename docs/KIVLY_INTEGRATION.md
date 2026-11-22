@@ -445,6 +445,20 @@ neither changes identity nor causes previously earned prizes to be awarded again
 | `top_final` | Final ranking after definitive closure |
 | `raffle` | Selected raffle winners |
 
+STACK games with a `top_final` rule can schedule a game-wide automatic close
+in `PUT /v1/game/stack/prizes` (`action: "rules"`). Set `autoClose` to
+`{"hours": 1, "minutes": 30}` to schedule the close when the save succeeds, or
+`null` to cancel. Omitting it preserves the schedule unless the last `top_final`
+rule is removed. Saving the same duration keeps the existing deadline. `GET`
+and successful saves return `autoClose` with the duration and `closesAt` (Unix
+seconds), or `null`. Public game metadata exposes the deadline as
+`stackAutoCloseAt` while scheduled. At that deadline, no new attempts can start.
+Already-started attempts have up to 120 seconds from the deadline to submit
+their scores. The server then excludes unfinished attempts and finalizes the
+ranking; publication can follow after the background worker runs. Closing
+manually before the deadline cancels the schedule, and reopening does not
+restore it.
+
 OR chooses uniformly among groups with some rank-eligible remaining stock,
 without weighting by the number of prizes or remaining stock. A single eligible
 group needs no random draw; entirely unavailable groups are excluded.
@@ -525,11 +539,13 @@ STACK closure and archival; new registrations/starts do not.
 
 The retained prize table stores unit awards, allocation records and a durable
 outbox. After the finish transaction commits, the score handler immediately
-enqueues its grant job in FIFO SQS. Committed Kivly unit awards are likewise
-enqueued immediately after allocation, without waiting for the scheduler.
-Enqueue failures are logged and leave the durable outbox pending; a one-minute
-schedule recovers due work into the same queue. Both producers need
-`STACK_PRIZES_QUEUE` and `sqs:SendMessage` permission. Duplicate messages remain
+hands its grant job to the delivery Lambda via async invoke (`InvocationType=Event`;
+no SQS, so there is no idle polling cost). Committed Kivly unit awards are likewise
+handed over immediately after allocation, without waiting for the scheduler.
+Invoke failures are logged and leave the durable outbox pending; a one-minute
+schedule re-invokes due work (Lambda retries are disabled to avoid duplicates).
+Producers need `STACK_PRIZES_FUNCTION` and `lambda:InvokeFunction` permission. Duplicate
+invocations remain
 safe through allocation ledgers and conditional delivery transitions; grant jobs
 process winners in chunks. Owner views show remaining stock, allocation
 outcomes and safe Kivly failure stage/HTTP status.

@@ -659,9 +659,15 @@ T1MER, STACK and RULET4 resolves it to this policy:
   "company": { "enabled": false },
   "sex": { "enabled": false },
   "jobTitle": { "enabled": false },
-  "birthDate": { "enabled": false }
+  "birthDate": { "enabled": false },
+  "profilePhoto": { "enabled": false }
 }
 ```
+
+`profilePhoto` (default off, including existing games) controls whether `/play`
+offers the optional profile photo picker and shows participant avatars (ranking
+and play views). When disabled, `POST /v1/game/player/photo` returns
+`ProfilePhotoDisabled` (HTTP 400).
 
 Email is always required and verified, including legacy games stored with
 `email.required: false`. Phone is always enabled and mandatory, including legacy
@@ -722,7 +728,14 @@ registration fields (`gameId`, `username`, `consent: true`, enabled contact fiel
 ```
 
 Both timestamps are ISO 8601. Submit the registration to `/v1/public/join` with
-the returned `challengeId` and the emailed `code`. All joins, including
+the returned `challengeId` and the emailed `code`.
+
+The participant UI starts with `mode: "resume"` and only `gameId`, `email` and
+`language`. If the email belongs to a verified player in this game, or to the
+operator's client index profile from another of the owner's games
+(`knownClient: true`), the stored name, phone and consent are reused. The code is
+then sent directly, or the response lists only the missing required fields.
+Stored values are never returned before verification. All joins, including
 duplicate-registration recovery, require verification before a participant
 session can be issued; the successful join response is unchanged. Resending uses
 the request endpoint again after `resendAvailableAt`. Do not log codes, full
@@ -880,6 +893,15 @@ player/validation counts. Scores and quiz answers are stored on the player
 record, so removing it also removes those results from rankings. The game
 retains its player-ID high-water mark so later joins cannot reuse a removed
 player's ID.
+
+The same transaction releases the player's prizes. Unredeemed awards (stand
+prizes still `available`, Kivly prizes still `connection_required`) and their
+allocation ledgers are deleted. Their units go back to the event stock
+(`stackPrizeStock`, native `nativePrizeClaim_*` counters, and inventory movements
+marked `voided` with the balance `assigned` decremented). Redeemed or
+wallet-issued awards are kept. For STACK `top_finish` rules, the game then
+enqueues a grant job for players who are now in the top X without that award,
+so the next player in the ranking receives the released prize.
 
 The removal transaction uses native Python values with the DynamoDB resource
 client, which serializes them once. Regression tests check the actual SDK

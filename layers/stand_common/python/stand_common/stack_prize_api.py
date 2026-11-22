@@ -6,7 +6,7 @@ import boto3
 from botocore.exceptions import ClientError
 from stand_common import kivly_registration as registration
 from stand_common import stack_prizes as prizes
-from stand_common import game_lifecycle, reward_conditions, prize_inventory
+from stand_common import game_lifecycle, reward_conditions, prize_inventory, stack_auto_close
 from stand_common.prizes import staged_prize_image_key
 from stand_common.utils import _get_claims, _read_json_body, _resp, _json_sanitize, get_game_type_blob
 
@@ -43,6 +43,10 @@ def release_unused_reservations(dynamo, meta, program, stock, rows):
             stock[prize["id"]] = {"total": quantity, "remaining": 0}
         catalog.append(prize)
     return {**program, "catalog": catalog}, stock
+
+
+def program_revision(program, schedule):
+    return reward_conditions.revision({"program": program, "autoClose": schedule} if schedule else program)
 
 
 def handle(event, method, dynamo, raffles_enabled, read_image):
@@ -94,7 +98,8 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
             return response(dynamo, current)
         if method != "PUT":
             return _resp(405, {"ok": False, "error": "MethodNotAllowed"})
-        if meta.get("archivedAt") or not meta.get("isActive", True) or meta.get("stackPrizeState", "open") != "open":
+        if (meta.get("archivedAt") or not meta.get("isActive", True)
+                or meta.get("stackPrizeState", "open") != "open" or stack_auto_close.starts_closed(meta)):
             raise prizes.PrizeError("StackClosing")
         if "stackPrizeProgram" not in meta and any(
             get_game_type_blob(p, "STACK").get("attempt", {}).get("status") == "started"
@@ -104,10 +109,11 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
         conn = registration.connection(dynamo, owner)
         conditions_only = body.get("action") == "rules"
         existing = prizes.upgrade_program(prizes.effective_program(dynamo, meta))
+        previous_schedule = meta.get("stackAutoClose")
         if conditions_only:
-            if set(body) != {"gameId", "action", "expectedRevision", "rules"}:
+            if set(body) - {"autoClose"} != {"gameId", "action", "expectedRevision", "rules"}:
                 raise prizes.PrizeError("InvalidStackPrizeRules", 400)
-            if body["expectedRevision"] != reward_conditions.revision(existing):
+            if body["expectedRevision"] != program_revision(existing, previous_schedule):
                 raise prizes.PrizeError("RewardConditionsChanged")
             raw = {**_json_sanitize(existing), "rules": body["rules"]}
         elif body.get("action") == "catalog":
@@ -148,16 +154,39 @@ def handle(event, method, dynamo, raffles_enabled, read_image):
         stock = prizes.updated_stock(meta, program, rows)
         if conditions_only:
             program, stock = release_unused_reservations(dynamo, meta, program, stock, rows)
+        if stack_auto_close.starts_closed(meta):
+            raise prizes.PrizeError("StackClosing")
+        schedule = previous_schedule
+        if conditions_only and "autoClose" in body:
+            try:
+                schedule = stack_auto_close.configure(previous_schedule, body["autoClose"])
+            except ValueError:
+                raise prizes.PrizeError("InvalidStackAutoClose", 400) from None
+        if not any(rule["condition"] == "top_final" for rule in program["rules"]):
+            if conditions_only and body.get("autoClose") is not None:
+                raise prizes.PrizeError("StackAutoCloseRequiresFinalTop", 400)
+            schedule = None
         # Keep existing participants on their legacy flow; new attempts opt in at start.
         active_condition = "isActive = :active" if "isActive" in meta else "attribute_not_exists(isActive)"
+        values = {":program": program, ":stock": stock, **({":active": True} if "isActive" in meta else {})}
+        expression = ", stackPrizeProgram = :program, stackPrizeStock = :stock"
+        work = []
+        if schedule != previous_schedule:
+            if previous_schedule:
+                work.append(stack_auto_close.delete_task(meta["gameId"], previous_schedule))
+            if schedule:
+                expression += ", stackAutoClose = :autoClose"
+                values[":autoClose"] = schedule
+                work.append(prizes.put(stack_auto_close.task(meta["gameId"], schedule)))
+            else:
+                expression += " REMOVE stackAutoClose"
         prizes.transact(dynamo, [prizes.game_update(
-            meta, ", stackPrizeProgram = :program, stackPrizeStock = :stock",
-            {":program": program, ":stock": stock, **({":active": True} if "isActive" in meta else {})},
-            extra=" AND " + active_condition + " AND attribute_not_exists(archivedAt)",
-        )])
+            meta, expression, values, extra=" AND " + active_condition + " AND attribute_not_exists(archivedAt)",
+        ), *work])
+        effective = prizes.effective_program(dynamo, meta, program)
         return _resp(200, _json_sanitize({
-            "ok": True, "program": prizes.program_view(prizes.effective_program(dynamo, meta, program), meta),
-            "programRevision": reward_conditions.revision(prizes.effective_program(dynamo, meta, program)),
+            "ok": True, "program": prizes.program_view(effective, meta), "autoClose": stack_auto_close.view(schedule),
+            "programRevision": program_revision(effective, schedule),
         }))
     except prizes.PrizeError as exc:
         return _resp(exc.status, {"ok": False, "error": exc.code})
@@ -188,7 +217,8 @@ def response(dynamo, meta):
     general = prize_inventory.capacity(dynamo, meta["ownerUserId"], program["catalog"], meta)
     return _resp(200, _json_sanitize({
         "ok": True, "program": prizes.program_view(program, meta),
-        "programRevision": reward_conditions.revision(prizes.upgrade_program(program)),
+        "programRevision": program_revision(prizes.upgrade_program(program), meta.get("stackAutoClose")),
+        "autoClose": stack_auto_close.view(meta.get("stackAutoClose")),
         "enabled": "stackPrizeProgram" in meta,
         "state": "closing" if game_lifecycle.state(meta) == "closing" else meta.get("stackPrizeState", "open"),
         "emailAvailable": os.environ.get("STACK_REWARD_EMAIL_ENABLED", "false").lower() == "true",

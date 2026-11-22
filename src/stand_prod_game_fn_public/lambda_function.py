@@ -44,8 +44,8 @@ from stand_common.email_verification import (
 from stand_common.prizes import serialize_prize_catalog
 from stand_common.rulet4 import game_config as rulet4_game_config
 from stand_common.rulet4_gameplay import public_assignment as rulet4_assignment, spin as rulet4_spin
-from stand_common import kivly_registration, kivly_rewards, stack_prizes, wallet_passes
-from stand_common import game_forms, mobile_gameplay
+from stand_common import kivly_registration, kivly_rewards, stack_auto_close, stack_prizes, wallet_passes
+from stand_common import client_index, game_forms, mobile_gameplay
 
 GAMES_TABLE = os.environ.get("GAMES_TABLE", "stand-prod-game-table")
 GAMEPLAYER_TABLE = os.environ.get("GAMEPLAYER_TABLE", "stand-prod-gameplayer-table")
@@ -289,6 +289,9 @@ def _handle_get_game(event):
             payload["prizeCatalog"] = {}
             payload["stackPrizeState"] = item.get("stackPrizeState", "open")
             payload["stackPrizeRules"] = stack_prizes.promotional_rules(item)
+            closes_at = stack_auto_close.scheduled_at(item)
+            if closes_at is not None:
+                payload["stackAutoCloseAt"] = closes_at
         reward = item.get("kivlyReward")
         if reward and item.get("ownerUserId"):
             reward = kivly_rewards.configured_reward(
@@ -377,7 +380,7 @@ def _registration_game(game_id):
     meta = _get_game(game_id)
     if not meta:
         raise VerificationError("GameNotFound", 404)
-    if not meta.get("isActive", True):
+    if not meta.get("isActive", True) or stack_auto_close.starts_closed(meta):
         raise VerificationError("GameInactive", 403)
     if (meta.get("gameType") or "").upper() not in game_access.GAME_ACCESS_CAPABILITIES:
         raise VerificationError("unsupported_game_type", 400)
@@ -431,7 +434,15 @@ def _handle_email_resume(event, body, game_id, meta):
     player = find_verified_player(
         table, gp_table, PLAYER_TOKEN_SECRET, game_id, email, Key,
     )
-    needed, stored_values, loyalty_version = resume_requirements(meta, player)
+    profile = None
+    if player is None:
+        try:
+            profile = client_index.find_profile(
+                dynamo_r, meta.get("ownerUserId"), email, PLAYER_TOKEN_SECRET,
+            )
+        except (ClientError, client_index.ClientIndexError) as exc:
+            log("email_resume_profile_lookup_failed", {"errorType": type(exc).__name__, "gameId": game_id})
+    needed, stored_values, loyalty_version = resume_requirements(meta, player, profile)
     supplied_fields = {
         "username": needed["username"],
         "phone": needed["phone"],
@@ -471,6 +482,7 @@ def _handle_email_resume(event, body, game_id, meta):
             "detailsRequired": True,
             "fields": needed,
             "existingPlayer": player is not None,
+            "knownClient": profile is not None,
             **({"loyaltyConsentVersion": loyalty_version}
                if pending["loyaltyConsent"] else {}),
         })
@@ -987,7 +999,10 @@ def _handle_player_photo(event):
     player = _get_player(game_id, player_id)
     if not player:
         return _resp(404, {"ok": False, "error": "PlayerNotFound"})
-    kivly_registration.require_player(dynamo_r, _get_game(game_id) or {}, player)
+    meta = _get_game(game_id) or {}
+    kivly_registration.require_player(dynamo_r, meta, player)
+    if not web_participant_fields(meta.get("gameType") or "", meta.get("participantFields"))["profilePhoto"]["enabled"]:
+        return _resp(400, {"ok": False, "error": "ProfilePhotoDisabled"})
     action = body.get("action")
     existing_photo_key = player.get("participantPhotoKey")
     if existing_photo_key:
@@ -1203,6 +1218,11 @@ def _player_response(meta: dict, player: dict, game_id: str, player_id: int, tok
             if row["state"] == "available" else None,
         } for row in awards]
         payload["prizes"] = []
+    channels = stack_prizes.notification_channels(meta)
+    payload["prizeNotification"] = channels
+    if not channels["play"]:
+        for award in payload.get("nativePrizes", []) + payload.get("stackPrizes", {}).get("awards", []):
+            award["token"] = None
     if game_forms.pending(meta, player, "prize"):
         payload["quiz"]["prizePending"] = bool(
             payload.get("nativePrizes") or payload.get("stackPrizes", {}).get("awards") or payload.get("prizes"))

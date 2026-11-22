@@ -100,7 +100,7 @@ def reservation_limits(dynamo, owner, meta):
 
 
 def event_usage(dynamo, owner, pid):
-    """Immutable movements preserve event consumption even after awards are deleted."""
+    """Movements preserve event consumption after awards are deleted, except units voided on player removal."""
     usage, cursor = {}, None
     while True:
         result = page(dynamo, owner, "MOVE#" + pid + "#", cursor, 100)
@@ -108,7 +108,8 @@ def event_usage(dynamo, owner, pid):
             if movement.get("kind") != "assignment" or not movement.get("gameId"):
                 continue
             entry = usage.setdefault(movement["gameId"], {"assigned": 0, "redeemed": 0})
-            entry["assigned"] += int(movement["quantity"])
+            units = movement.get("units", {}).values()
+            entry["assigned"] += int(movement["quantity"]) - sum(unit.get("state") == "voided" for unit in units)
             entry["redeemed"] += sum(unit.get("state") == "delivered" for unit in movement.get("units", {}).values())
         cursor = result["cursor"]
         if not cursor:
