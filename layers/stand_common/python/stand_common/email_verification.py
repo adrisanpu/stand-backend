@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from botocore.exceptions import BotoCoreError, ClientError
 
+from stand_common.email_sender import format_sender
 from stand_common.utils import (
     is_valid_email, is_valid_phone, normalize_email, web_participant_fields, mask_email, log,
     OPTIONAL_PARTICIPANT_FIELDS,
@@ -136,11 +137,16 @@ def find_verified_player(table, player_table, secret, game_id, email, key_expres
     return player
 
 
-def resume_requirements(meta, player=None):
-    """Return server-derived missing fields and trusted values for a resume request."""
+def resume_requirements(meta, player=None, profile=None):
+    """Return server-derived missing fields and trusted values for a resume request.
+
+    ``profile`` is the operator-level client index profile, used when the email
+    has no player in this game yet but was verified in another of the owner's games.
+    """
     fields = web_participant_fields(meta.get("gameType") or "", meta.get("participantFields"))
     needed = {"username": False, "phone": False, "consent": False, "loyaltyConsent": False}
     values = {}
+    known = player or ({"username": profile.get("name"), "phone": profile.get("phone")} if profile else None)
 
     def valid_username(value):
         return (
@@ -148,17 +154,17 @@ def resume_requirements(meta, player=None):
             and not re.search(r"[\x00-\x1f\x7f-\x9f]", value.strip())
         )
 
-    username = player.get("username") if player else None
+    username = known.get("username") if known else None
     if valid_username(username):
         values["username"] = username.strip()
     else:
         needed["username"] = True
 
     phone_required = fields["phone"]["enabled"] and fields["phone"]["required"]
-    stored_phone = player.get("phone") if player else None
+    stored_phone = known.get("phone") if known else None
     if fields["phone"]["enabled"] and is_valid_phone(stored_phone):
         values["phone"] = stored_phone.strip()
-    elif (fields["phone"]["enabled"] and not player) or phone_required:
+    elif (fields["phone"]["enabled"] and not known) or phone_required:
         needed["phone"] = True
     for name in OPTIONAL_PARTICIPANT_FIELDS:
         if not fields[name]["enabled"]:
@@ -170,7 +176,7 @@ def resume_requirements(meta, player=None):
         else:
             needed[name] = True
 
-    if not (
+    if not profile and not (
         player and player.get("verifiedAt")
         and player.get("verificationMethod") == "email-code"
     ):
@@ -267,6 +273,11 @@ def request_code(table, ses, secret, game_id, values, source_ip, language="es", 
     sender = os.environ.get("EMAIL_SENDER_ADDRESS")
     if not sender or not source_ip:
         raise VerificationError("VerificationUnavailable", 503)
+    try:
+        sender = format_sender(sender, os.environ.get("EMAIL_SENDER_NAME", ""))
+    except ValueError as exc:
+        log("email_sender_configuration_invalid", {"error": str(exc)})
+        raise VerificationError("VerificationUnavailable", 503) from exc
     now = int(time.time())
     hour = now // 3600
     hour_end = (hour + 1) * 3600

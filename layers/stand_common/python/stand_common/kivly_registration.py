@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from stand_common import credential_store
 from stand_common.kivly import KivlyClient, KivlyError
 from stand_common.utils import _iso_now, is_valid_phone, log
 
@@ -167,8 +168,7 @@ def _cached_client(secret_arn, version):
     # A reconnect creates a new immutable credential version. Warm invocations
     # reuse its client/token without mixing owners or minting a token per player.
     try:
-        data = boto3.client("secretsmanager").get_secret_value(SecretId=secret_arn)
-        credentials = json.loads(data["SecretString"])
+        credentials = credential_store.read_json(secret_arn)
         return KivlyClient(credentials["client_id"], credentials["client_secret"])
     except (KeyError, TypeError, ValueError):
         raise RegistrationError("KivlyConfigurationInvalid") from None

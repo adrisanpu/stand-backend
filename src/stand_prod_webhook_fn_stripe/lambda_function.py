@@ -8,6 +8,7 @@ from typing import Optional
 import boto3
 import stripe
 from botocore.exceptions import ClientError
+from stand_common.credential_store import read_json
 from stand_common.utils import log, _resp, _iso_now, _parse_iso
 
 # ========= AWS =========
@@ -16,15 +17,15 @@ dynamodb = boto3.resource("dynamodb")
 # ========= ENV =========
 USERS_TABLE = (os.environ.get("USERS_TABLE", "") or "").strip()
 
-# Stripe keys solo desde Secrets Manager (STRIPE_SECRET_NAME obligatorio)
+# The configured credential store must be provisioned before switching.
 STRIPE_SECRET_KEY = ""
 STRIPE_WEBHOOK_SECRET = ""
 _stripe_secret_name = os.environ.get("STRIPE_SECRET_NAME", "").strip()
+if os.environ.get("STRIPE_CREDENTIALS_STORE", "secretsmanager") == "parameter":
+    _stripe_secret_name = os.environ.get("STRIPE_PARAMETER_NAME", "").strip()
 if _stripe_secret_name:
     try:
-        sm = boto3.client("secretsmanager")
-        raw = sm.get_secret_value(SecretId=_stripe_secret_name)
-        data = json.loads(raw.get("SecretString", "{}"))
+        data = read_json(_stripe_secret_name)
         if data:
             STRIPE_SECRET_KEY = (data.get("STRIPE_SECRET_KEY") or data.get("SECRET_KEY") or "").strip()
             STRIPE_WEBHOOK_SECRET = (data.get("STRIPE_WEBHOOK_SECRET") or data.get("WEBHOOK_SECRET") or "").strip()

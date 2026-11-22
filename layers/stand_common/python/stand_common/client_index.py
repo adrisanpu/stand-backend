@@ -49,6 +49,20 @@ def reference_key(game_id, player_id):
     return f"GAME#{game_id}#PLAYER#{int(player_id):020d}"
 
 
+def find_profile(dynamo, owner_id, email, secret):
+    """Return the owner's verified client profile for an email, if one exists."""
+    table_name = os.environ.get("CLIENT_INDEX_TABLE")
+    if not table_name or not isinstance(owner_id, str) or not owner_id.strip():
+        return None
+    profile = dynamo.Table(table_name).get_item(
+        Key={"clientId": client_id(secret, owner_id, email), "recordKey": PROFILE_KEY},
+        ConsistentRead=True,
+    ).get("Item")
+    if not profile or profile.get("ownerUserId") != owner_id:
+        return None
+    return profile
+
+
 def has_verified_email_mapping(dynamo, game_id, player, secret):
     email = player.get("email") if isinstance(player, dict) else None
     if not isinstance(email, str) or not email.strip():

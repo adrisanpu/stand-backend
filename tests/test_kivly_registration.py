@@ -532,6 +532,28 @@ def test_actual_queue_handler_checkpoints_success_and_returns_only_failed_messag
     assert record(club, identifier)["phase"] == "lookup_email"
 
 
+def test_async_invoke_handler_processes_direct_payload(club, monkeypatch):
+    worker = load_worker()
+    monkeypatch.setattr(worker.boto3, "resource", lambda *_: club["dynamo"])
+    identifier = request(club)
+    assert worker.lambda_handler({"requestId": identifier}, None) == {"ok": True}
+    assert record(club, identifier)["phase"] == "lookup_email"
+
+
+def test_resolver_enqueue_uses_async_lambda_and_defers_long_delays(monkeypatch):
+    client, services = MagicMock(), []
+    monkeypatch.setenv("KIVLY_REGISTRATION_FUNCTION", "kivly-fn")
+    monkeypatch.setattr(resolver.boto3, "client", lambda service: services.append(service) or client)
+    resolver.enqueue("registration:a")
+    resolver.enqueue("registration:b", 3)
+    resolver.enqueue("registration:c", 120)
+    assert services == ["lambda", "lambda"]
+    first, second = [call.kwargs for call in client.invoke.call_args_list]
+    assert first["FunctionName"] == "kivly-fn" and first["InvocationType"] == "Event"
+    assert json.loads(first["Payload"]) == {"requestId": "registration:a"}
+    assert json.loads(second["Payload"]) == {"requestId": "registration:b", "delaySeconds": 3}
+
+
 def test_worker_reserves_time_and_does_not_start_near_lambda_deadline(club, monkeypatch):
     worker = load_worker()
     monkeypatch.setattr(worker.boto3, "resource", lambda *_: club["dynamo"])

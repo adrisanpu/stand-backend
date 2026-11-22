@@ -234,6 +234,7 @@ OPTIONAL_PARTICIPANT_FIELDS = ("address", "company", "sex", "jobTitle", "birthDa
 def default_participant_fields(game_type: str) -> dict:
     return {"email": {"required": True}, "instagram": {"required": False},
             "phone": {"required": True, "enabled": True},
+            "profilePhoto": {"enabled": False},
             **{name: {"enabled": False} for name in OPTIONAL_PARTICIPANT_FIELDS}}
 
 
@@ -249,7 +250,7 @@ def normalize_participant_fields(game_type: str, fields: dict | None = None, *, 
             raise ValueError(f"Unsupported participant field: {name}.")
         if not isinstance(config, dict):
             raise ValueError(f"participantFields.{name} must be an object.")
-        allowed = ({"enabled"} if name in OPTIONAL_PARTICIPANT_FIELDS
+        allowed = ({"enabled"} if name in OPTIONAL_PARTICIPANT_FIELDS or name == "profilePhoto"
                    else {"required", "enabled"} if name == "phone" else {"required"})
         if set(config) - allowed:
             raise ValueError(f"Unsupported participantFields.{name} option.")

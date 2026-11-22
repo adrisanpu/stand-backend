@@ -12,6 +12,7 @@ from stand_common.utils import _iso_now, _json_sanitize, get_game_type_blob, nor
 MOMENTS = {"disabled", "after_registration", "after_game", "prize", "raffle"}
 DEFAULT = {
     "registrationTitle": "", "registrationDescription": "",
+    "defaultLanguage": "es",
     "quizTitle": "", "quizDescription": "", "logoKey": None, "bannerKey": None,
     "appearance": None, "quizMoment": "disabled",
 }
@@ -131,6 +132,8 @@ def validate_config(raw, owner):
     if not isinstance(raw, dict) or set(raw) - set(DEFAULT):
         raise FormError("InvalidFormConfig", 400)
     value = {**DEFAULT, **raw}
+    if value["defaultLanguage"] not in ("es", "en"):
+        raise FormError("InvalidDefaultLanguage", 400)
     for key in ("registrationTitle", "registrationDescription", "quizTitle", "quizDescription"):
         text = value[key]
         if not isinstance(text, str) or len(text) > (160 if key.endswith("Title") else 1000):
@@ -184,7 +187,10 @@ def save(dynamo, meta, body):
         raise FormError("InvalidFormUpdate", 400)
     if body["expectedRevision"] != revision(meta):
         raise FormError("FormChanged")
-    value = validate_config(body["formConfig"], meta["ownerUserId"])
+    raw = body["formConfig"]
+    if isinstance(raw, dict):
+        raw = {"defaultLanguage": config(meta)["defaultLanguage"], **raw}
+    value = validate_config(raw, meta["ownerUserId"])
     qs = questions(meta) if body["questions"] == questions(meta) else normalize_questions(body["questions"], meta["gameId"])
     if value["quizMoment"] != "disabled" and not qs:
         raise FormError("QuizQuestionsRequired", 400)

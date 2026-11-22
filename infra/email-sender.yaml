@@ -7,6 +7,30 @@ Parameters:
     Default: playstand.app
     Description: Domain owned by Stand whose DNS records the operator can manage
 
+  BimiLogoUrl:
+    Type: String
+    Default: https://playstand.app/bimi/logo-stand.svg
+    AllowedPattern: '^$|^https://[^\s;"]+$'
+    Description: Optional public HTTPS URL of a BIMI SVG Tiny PS logo
+
+  BimiCertificateUrl:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^https://[^\s;"]+$'
+    Description: Optional public HTTPS URL of the BIMI VMC or CMC PEM certificate
+
+Rules:
+  BimiCertificateRequiresLogo:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref BimiCertificateUrl, ""]
+          - !Not [!Equals [!Ref BimiLogoUrl, ""]]
+        AssertDescription: Supply BimiLogoUrl when BimiCertificateUrl is set
+
+Conditions:
+  HasBimiLogo: !Not [!Equals [!Ref BimiLogoUrl, ""]]
+  HasBimiCertificate: !Not [!Equals [!Ref BimiCertificateUrl, ""]]
+
 Resources:
   EmailIdentity:
     Type: AWS::SES::EmailIdentity
@@ -22,6 +46,17 @@ Resources:
         EmailForwardingEnabled: true
 
 Outputs:
+  BimiRecordName:
+    Condition: HasBimiLogo
+    Description: Publish this TXT record at the domain DNS provider
+    Value: !Sub "default._bimi.${EmailIdentityName}"
+  BimiRecordValue:
+    Condition: HasBimiLogo
+    Description: BIMI TXT record value; DNS is not modified by this stack
+    Value: !If
+      - HasBimiCertificate
+      - !Sub "v=BIMI1; l=${BimiLogoUrl}; a=${BimiCertificateUrl}"
+      - !Sub "v=BIMI1; l=${BimiLogoUrl}; a="
   EmailIdentityName:
     Value: !Ref EmailIdentity
   EmailIdentityArn:
