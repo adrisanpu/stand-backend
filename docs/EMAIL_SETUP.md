@@ -137,62 +137,6 @@ authorization is configured. Only the dedicated public Lambda role receives
 table permissions but cannot send mail. The existing game managed policy is
 reused on these roles to preserve all prior game/session behavior.
 
-### Sender avatar with BIMI
-
-SES does not set the avatar beside a sender. BIMI is configured at the domain
-and DNS provider, and mailbox providers decide independently whether to show
-the logo. The shared `playstand.app` identity means dev and prod use the same
-domain-level BIMI record; neither the display name nor the sender address
-selects a per-game avatar.
-
-1. Coordinate with the domain/DNS owner. Confirm SES DKIM signs with a domain
-   aligned to the visible From domain, and check authentication in a real
-   received message. BIMI requires DMARC enforcement (`p=quarantine` or
-   `p=reject`, `pct=100`); check subdomain policy too. Before changing DMARC,
-   inventory and test **all** legitimate domain senders, since enforcement can
-   reject or quarantine their mail. `p=none` is not sufficient for BIMI.
-2. The frontend includes `public/bimi/logo-stand.svg`, a vector recreation of
-   `public/images/logo-stand-footer.png` (orange circle, with a white background
-   for mailbox compatibility) using SVG Tiny PS. Publish the production
-   frontend and verify that `https://playstand.app/bimi/logo-stand.svg` returns
-   the SVG publicly over HTTPS, rather than the SPA's HTML fallback. The PNG
-   itself cannot be used as the BIMI asset. Validate the SVG against the
-   certificate issuer's current requirements before submitting it.
-3. For Gmail, obtain a **VMC or CMC** from a supported certificate authority
-   and host the certificate chain PEM over HTTPS. A VMC requires an eligible
-   registered trademark; CMC eligibility differs. A logo without a certificate
-   has limited provider support and does **not** make Gmail display it. Check
-   current provider rules and certificate costs before purchasing.
-4. Publish one TXT record at `default._bimi.playstand.app`:
-
-   ```text
-   v=BIMI1; l=https://playstand.app/bimi/logo-stand.svg; a=https://assets.playstand.app/bimi/certificate.pem
-   ```
-
-   Replace the certificate URL with the actual public PEM URL. Without a
-   certificate, the `a=` value may be empty, with the provider limitations
-   above. Inspect any existing BIMI record first and coordinate changes with
-   its owner; do not overwrite unrelated records.
-
-The shared `infra/email-sender.yaml` accepts optional `BimiLogoUrl` and
-`BimiCertificateUrl` parameters and, when a logo URL is supplied, outputs
-`BimiRecordName` and `BimiRecordValue` for manual publication. These parameters
-only prepare the TXT value: the stack does not create DNS records, upload
-assets, validate the SVG or issue certificates. Do not deploy a second SES
-identity merely to obtain the output; update the existing owning stack only
-after review, or create the TXT value manually if the identity is managed
-elsewhere. `BimiLogoUrl` defaults to the production URL above; when updating an
-existing stack, explicitly supply it because CloudFormation can retain its
-previous parameter value. Override it if `EmailIdentityName` changes.
-Supplying a certificate URL without a logo URL is rejected. Test
-public HTTPS access, the published TXT record, DMARC alignment and a controlled
-mailbox after DNS propagation; provider caching, reputation and support mean
-display is not guaranteed. Neither this repository change nor a successful
-CloudFormation deployment activates BIMI automatically.
-
-References: [Google BIMI setup and Gmail requirements](https://support.google.com/a/answer/10911320),
-[BIMI Group implementation guide](https://bimigroup.org/implementation-guide/).
-
 ### Prize notification emails across games
 
 The shared delivery worker sends the same bilingual STAND prize-notification

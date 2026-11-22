@@ -38,7 +38,8 @@ def test_analytics_returns_all_paginated_participants_and_legacy_answer_fields(m
         {
             "Items": [{
                 "gameId": "ABCDEF", "playerId": 1, "username": "Ana",
-                "email": "ana@example.test", "sex": "female", "jobTitle": "Engineer",
+                "email": "ana@example.test", "phone": "+34612345678",
+                "joinedAt": "2026-01-01T02:03:04Z", "sex": "female", "jobTitle": "Engineer",
                 "type": {"T1MER": {"quizCompleted": True, "quizCompletedAt": "2026-01-02T03:04:05Z",
                                    "quizAnswers": {"q1": "ABCDEF_q1_a"}}},
             }],
@@ -59,10 +60,12 @@ def test_analytics_returns_all_paginated_participants_and_legacy_answer_fields(m
                        "options": [{"title": "First", "payload": "ABCDEF_q1_a"}]}],
         "players": [
             {"playerId": 1, "name": "Ana", "email": "ana@example.test", "completed": True,
-             "phone": None, "address": None, "company": None, "sex": "female", "jobTitle": "Engineer", "birthDate": None,
+             "phone": "+34612345678", "joinedAt": "2026-01-01T02:03:04Z",
+             "address": None, "company": None, "sex": "female", "jobTitle": "Engineer", "birthDate": None,
              "completedAt": "2026-01-02T03:04:05Z", "answers": {"q1": "ABCDEF_q1_a"}},
             {"playerId": 2, "name": None, "email": None, "completed": False,
-             "phone": None, "address": None, "company": None, "sex": None, "jobTitle": None, "birthDate": None,
+             "phone": None, "joinedAt": None, "address": None, "company": None, "sex": None,
+             "jobTitle": None, "birthDate": None,
              "completedAt": None, "answers": {}},
         ],
     }

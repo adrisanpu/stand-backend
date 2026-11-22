@@ -68,6 +68,7 @@ def get_form_responses(event, game_id, games_table, gameplayer_table):
                     "name": item.get("username") if isinstance(item.get("username"), str) else None,
                     "email": item.get("email") if isinstance(item.get("email"), str) else None,
                     "phone": item.get("phone") if isinstance(item.get("phone"), str) else None,
+                    "joinedAt": item.get("joinedAt") if isinstance(item.get("joinedAt"), str) else None,
                     **{name: item.get(name) if isinstance(item.get(name), str) else None
                        for name in OPTIONAL_PARTICIPANT_FIELDS},
                     "completed": bool(blob.get("quizCompleted", False)) if isinstance(blob, dict) else False,
