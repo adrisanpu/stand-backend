@@ -1,6 +1,8 @@
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 from tests.test_stack_integration import ROOT, load, operator_event
 
 quiz = load(
@@ -30,6 +32,15 @@ def api_event(method="GET", **query):
     return event
 
 
+@pytest.fixture(autouse=True)
+def prize_storage(monkeypatch):
+    monkeypatch.setenv("STACK_PRIZES_TABLE", "test-prizes")
+    dynamo = MagicMock()
+    dynamo.Table.return_value.query.return_value = {"Items": []}
+    monkeypatch.setattr(quiz, "dynamo_r", dynamo)
+    return dynamo
+
+
 def test_analytics_returns_all_paginated_participants_and_legacy_answer_fields(monkeypatch):
     games = MagicMock()
     games.get_item.return_value = {"Item": GAME}
@@ -38,7 +49,8 @@ def test_analytics_returns_all_paginated_participants_and_legacy_answer_fields(m
         {
             "Items": [{
                 "gameId": "ABCDEF", "playerId": 1, "username": "Ana",
-                "email": "ana@example.test", "sex": "female", "jobTitle": "Engineer",
+                "email": "ana@example.test", "phone": "+34612345678",
+                "joinedAt": "2026-01-01T02:03:04Z", "sex": "female", "jobTitle": "Engineer",
                 "type": {"T1MER": {"quizCompleted": True, "quizCompletedAt": "2026-01-02T03:04:05Z",
                                    "quizAnswers": {"q1": "ABCDEF_q1_a"}}},
             }],
@@ -59,19 +71,22 @@ def test_analytics_returns_all_paginated_participants_and_legacy_answer_fields(m
                        "options": [{"title": "First", "payload": "ABCDEF_q1_a"}]}],
         "players": [
             {"playerId": 1, "name": "Ana", "email": "ana@example.test", "completed": True,
-             "phone": None, "address": None, "company": None, "sex": "female", "jobTitle": "Engineer", "birthDate": None,
+             "phone": "+34612345678", "joinedAt": "2026-01-01T02:03:04Z",
+             "address": None, "company": None, "sex": "female", "jobTitle": "Engineer", "birthDate": None,
              "completedAt": "2026-01-02T03:04:05Z", "answers": {"q1": "ABCDEF_q1_a"}},
             {"playerId": 2, "name": None, "email": None, "completed": False,
-             "phone": None, "address": None, "company": None, "sex": None, "jobTitle": None, "birthDate": None,
+             "phone": None, "joinedAt": None, "address": None, "company": None, "sex": None,
+             "jobTitle": None, "birthDate": None,
              "completedAt": None, "answers": {}},
         ],
+        "prizeEvents": [],
     }
     assert players.query.call_count == 2
     assert all(call.kwargs.get("KeyConditionExpression") is not None
                for call in players.query.call_args_list)
 
 
-def test_analytics_checks_owner_before_querying_participants(monkeypatch):
+def test_analytics_checks_owner_before_querying_participants(monkeypatch, prize_storage):
     games = MagicMock()
     games.get_item.return_value = {"Item": {**GAME, "ownerUserId": "other"}}
     players = MagicMock()
@@ -82,6 +97,63 @@ def test_analytics_checks_owner_before_querying_participants(monkeypatch):
 
     assert result["statusCode"] == 403
     players.query.assert_not_called()
+    prize_storage.Table.assert_not_called()
+
+
+def test_analytics_returns_paginated_award_and_redemption_dates_without_sensitive_award_data(monkeypatch, prize_storage):
+    games = MagicMock()
+    games.get_item.return_value = {"Item": GAME}
+    players = MagicMock()
+    players.query.return_value = {"Items": []}
+    monkeypatch.setattr(quiz, "games_table", games)
+    monkeypatch.setattr(quiz, "gp_table", players)
+    table = prize_storage.Table.return_value
+    table.query.side_effect = [
+        {"Items": [
+            {"id": "stock", "createdAt": "2026-01-01T00:00:00Z"},
+            {"id": "award_1", "createdAt": "2026-01-02T00:00:00Z",
+             "state": "delivered", "deliveredAt": "2026-01-03T00:00:00Z",
+             "prize": {"source": "stand"}, "token": "private", "email": "private@example.test"},
+            {"id": "award_2", "createdAt": "2026-01-02T01:00:00Z",
+             "state": "confirmed", "deliveredAt": "2026-01-03T01:00:00Z", "prize": {"source": "kivly"}},
+        ], "LastEvaluatedKey": {"gameId": "ABCDEF", "id": "award_2"}},
+        {"Items": [
+            {"id": "award_3", "state": "available", "prize": {"source": "stand"}},
+            {"id": "award_4", "createdAt": 123, "state": "delivered",
+             "deliveredAt": 456, "prize": {"source": "stand"}},
+        ]},
+    ]
+
+    result = quiz.lambda_handler(api_event(gameId="ABCDEF", analytics="1"), None)
+
+    assert result["statusCode"] == 200
+    assert response_body(result)["prizeEvents"] == [
+        {"kind": "awarded", "timestamp": "2026-01-02T00:00:00Z"},
+        {"kind": "redeemed", "timestamp": "2026-01-03T00:00:00Z"},
+        {"kind": "awarded", "timestamp": "2026-01-02T01:00:00Z"},
+        {"kind": "awarded", "timestamp": None},
+        {"kind": "awarded", "timestamp": None},
+        {"kind": "redeemed", "timestamp": None},
+    ]
+    assert table.query.call_count == 2
+    assert table.query.call_args.kwargs["ExclusiveStartKey"] == {"gameId": "ABCDEF", "id": "award_2"}
+    assert table.query.call_args.kwargs["ConsistentRead"] is True
+    assert "private" not in result["body"]
+
+
+def test_analytics_prize_read_failure_is_not_reported_as_empty_history(monkeypatch, prize_storage):
+    games = MagicMock()
+    games.get_item.return_value = {"Item": GAME}
+    players = MagicMock()
+    players.query.return_value = {"Items": []}
+    monkeypatch.setattr(quiz, "games_table", games)
+    monkeypatch.setattr(quiz, "gp_table", players)
+    prize_storage.Table.return_value.query.side_effect = RuntimeError("offline")
+
+    result = quiz.lambda_handler(api_event(gameId="ABCDEF", analytics="1"), None)
+
+    assert result["statusCode"] == 500
+    assert response_body(result)["error"] == "FormResponsesUnavailable"
 
 
 def test_analytics_includes_registered_players_when_quiz_is_unconfigured(monkeypatch):

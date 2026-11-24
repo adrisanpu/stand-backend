@@ -245,7 +245,7 @@ def lambda_handler(event, context):
         # -------- GET export --------
         if method == "GET":
             if qs.get("analytics") == "1":
-                return get_form_responses(event, qs.get("gameId"), games_table, gp_table)
+                return get_form_responses(event, qs.get("gameId"), games_table, gp_table, dynamo_r)
             game_id = (qs.get("gameId") or body.get("gameId") or "").strip()
             if not game_id:
                 return _resp(400, {"ok": False, "error": "MissingGameId"})

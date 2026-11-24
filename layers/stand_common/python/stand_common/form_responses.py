@@ -1,9 +1,10 @@
 from boto3.dynamodb.conditions import Key
 
+from stand_common import stack_prizes
 from stand_common.utils import _as_int, _get_claims, _resp, log, OPTIONAL_PARTICIPANT_FIELDS
 
 
-def get_form_responses(event, game_id, games_table, gameplayer_table):
+def get_form_responses(event, game_id, games_table, gameplayer_table, dynamo):
     owner_id = (_get_claims(event).get("sub") or "").strip()
     if not owner_id:
         return _resp(401, {"ok": False, "error": "Unauthorized"})
@@ -68,6 +69,7 @@ def get_form_responses(event, game_id, games_table, gameplayer_table):
                     "name": item.get("username") if isinstance(item.get("username"), str) else None,
                     "email": item.get("email") if isinstance(item.get("email"), str) else None,
                     "phone": item.get("phone") if isinstance(item.get("phone"), str) else None,
+                    "joinedAt": item.get("joinedAt") if isinstance(item.get("joinedAt"), str) else None,
                     **{name: item.get(name) if isinstance(item.get(name), str) else None
                        for name in OPTIONAL_PARTICIPANT_FIELDS},
                     "completed": bool(blob.get("quizCompleted", False)) if isinstance(blob, dict) else False,
@@ -78,12 +80,29 @@ def get_form_responses(event, game_id, games_table, gameplayer_table):
             if not last_key:
                 break
 
+        prize_events = []
+        for award in stack_prizes.records(dynamo, game_id):
+            if not isinstance(award.get("id"), str) or not award["id"].startswith("award_"):
+                continue
+            awarded_at = award.get("createdAt")
+            prize_events.append({
+                "kind": "awarded",
+                "timestamp": awarded_at if isinstance(awarded_at, str) else None,
+            })
+            if (award.get("prize") or {}).get("source") == "stand" and award.get("state") == "delivered":
+                redeemed_at = award.get("deliveredAt")
+                prize_events.append({
+                    "kind": "redeemed",
+                    "timestamp": redeemed_at if isinstance(redeemed_at, str) else None,
+                })
+
         return _resp(200, {
             "ok": True,
             "gameId": game_id,
             "gameName": game.get("gameName") or game_id,
             "questions": questions,
             "players": players,
+            "prizeEvents": prize_events,
         })
     except Exception as exc:
         log("form_responses_read_failed", {"gameId": game_id, "error": repr(exc)})

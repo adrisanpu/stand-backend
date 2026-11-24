@@ -220,10 +220,17 @@ and already delivered prizes are not revoked. Raffle surveys filter both native
 and STACK draws regardless of the operator's validated-only filter.
 
 Owner-authenticated `GET /v1/game/quiz?gameId=...&analytics=1` returns the selected
-event's questions and participant responses for the Respuestas panel. It follows
+event's questions and participant responses for the Analytics panel. It follows
 all participant query pages within the selected game partition, not a table
-scan. The UI filters/paginates that complete dataset and exports the selected
-results with CSV formula escaping. There are no visit/abandonment events,
+scan. It also reads all pages of that game's durable prize records, after
+checking ownership, and returns `prizeEvents: [{kind, timestamp}]` without
+recipient details or redemption tokens. Each award unit contributes an
+`awarded` event at `createdAt`; a STAND award in `delivered` state also contributes
+a `redeemed` event at `deliveredAt`. Missing timestamps are returned as null,
+not inferred from other activity. Kivly wallet assignments are not redemptions.
+Prize read failures fail the analytics request rather than returning false zeroes.
+The UI summarizes the complete dataset and exports participant responses
+with CSV formula escaping. There are no visit/abandonment events,
 cross-questionnaire insights, new tables or new external API operations.
 Deploy the changed functions and shared layer together; no deployment or live
 Kivly mutation is performed by local verification.
